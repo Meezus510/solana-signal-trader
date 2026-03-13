@@ -5,7 +5,7 @@ build-backend = "setuptools.backends.legacy:build"
 [project]
 name = "sol-trader"
 version = "0.1.0"
-description = "Solana meme coin paper trading bot with Telegram signal ingestion"
+description = "Algorithmic trading bot for Solana tokens — Telegram signal ingestion, Birdeye pricing, Jupiter execution"
 requires-python = ">=3.11"
 dependencies = [
     "telethon>=1.36.0",

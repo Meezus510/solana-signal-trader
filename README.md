@@ -1,9 +1,8 @@
 # Solana Signal Trader
 
-A two-component Solana trading system built in Python:
+Algorithmic trading bot for Solana tokens. Ingests token signals from a Telegram channel, fetches real-time prices from Birdeye, and executes a take-profit / trailing-stop strategy via Jupiter.
 
-- **Paper trader** — ingests token signals from a Telegram channel via a user account (Telethon), fetches real-time prices from Birdeye, and runs a TP / trailing-stop strategy against a mock portfolio with zero on-chain risk.
-- **Live execution webhook** — a Quart HTTP server that receives buy/sell signals and executes market swaps + limit orders on-chain via Jupiter.
+Currently running in **paper mode** for strategy validation — live on-chain execution is wired and ready to activate by swapping `PaperExchange` for `JupiterSwapExecutor`.
 
 ---
 
@@ -25,14 +24,13 @@ TradingEngine                 trader/trading/engine.py
       │     get_price()        ← entry price (single token)
       │     get_prices_batch() ← monitoring (all open positions)
       │
-      ├─→ PaperExchange                 trader/trading/exchange.py
+      ├─→ PaperExchange / JupiterSwapExecutor    trader/trading/exchange.py
       │     buy() / sell_partial() / sell_all()
-      │     [swap → JupiterSwapExecutor for live trading]
       │
       └─→ PortfolioManager              trader/trading/portfolio.py
             in-memory position registry
 
-Live execution (separate process):
+Live execution (webhook server):
 POST /webhook ──→ solana_api/my_bot_script.py
                     perform_swap()        ← Jupiter market swap (entry)
                     create_limit_order()  ← Jupiter limit orders (TP exits)
@@ -40,7 +38,7 @@ POST /webhook ──→ solana_api/my_bot_script.py
 
 ---
 
-## Paper Trading Strategy
+## Strategy
 
 | Event | Rule | Action |
 |-------|------|--------|
@@ -50,7 +48,7 @@ POST /webhook ──→ solana_api/my_bot_script.py
 | Trailing — new high | Price > highest seen | Update trailing stop level |
 | Trailing stop | Price ≤ highest × 0.65 | Sell remaining 100% → CLOSE |
 
-PnL accumulates correctly across the partial TP sell and the final close:
+PnL is tracked per sell event and accumulated across partial and full closes:
 
 ```
 pnl_per_sell = (exit_price − entry_price) × quantity_sold
@@ -67,7 +65,7 @@ pnl_per_sell = (exit_price − entry_price) × quantity_sold
 ├── Makefile                    # common dev tasks
 ├── .env.example                # environment variable template
 │
-├── trader/                     # paper trading package
+├── trader/                     # core trading package
 │   ├── config.py               # centralised, immutable Config dataclass
 │   │
 │   ├── listener/
@@ -80,19 +78,19 @@ pnl_per_sell = (exit_price − entry_price) × quantity_sold
 │   ├── trading/
 │   │   ├── models.py           # TokenSignal, Position, PortfolioState
 │   │   ├── portfolio.py        # PortfolioManager
-│   │   ├── exchange.py         # PaperExchange  ← swap for live executor here
+│   │   ├── exchange.py         # PaperExchange  ← swap for JupiterSwapExecutor here
 │   │   └── engine.py           # TradingEngine — strategy orchestration
 │   │
 │   └── utils/
 │       └── logging.py          # structured logging setup
 │
-├── solana_api/                 # live execution package
+├── solana_api/                 # on-chain execution package
 │   ├── RestClientHelper.py     # Jupiter / Solana RPC sync REST client
 │   └── my_bot_script.py        # Quart webhook server — market swaps + limit orders
 │
 └── tests/
     ├── test_parser.py          # parser unit tests (pure, no network)
-    └── test_strategy.py        # PnL math, exchange, portfolio tests
+    └── test_strategy.py        # strategy math, exchange, portfolio tests
 ```
 
 ---
@@ -116,7 +114,7 @@ cd <repo>
 python -m venv venv
 source venv/bin/activate          # Windows: venv\Scripts\activate
 
-pip install -e ".[dev]"           # installs runtime + dev dependencies
+pip install -e ".[dev]"
 ```
 
 ### 3. Configure
@@ -125,7 +123,7 @@ pip install -e ".[dev]"           # installs runtime + dev dependencies
 cp .env.example .env
 ```
 
-Edit `.env` with your credentials:
+Edit `.env`:
 
 ```env
 # Birdeye
@@ -136,7 +134,7 @@ TG_API_ID=12345678
 TG_API_HASH=abcdef...
 TG_CHANNEL=channel_username
 
-# Live execution (optional)
+# Live execution (when ready)
 JUPITER_API_KEY=your_key_here
 WALLET_ID=your_solana_wallet_address
 PRIVATE_KEY=your_base58_private_key
@@ -156,13 +154,13 @@ python run.py
 ### 5. Run
 
 ```bash
-# Paper trading — listens to Telegram and simulates trades with real prices
+# Live mode — listens to Telegram and executes strategy
 python run.py
 
 # Demo mode — injects sample tokens, no Telegram required
 python run.py --demo
 
-# Live execution webhook (separate process)
+# On-chain execution webhook (separate process, live trading)
 python solana_api/my_bot_script.py
 
 # Tests
@@ -171,14 +169,31 @@ pytest tests/ -v
 
 ---
 
+## Going Live
+
+The system is designed to transition from paper to live trading with a single swap in `run.py`:
+
+```python
+# Current — paper mode
+exchange = PaperExchange(portfolio=portfolio, cfg=cfg)
+
+# Live — replace with:
+exchange = JupiterSwapExecutor(cfg=cfg)
+```
+
+The `solana_api/my_bot_script.py` webhook server handles on-chain execution independently and can receive signals from any source via POST `/webhook`.
+
+---
+
 ## Extending
 
 | Goal | Where to change |
 |------|----------------|
-| Live on-chain execution | Replace `PaperExchange` with `JupiterSwapExecutor` in `run.py` |
+| Enable live on-chain execution | Replace `PaperExchange` with `JupiterSwapExecutor` in `run.py` |
 | WebSocket price feed | Add `subscribe()` to `BirdeyePriceClient`; remove polling loop in `engine.py` |
+| Tune TP / SL levels | Edit constants in `trader/config.py` |
 | Additional TP ladders | Extend `evaluate_position()` in `engine.py` |
-| Fee / slippage modelling | Add to `PaperExchange.sell_*` methods; use `total_fees_usd` field |
+| Custom limit order exits | Edit `create_limit_order` calls in `handle_buy()` in `my_bot_script.py` |
+| Fee / slippage modelling | Add to `PaperExchange.sell_*`; use `total_fees_usd` field |
 | Persistent trade log | Add a `TradeRepository` and inject into `TradingEngine` |
 | Multiple signal sources | Add new listener classes alongside `TelegramListener` |
-| Custom limit order ladders | Edit the `create_limit_order` calls in `handle_buy()` |
