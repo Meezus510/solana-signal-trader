@@ -61,7 +61,7 @@ class Config:
     tg_api_id: int = 0
     tg_api_hash: str = ""
     channel_username: str = ""
-    session_file: str = "listener/tg_session"  # path to .session file
+    session_file: str = "trader/listener/tg_session"  # path to .session file
 
     # ------------------------------------------------------------------
     # Factory
