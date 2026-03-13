@@ -71,7 +71,7 @@ class TelegramListener:
             events.NewMessage(chats=self._cfg.channel_username),
         )
 
-        await self._client.start()
+        await self._client.start(phone=self._cfg.tg_phone or None)
         me = await self._client.get_me()
         logger.info("[TG] Authenticated as: %s", me.username or me.first_name)
 

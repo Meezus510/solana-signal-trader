@@ -60,6 +60,7 @@ class Config:
     # ------------------------------------------------------------------
     tg_api_id: int = 0
     tg_api_hash: str = ""
+    tg_phone: str = ""
     channel_username: str = ""
     session_file: str = "trader/listener/tg_session"  # path to .session file
 
@@ -104,5 +105,6 @@ class Config:
             birdeye_api_key=birdeye_api_key,
             tg_api_id=tg_api_id,
             tg_api_hash=tg_api_hash,
+            tg_phone=os.getenv("TG_PHONE", "").strip(),
             channel_username=channel,
         )
