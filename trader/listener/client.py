@@ -87,6 +87,35 @@ class TelegramListener:
             )
             raise
 
+        await self._catch_up(entity)
+
+    async def _catch_up(self, entity, limit: int = 50) -> None:
+        """
+        Fetch the most recent `limit` messages from the channel and process
+        any that were not seen in the previous session.
+
+        This fills the gap caused by restarts, crashes, or deployments.
+        Messages already in seen_msg_ids are skipped silently — no duplicate
+        positions can be opened because the engine also checks has_open_position().
+        """
+        logger.info("[TG] Catching up on last %d messages...", limit)
+        caught = 0
+        async for msg in self._client.iter_messages(entity, limit=limit):
+            if msg.id in self._seen_ids:
+                continue  # already processed in a prior session
+            if not (msg.text or "").strip():
+                self._seen_ids.add(msg.id)
+                if self._db:
+                    self._db.add_seen_msg_id(msg.id)
+                continue
+            logger.info("[CATCHUP] Processing missed message id=%d", msg.id)
+            # Reuse the existing handler — it handles dedup, parsing, and queueing
+            class _FakeEvent:
+                message = msg
+            await self._on_new_message(_FakeEvent())
+            caught += 1
+        logger.info("[TG] Catch-up complete — %d missed message(s) processed", caught)
+
     async def run_until_disconnected(self) -> None:
         """Block until the Telegram connection drops."""
         if self._client:
