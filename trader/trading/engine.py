@@ -26,6 +26,8 @@ from trader.trading.models import Position, TokenSignal
 from trader.trading.portfolio import PortfolioManager
 
 logger = logging.getLogger(__name__)
+trade_log = logging.getLogger("trades")
+signal_log = logging.getLogger("signals")
 
 
 class TradingEngine:
@@ -49,11 +51,13 @@ class TradingEngine:
         birdeye_client: BirdeyePriceClient,
         exchange: PaperExchange,
         portfolio: PortfolioManager,
+        db=None,           # TradeDatabase | None
     ) -> None:
         self._cfg = cfg
         self._birdeye = birdeye_client
         self._exchange = exchange
         self._portfolio = portfolio
+        self._db = db
 
     # ------------------------------------------------------------------
     # Signal handling / entry
@@ -81,6 +85,9 @@ class TradingEngine:
                 "[SKIP] Open position already exists for %s — duplicate signal ignored",
                 signal.symbol,
             )
+            signal_log.info("DUPLICATE  | %-10s | %-44s", signal.symbol, signal.mint_address)
+            if self._db:
+                self._db.log_signal("DUPLICATE", symbol=signal.symbol, mint=signal.mint_address)
             return
 
         entry_price = await self._birdeye.get_price(signal.mint_address)
@@ -88,12 +95,18 @@ class TradingEngine:
             logger.warning(
                 "[SKIP] No live price available for %s — entry aborted", signal.symbol
             )
+            signal_log.info("NO_PRICE   | %-10s | %-44s", signal.symbol, signal.mint_address)
+            if self._db:
+                self._db.log_signal("NO_PRICE", symbol=signal.symbol, mint=signal.mint_address)
             return
 
         logger.info("[ENTRY] %s @ $%.8f", signal.symbol, entry_price)
 
         position = self._exchange.buy(signal, entry_price, self._cfg.buy_size_usd)
         if position is None:
+            signal_log.info("NO_CASH    | %-10s | %-44s", signal.symbol, signal.mint_address)
+            if self._db:
+                self._db.log_signal("NO_CASH", symbol=signal.symbol, mint=signal.mint_address)
             return  # insufficient cash — already logged by PaperExchange
 
         self._portfolio.add_position(position)
@@ -105,6 +118,14 @@ class TradingEngine:
             position.stop_loss_price,
             self._exchange.portfolio.available_cash_usd,
         )
+        trade_log.info(
+            "BUY          | %-10s | %-44s | price=$%.8f | qty=%.4f | pnl=$0.00",
+            position.symbol, position.mint_address, entry_price, position.initial_quantity,
+        )
+        if self._db:
+            self._db.upsert_position(position)
+            self._db.save_portfolio(self._exchange.portfolio)
+            self._db.log_trade("BUY", position, entry_price, position.initial_quantity, 0.0)
 
     # ------------------------------------------------------------------
     # Monitoring loop
@@ -204,8 +225,18 @@ class TradingEngine:
                     "[SL] %s stop loss | current=$%.8f | sl=$%.8f",
                     position.symbol, current_price, position.stop_loss_price,
                 )
+                qty = position.remaining_quantity
                 self._exchange.sell_all(position, current_price, "STOP_LOSS")
                 self._portfolio.close_position(position.mint_address)
+                pnl = (current_price - position.entry_price) * qty
+                trade_log.info(
+                    "STOP_LOSS    | %-10s | %-44s | price=$%.8f | qty=%.4f | pnl=$%+.4f",
+                    position.symbol, position.mint_address, current_price, qty, pnl,
+                )
+                if self._db:
+                    self._db.upsert_position(position)
+                    self._db.save_portfolio(self._exchange.portfolio)
+                    self._db.log_trade("STOP_LOSS", position, current_price, qty, pnl)
                 return
 
             # ---- Take profit (partial sell) ----
@@ -217,6 +248,8 @@ class TradingEngine:
                     current_price,
                     cfg.take_profit_sell_fraction * 100,
                 )
+                qty = position.remaining_quantity * cfg.take_profit_sell_fraction
+                pnl = (current_price - position.entry_price) * qty
                 self._exchange.sell_partial(
                     position,
                     cfg.take_profit_sell_fraction,
@@ -231,6 +264,14 @@ class TradingEngine:
                     "[TRAIL] %s activated | highest=$%.8f | trail_stop=$%.8f",
                     position.symbol, position.highest_price, position.trailing_stop_price,
                 )
+                trade_log.info(
+                    "TP_PARTIAL   | %-10s | %-44s | price=$%.8f | qty=%.4f | pnl=$%+.4f",
+                    position.symbol, position.mint_address, current_price, qty, pnl,
+                )
+                if self._db:
+                    self._db.upsert_position(position)
+                    self._db.save_portfolio(self._exchange.portfolio)
+                    self._db.log_trade("TP_PARTIAL", position, current_price, qty, pnl)
 
         else:
             # ---- Update trailing stop on new high ----
@@ -251,8 +292,18 @@ class TradingEngine:
                     "[TRAIL] %s stop triggered | current=$%.8f | trail_stop=$%.8f",
                     position.symbol, current_price, position.trailing_stop_price,
                 )
+                qty = position.remaining_quantity
+                pnl = (current_price - position.entry_price) * qty
                 self._exchange.sell_all(position, current_price, "TRAILING_STOP")
                 self._portfolio.close_position(position.mint_address)
+                trade_log.info(
+                    "TRAILING_STOP | %-10s | %-44s | price=$%.8f | qty=%.4f | pnl=$%+.4f",
+                    position.symbol, position.mint_address, current_price, qty, pnl,
+                )
+                if self._db:
+                    self._db.upsert_position(position)
+                    self._db.save_portfolio(self._exchange.portfolio)
+                    self._db.log_trade("TRAILING_STOP", position, current_price, qty, pnl)
 
     # ------------------------------------------------------------------
     # Reporting
@@ -285,18 +336,18 @@ class TradingEngine:
         logger.info(sep)
         logger.info("[SUMMARY]  Portfolio Report")
         logger.info(sep)
-        logger.info("  Starting capital   : $%,.2f", port.starting_cash_usd)
-        logger.info("  Available cash     : $%,.2f", port.available_cash_usd)
-        logger.info("  Open market value  : $%,.4f", market_value)
-        logger.info("  Total equity       : $%,.4f", equity)
+        logger.info("  Starting capital   : $%.2f", port.starting_cash_usd)
+        logger.info("  Available cash     : $%.2f", port.available_cash_usd)
+        logger.info("  Open market value  : $%.4f", market_value)
+        logger.info("  Total equity       : $%.4f", equity)
         logger.info("  " + "-" * 46)
         logger.info("  Positions — total  : %d", self._portfolio.total_count)
         logger.info("  Positions — open   : %d", self._portfolio.open_count)
         logger.info("  Positions — closed : %d", self._portfolio.closed_count)
         logger.info("  " + "-" * 46)
-        logger.info("  Realized PnL       : $%+,.4f", realized)
-        logger.info("  Unrealized PnL     : $%+,.4f", unrealized)
-        logger.info("  Net PnL vs start   : $%+,.4f  (%+.2f%%)",
+        logger.info("  Realized PnL       : $%+.4f", realized)
+        logger.info("  Unrealized PnL     : $%+.4f", unrealized)
+        logger.info("  Net PnL vs start   : $%+.4f  (%+.2f%%)",
                     net_pnl, (net_pnl / port.starting_cash_usd) * 100)
         logger.info(sep)
 

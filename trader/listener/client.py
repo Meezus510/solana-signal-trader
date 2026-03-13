@@ -26,6 +26,7 @@ from trader.listener.parser import parse_message
 from trader.trading.models import TokenSignal
 
 logger = logging.getLogger(__name__)
+signal_log = logging.getLogger("signals")
 
 
 class TelegramListener:
@@ -37,10 +38,16 @@ class TelegramListener:
     Telegram event loop is never blocked by price fetches or order logic.
     """
 
-    def __init__(self, cfg: Config, signal_queue: asyncio.Queue[TokenSignal]) -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        signal_queue: asyncio.Queue[TokenSignal],
+        db=None,           # TradeDatabase | None — optional to avoid circular import
+    ) -> None:
         self._cfg = cfg
         self._queue = signal_queue
-        self._seen_ids: set[int] = set()  # in-memory dedup (resets on restart)
+        self._db = db
+        self._seen_ids: set[int] = set()
         self._client: Optional[TelegramClient] = None
 
     # ------------------------------------------------------------------
@@ -67,6 +74,9 @@ class TelegramListener:
         await self._client.start()
         me = await self._client.get_me()
         logger.info("[TG] Authenticated as: %s", me.username or me.first_name)
+
+        if self._db:
+            self._seen_ids = self._db.load_seen_msg_ids()
 
         try:
             entity = await self._client.get_entity(self._cfg.channel_username)
@@ -106,6 +116,8 @@ class TelegramListener:
         if msg.id in self._seen_ids:
             return
         self._seen_ids.add(msg.id)
+        if self._db:
+            self._db.add_seen_msg_id(msg.id)
 
         raw_text: str = msg.text or ""
         if not raw_text.strip():
@@ -119,26 +131,37 @@ class TelegramListener:
 
         if not result["is_first_call"]:
             logger.info("[TG] id=%d — update post, skipping", msg.id)
+            signal_log.info("UPDATE     | %-10s | %-44s | msg_id=%d", "-", "-", msg.id)
+            if self._db:
+                self._db.log_signal("UPDATE", msg_id=msg.id)
             return
 
         if not result["is_solana"]:
             logger.info("[TG] id=%d — not a Solana call, skipping", msg.id)
+            signal_log.info("NOT_SOLANA | %-10s | %-44s | msg_id=%d", "-", "-", msg.id)
+            if self._db:
+                self._db.log_signal("NOT_SOLANA", msg_id=msg.id)
             return
 
         mint: Optional[str] = result["mint_address"]
+        symbol: str = result["symbol_hint"] or "UNKNOWN"
+
         if not mint:
             logger.info("[TG] id=%d — no mint address found, skipping", msg.id)
+            signal_log.info("NO_MINT    | %-10s | %-44s | msg_id=%d", symbol, "-", msg.id)
+            if self._db:
+                self._db.log_signal("NO_MINT", msg_id=msg.id, symbol=symbol)
             return
 
-        symbol: str = result["symbol_hint"] or "UNKNOWN"
         signal = TokenSignal(
             symbol=symbol,
             mint_address=mint,
             detected_at=datetime.now(timezone.utc),
         )
 
-        logger.info(
-            "[QUEUE] %s | mint=%s | queue_depth=%d",
-            symbol, mint, self._queue.qsize() + 1,
-        )
+        logger.info("[QUEUE] %s | mint=%s | queue_depth=%d", symbol, mint, self._queue.qsize() + 1)
+        signal_log.info("QUEUED     | %-10s | %-44s | msg_id=%d", symbol, mint, msg.id)
+        if self._db:
+            self._db.log_signal("QUEUED", msg_id=msg.id, symbol=symbol, mint=mint)
+
         await self._queue.put(signal)

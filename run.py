@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 
 from trader.config import Config
 from trader.listener.client import TelegramListener
+from trader.persistence.database import TradeDatabase
 from trader.pricing.birdeye import BirdeyePriceClient
 from trader.trading.engine import TradingEngine
 from trader.trading.exchange import PaperExchange
@@ -60,23 +61,40 @@ async def run_live(cfg: Config) -> None:
     """
     signal_queue: asyncio.Queue[TokenSignal] = asyncio.Queue()
 
-    listener = TelegramListener(cfg=cfg, signal_queue=signal_queue)
-    await listener.start()
+    # ------------------------------------------------------------------
+    # Persistence — restore state from previous session if it exists
+    # ------------------------------------------------------------------
+    db = TradeDatabase()
+
+    saved = db.load_portfolio()
+    if saved:
+        available_cash, starting_cash = saved
+        logger.info("[RESTORE] Resuming session | cash=$%.2f", available_cash)
+    else:
+        available_cash = starting_cash = cfg.starting_cash_usd
 
     portfolio = PortfolioState(
-        starting_cash_usd=cfg.starting_cash_usd,
-        available_cash_usd=cfg.starting_cash_usd,
+        starting_cash_usd=starting_cash,
+        available_cash_usd=available_cash,
     )
+
+    mgr = PortfolioManager()
+    for pos in db.load_open_positions():
+        mgr.add_position(pos)
+        logger.info("[RESTORE] Position %s | mint=%s", pos.symbol, pos.mint_address)
+
+    listener = TelegramListener(cfg=cfg, signal_queue=signal_queue, db=db)
+    await listener.start()
 
     async with aiohttp.ClientSession() as http:
         birdeye = BirdeyePriceClient(cfg=cfg, session=http)
         exchange = PaperExchange(portfolio=portfolio, cfg=cfg)
-        mgr = PortfolioManager()
         engine = TradingEngine(
             cfg=cfg,
             birdeye_client=birdeye,
             exchange=exchange,
             portfolio=mgr,
+            db=db,
         )
 
         async def consume_signals() -> None:
@@ -112,6 +130,8 @@ async def run_live(cfg: Config) -> None:
         finally:
             logger.info("Shutting down...")
             engine.print_summary()
+            db.save_portfolio(portfolio)
+            db.close()
             await listener.disconnect()
 
 

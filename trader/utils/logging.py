@@ -19,24 +19,35 @@ def configure_logging(
     """
     Configure the root logger with console + optional file output.
 
+    Also sets up two dedicated structured loggers:
+        signals  → signals.log   (every Telegram message + outcome)
+        trades   → trades.log    (every buy / sell event)
+
     Format uses a fixed-width level name so log columns align cleanly
     when tailing in a terminal.
-
-    Args:
-        level:    Logging level (default INFO).
-        log_file: Path to the rotating log file, or None to disable.
     """
     fmt = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
     formatter = logging.Formatter(fmt, datefmt=datefmt)
 
-    handlers: list[logging.Handler] = [
-        _stream_handler(formatter),
-    ]
+    handlers: list[logging.Handler] = [_stream_handler(formatter)]
     if log_file:
         handlers.append(_file_handler(log_file, formatter))
 
     logging.basicConfig(level=level, handlers=handlers, force=True)
+
+    # Pipe-delimited structured logs — easy to tail or import into a spreadsheet
+    _add_dedicated_logger("signals", "signals.log")
+    _add_dedicated_logger("trades",  "trades.log")
+
+
+def _add_dedicated_logger(name: str, path: str) -> None:
+    log = logging.getLogger(name)
+    log.setLevel(logging.INFO)
+    log.propagate = False          # keep out of console / trader.log
+    if not log.handlers:
+        h = _file_handler(path, logging.Formatter("%(asctime)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
+        log.addHandler(h)
 
 
 def _stream_handler(formatter: logging.Formatter) -> logging.StreamHandler:
