@@ -74,6 +74,9 @@ class Position:
     # Flags
     partial_take_profit_hit: bool = False
 
+    # Multi-strategy identity (set by StrategyRunner after buy)
+    strategy_name: str = "default"
+
 
 @dataclass
 class PortfolioState:

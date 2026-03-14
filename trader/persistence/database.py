@@ -7,10 +7,10 @@ without losing state.
 
 Schema
 ------
-positions     — one row per open/closed position (upserted on every state change)
+positions     — one row per (strategy, mint) pair (upserted on every state change)
 trades        — append-only event log (BUY, TP_PARTIAL, STOP_LOSS, TRAILING_STOP)
 signals       — append-only log of every Telegram message and its outcome
-portfolio     — single-row cash balance (updated after every trade)
+portfolio     — one row per strategy, tracks cash balance
 seen_msg_ids  — set of processed Telegram message IDs (prevents re-entry on restart)
 """
 
@@ -28,7 +28,8 @@ logger = logging.getLogger(__name__)
 
 _CREATE_POSITIONS = """
 CREATE TABLE IF NOT EXISTS positions (
-    mint                    TEXT PRIMARY KEY,
+    strategy                TEXT NOT NULL DEFAULT 'default',
+    mint                    TEXT NOT NULL,
     symbol                  TEXT NOT NULL,
     status                  TEXT NOT NULL,
     entry_price             REAL NOT NULL,
@@ -48,7 +49,8 @@ CREATE TABLE IF NOT EXISTS positions (
     sell_reason             TEXT,
     last_price              REAL,
     opened_at               TEXT NOT NULL,
-    closed_at               TEXT
+    closed_at               TEXT,
+    PRIMARY KEY (strategy, mint)
 )
 """
 
@@ -56,6 +58,7 @@ _CREATE_TRADES = """
 CREATE TABLE IF NOT EXISTS trades (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     ts       TEXT NOT NULL,
+    strategy TEXT NOT NULL DEFAULT 'default',
     event    TEXT NOT NULL,
     symbol   TEXT NOT NULL,
     mint     TEXT NOT NULL,
@@ -67,18 +70,19 @@ CREATE TABLE IF NOT EXISTS trades (
 
 _CREATE_SIGNALS = """
 CREATE TABLE IF NOT EXISTS signals (
-    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts      TEXT NOT NULL,
-    msg_id  INTEGER,
-    outcome TEXT NOT NULL,
-    symbol  TEXT,
-    mint    TEXT
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts       TEXT NOT NULL,
+    strategy TEXT,
+    msg_id   INTEGER,
+    outcome  TEXT NOT NULL,
+    symbol   TEXT,
+    mint     TEXT
 )
 """
 
 _CREATE_PORTFOLIO = """
 CREATE TABLE IF NOT EXISTS portfolio (
-    id                 INTEGER PRIMARY KEY CHECK (id = 1),
+    strategy           TEXT PRIMARY KEY,
     available_cash_usd REAL NOT NULL,
     starting_cash_usd  REAL NOT NULL
 )
@@ -129,7 +133,7 @@ class TradeDatabase:
         self._conn.execute(
             """
             INSERT OR REPLACE INTO positions VALUES (
-                :mint, :symbol, :status,
+                :strategy, :mint, :symbol, :status,
                 :entry_price, :initial_quantity, :remaining_quantity, :usd_size,
                 :highest_price, :take_profit_price, :stop_loss_price,
                 :trailing_active, :trailing_stop_pct, :trailing_stop_price,
@@ -139,6 +143,7 @@ class TradeDatabase:
             )
             """,
             {
+                "strategy": position.strategy_name,
                 "mint": position.mint_address,
                 "symbol": position.symbol,
                 "status": position.status,
@@ -164,19 +169,20 @@ class TradeDatabase:
         )
         self._conn.commit()
 
-    def load_open_positions(self) -> list[Position]:
-        """Restore all OPEN positions from the DB (called on startup)."""
+    def load_open_positions(self, strategy_name: str = "default") -> list[Position]:
+        """Restore all OPEN positions for a given strategy (called on startup)."""
         rows = self._conn.execute(
-            "SELECT * FROM positions WHERE status = 'OPEN'"
+            "SELECT * FROM positions WHERE status = 'OPEN' AND strategy = ?",
+            (strategy_name,),
         ).fetchall()
         positions = [self._row_to_position(r) for r in rows]
-        logger.info("[DB] Restored %d open position(s)", len(positions))
+        logger.info("[DB] Restored %d open position(s) for strategy '%s'", len(positions), strategy_name)
         return positions
 
     @staticmethod
     def _row_to_position(row: tuple) -> Position:
         (
-            mint, symbol, status,
+            strategy, mint, symbol, status,
             entry_price, initial_quantity, remaining_quantity, usd_size,
             highest_price, take_profit_price, stop_loss_price,
             trailing_active, trailing_stop_pct, trailing_stop_price,
@@ -185,6 +191,7 @@ class TradeDatabase:
             opened_at, closed_at,
         ) = row
         return Position(
+            strategy_name=strategy,
             mint_address=mint,
             symbol=symbol,
             status=status,
@@ -209,20 +216,21 @@ class TradeDatabase:
         )
 
     # ------------------------------------------------------------------
-    # Portfolio cash
+    # Portfolio cash (per strategy)
     # ------------------------------------------------------------------
 
-    def save_portfolio(self, state: PortfolioState) -> None:
+    def save_portfolio(self, state: PortfolioState, strategy_name: str = "default") -> None:
         self._conn.execute(
-            "INSERT OR REPLACE INTO portfolio VALUES (1, ?, ?)",
-            (state.available_cash_usd, state.starting_cash_usd),
+            "INSERT OR REPLACE INTO portfolio VALUES (?, ?, ?)",
+            (strategy_name, state.available_cash_usd, state.starting_cash_usd),
         )
         self._conn.commit()
 
-    def load_portfolio(self) -> Optional[tuple[float, float]]:
+    def load_portfolio(self, strategy_name: str = "default") -> Optional[tuple[float, float]]:
         """Returns (available_cash_usd, starting_cash_usd) or None if no prior session."""
         row = self._conn.execute(
-            "SELECT available_cash_usd, starting_cash_usd FROM portfolio WHERE id = 1"
+            "SELECT available_cash_usd, starting_cash_usd FROM portfolio WHERE strategy = ?",
+            (strategy_name,),
         ).fetchone()
         return row  # (available, starting) or None
 
@@ -239,9 +247,11 @@ class TradeDatabase:
         pnl: float,
     ) -> None:
         self._conn.execute(
-            "INSERT INTO trades (ts, event, symbol, mint, price, quantity, pnl) VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO trades (ts, strategy, event, symbol, mint, price, quantity, pnl) "
+            "VALUES (?,?,?,?,?,?,?,?)",
             (
                 datetime.now(timezone.utc).isoformat(),
+                position.strategy_name,
                 event,
                 position.symbol,
                 position.mint_address,
@@ -262,10 +272,11 @@ class TradeDatabase:
         msg_id: Optional[int] = None,
         symbol: Optional[str] = None,
         mint: Optional[str] = None,
+        strategy: Optional[str] = None,
     ) -> None:
         self._conn.execute(
-            "INSERT INTO signals (ts, msg_id, outcome, symbol, mint) VALUES (?,?,?,?,?)",
-            (datetime.now(timezone.utc).isoformat(), msg_id, outcome, symbol, mint),
+            "INSERT INTO signals (ts, strategy, msg_id, outcome, symbol, mint) VALUES (?,?,?,?,?,?)",
+            (datetime.now(timezone.utc).isoformat(), strategy, msg_id, outcome, symbol, mint),
         )
         self._conn.commit()
 

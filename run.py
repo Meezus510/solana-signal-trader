@@ -2,19 +2,26 @@
 run.py — Entry point for the Solana Trader system.
 
 Usage:
-    python run.py          # live mode: Telegram listener + paper trading engine
+    python run.py          # live mode: Telegram listener + multi-strategy engine
     python run.py --demo   # demo mode: inject sample signals without Telegram
+
+Adding a new strategy:
+    Define a StrategyConfig in the STRATEGIES list below. The bot will
+    independently manage cash, positions, and PnL for each strategy.
+    All strategies share a single Birdeye price feed — one API call per
+    unique mint per polling cycle, regardless of how many strategies hold it.
 
 Live signal flow:
     Telegram channel post
         → TelegramListener._on_new_message()
         → trader.listener.parser.parse_message()
         → asyncio.Queue[TokenSignal]
-        → TradingEngine.handle_new_signal()
-        → BirdeyePriceClient (entry price)
-        → PaperExchange.buy()
-        → monitor_positions() polling loop
-        → evaluate_position() → TP / SL / trailing stop
+        → MultiStrategyEngine.handle_new_signal()
+            → BirdeyePriceClient.get_price()  (once, shared)
+            → StrategyRunner.enter_position()  (once per strategy)
+        → MultiStrategyEngine.monitor_positions()
+            → BirdeyePriceClient.get_prices_batch()  (unique mints only)
+            → StrategyRunner.evaluate_position()  (per strategy, independent)
 """
 
 from __future__ import annotations
@@ -31,10 +38,9 @@ from trader.config import Config
 from trader.listener.client import TelegramListener
 from trader.persistence.database import TradeDatabase
 from trader.pricing.birdeye import BirdeyePriceClient
-from trader.trading.engine import TradingEngine
-from trader.trading.exchange import PaperExchange
-from trader.trading.models import PortfolioState, TokenSignal
-from trader.trading.portfolio import PortfolioManager
+from trader.trading.engine import MultiStrategyEngine
+from trader.trading.models import TokenSignal
+from trader.trading.strategy import StrategyConfig, StrategyRunner
 from trader.utils.logging import configure_logging
 
 # ---------------------------------------------------------------------------
@@ -47,53 +53,82 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Strategy definitions
+# ---------------------------------------------------------------------------
+# Add entries here to run additional strategies in parallel.
+# Each strategy is fully isolated: its own cash, positions, and PnL.
+# All strategies share the same Birdeye price feed.
+
+def build_strategies(cfg: Config) -> list[StrategyConfig]:
+    """
+    Define all strategies to run.
+
+    The first entry mirrors the previous single-strategy behaviour exactly.
+    Duplicate this block (with a different name and parameters) to add more.
+    """
+    return [
+        StrategyConfig(
+            name="default",
+            buy_size_usd=cfg.buy_size_usd,
+            stop_loss_pct=cfg.stop_loss_pct,
+            take_profit_multiple=cfg.take_profit_multiple,
+            take_profit_sell_fraction=cfg.take_profit_sell_fraction,
+            trailing_stop_pct=cfg.trailing_stop_pct,
+            starting_cash_usd=cfg.starting_cash_usd,
+        ),
+        # Example: a more aggressive strategy running alongside
+        # StrategyConfig(
+        #     name="aggressive",
+        #     buy_size_usd=20.0,
+        #     stop_loss_pct=0.20,
+        #     take_profit_multiple=3.0,
+        #     take_profit_sell_fraction=0.50,
+        #     trailing_stop_pct=0.25,
+        #     starting_cash_usd=cfg.starting_cash_usd,
+        # ),
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Live mode
 # ---------------------------------------------------------------------------
 
 async def run_live(cfg: Config) -> None:
     """
-    Connect to Telegram, listen for signals, and trade them with real prices.
+    Connect to Telegram, listen for signals, and trade them across all strategies.
 
-    All three coroutines run concurrently via asyncio.gather:
+    All coroutines run concurrently via asyncio.gather:
         1. TelegramListener  — produces signals into the queue
-        2. consume_signals() — feeds signals to the trading engine
+        2. consume_signals() — feeds signals to the engine
         3. monitor_positions() — polls prices and fires strategy rules
     """
     signal_queue: asyncio.Queue[TokenSignal] = asyncio.Queue()
-
-    # ------------------------------------------------------------------
-    # Persistence — restore state from previous session if it exists
-    # ------------------------------------------------------------------
     db = TradeDatabase()
 
-    saved = db.load_portfolio()
-    if saved:
-        available_cash, starting_cash = saved
-        logger.info("[RESTORE] Resuming session | cash=$%.2f", available_cash)
-    else:
-        available_cash = starting_cash = cfg.starting_cash_usd
-
-    portfolio = PortfolioState(
-        starting_cash_usd=starting_cash,
-        available_cash_usd=available_cash,
-    )
-
-    mgr = PortfolioManager()
-    for pos in db.load_open_positions():
-        mgr.add_position(pos)
-        logger.info("[RESTORE] Position %s | mint=%s", pos.symbol, pos.mint_address)
+    # Build and restore each strategy runner
+    strategy_cfgs = build_strategies(cfg)
+    runners: list[StrategyRunner] = []
+    for scfg in strategy_cfgs:
+        runner = StrategyRunner(cfg=scfg, db=db)
+        saved = db.load_portfolio(scfg.name)
+        if saved:
+            available_cash, starting_cash = saved
+            runner.restore_cash(available_cash, starting_cash)
+            logger.info(
+                "[RESTORE] Strategy '%s' | cash=$%.2f", scfg.name, available_cash
+            )
+        runner.restore_positions(db.load_open_positions(scfg.name))
+        runners.append(runner)
 
     listener = TelegramListener(cfg=cfg, signal_queue=signal_queue, db=db)
     await listener.start()
 
     async with aiohttp.ClientSession() as http:
         birdeye = BirdeyePriceClient(cfg=cfg, session=http)
-        exchange = PaperExchange(portfolio=portfolio, cfg=cfg)
-        engine = TradingEngine(
+        engine = MultiStrategyEngine(
             cfg=cfg,
+            runners=runners,
             birdeye_client=birdeye,
-            exchange=exchange,
-            portfolio=mgr,
             db=db,
         )
 
@@ -108,11 +143,12 @@ async def run_live(cfg: Config) -> None:
                 finally:
                     signal_queue.task_done()
 
+        names = ", ".join(r.name for r in runners)
         logger.info("=" * 60)
         logger.info("  Paper trading session started (live mode)")
-        logger.info("  Cash      : $%.2f", cfg.starting_cash_usd)
-        logger.info("  Buy size  : $%.2f", cfg.buy_size_usd)
-        logger.info("  TP        : %.1f×  |  SL : %.0f%%  |  Trail : %.0f%%",
+        logger.info("  Strategies : %s", names)
+        logger.info("  Buy size   : $%.2f / strategy", cfg.buy_size_usd)
+        logger.info("  TP         : %.1f×  |  SL : %.0f%%  |  Trail : %.0f%%",
                     cfg.take_profit_multiple,
                     cfg.stop_loss_pct * 100,
                     cfg.trailing_stop_pct * 100)
@@ -122,7 +158,7 @@ async def run_live(cfg: Config) -> None:
         try:
             await asyncio.gather(
                 consume_signals(),
-                engine.monitor_positions(cycles=None),   # runs indefinitely
+                engine.monitor_positions(cycles=None),
                 listener.run_until_disconnected(),
             )
         except (KeyboardInterrupt, asyncio.CancelledError):
@@ -130,7 +166,8 @@ async def run_live(cfg: Config) -> None:
         finally:
             logger.info("Shutting down...")
             engine.print_summary()
-            db.save_portfolio(portfolio)
+            for runner in runners:
+                db.save_portfolio(runner.portfolio_state, runner.name)
             db.close()
             await listener.disconnect()
 
@@ -141,36 +178,30 @@ async def run_live(cfg: Config) -> None:
 
 async def run_demo(cfg: Config) -> None:
     """
-    Inject a handful of known Solana tokens and monitor them.
+    Inject a handful of known Solana tokens across all configured strategies.
 
     No Telegram connection required — useful for verifying the Birdeye
     integration and strategy logic without needing a live channel post.
-
-    Replace or extend the demo_signals list with mints from your listener.
     """
-    # Known liquid Solana tokens — Birdeye prices these reliably
-    # NOTE: verify these mints are still canonical before use in production
     demo_signals = [
         TokenSignal(symbol="SOL",  mint_address="So11111111111111111111111111111111111111112"),
         TokenSignal(symbol="JUP",  mint_address="JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"),
         TokenSignal(symbol="BONK", mint_address="DezXAZ8z7PnrnRJjz3wXBoRgixCa6xpB263pB263pB26"),
     ]
 
-    portfolio = PortfolioState(
-        starting_cash_usd=cfg.starting_cash_usd,
-        available_cash_usd=cfg.starting_cash_usd,
-    )
+    strategy_cfgs = build_strategies(cfg)
+    runners = [StrategyRunner(cfg=scfg) for scfg in strategy_cfgs]
 
     async with aiohttp.ClientSession() as http:
         birdeye = BirdeyePriceClient(cfg=cfg, session=http)
-        exchange = PaperExchange(portfolio=portfolio, cfg=cfg)
-        mgr = PortfolioManager()
-        engine = TradingEngine(cfg=cfg, birdeye_client=birdeye, exchange=exchange, portfolio=mgr)
+        engine = MultiStrategyEngine(cfg=cfg, runners=runners, birdeye_client=birdeye)
 
+        names = ", ".join(r.name for r in runners)
         logger.info("=" * 60)
         logger.info("  Paper trading session started (DEMO mode)")
-        logger.info("  Signals   : %d", len(demo_signals))
-        logger.info("  Cycles    : %d @ %.1fs", cfg.demo_cycles, cfg.poll_interval_seconds)
+        logger.info("  Strategies : %s", names)
+        logger.info("  Signals    : %d", len(demo_signals))
+        logger.info("  Cycles     : %d @ %.1fs", cfg.demo_cycles, cfg.poll_interval_seconds)
         logger.info("=" * 60)
 
         async def inject() -> None:
@@ -190,7 +221,7 @@ async def run_demo(cfg: Config) -> None:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Solana Trader — Solana paper trading bot")
+    p = argparse.ArgumentParser(description="Solana Trader — multi-strategy paper trading bot")
     p.add_argument(
         "--demo",
         action="store_true",

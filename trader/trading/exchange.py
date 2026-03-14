@@ -17,7 +17,6 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from trader.config import Config
 from trader.trading.models import PortfolioState, Position, TokenSignal
 
 logger = logging.getLogger(__name__)
@@ -34,9 +33,12 @@ class PaperExchange:
 
     PnL formula (applied consistently across partial and full sells):
         pnl = (exit_price − entry_price) × quantity_sold
+
+    cfg is duck-typed — accepts Config or StrategyConfig as long as it exposes
+    stop_loss_pct, take_profit_multiple, take_profit_sell_fraction, trailing_stop_pct.
     """
 
-    def __init__(self, portfolio: PortfolioState, cfg: Config) -> None:
+    def __init__(self, portfolio: PortfolioState, cfg) -> None:
         self.portfolio = portfolio   # public — TradingEngine reads it for summary
         self._cfg = cfg
 
