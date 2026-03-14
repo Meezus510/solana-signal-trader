@@ -12,12 +12,9 @@ import sys
 from pathlib import Path
 
 
-def configure_logging(
-    level: int = logging.INFO,
-    log_file: str | None = "trader.log",
-) -> None:
+def configure_logging(level: int = logging.INFO) -> None:
     """
-    Configure the root logger with console + optional file output.
+    Configure the root logger with console-only output.
 
     Also sets up two dedicated structured loggers:
         signals  → signals.log   (every Telegram message + outcome)
@@ -30,11 +27,7 @@ def configure_logging(
     datefmt = "%Y-%m-%d %H:%M:%S"
     formatter = logging.Formatter(fmt, datefmt=datefmt)
 
-    handlers: list[logging.Handler] = [_stream_handler(formatter)]
-    if log_file:
-        handlers.append(_file_handler(log_file, formatter))
-
-    logging.basicConfig(level=level, handlers=handlers, force=True)
+    logging.basicConfig(level=level, handlers=[_stream_handler(formatter)], force=True)
 
     # Pipe-delimited structured logs — easy to tail or import into a spreadsheet
     _add_dedicated_logger("signals", "signals.log")
