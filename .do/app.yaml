@@ -1,0 +1,35 @@
+name: solana-signal-trader
+region: nyc
+
+workers:
+  - name: trader
+    github:
+      repo: Meezus510/solana-signal-trader
+      branch: main
+      deploy_on_push: true
+    run_command: python run.py
+    instance_size_slug: basic-xxs
+    instance_count: 1
+    envs:
+      - key: BIRDEYE_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+      - key: TG_API_ID
+        scope: RUN_TIME
+        type: SECRET
+      - key: TG_API_HASH
+        scope: RUN_TIME
+        type: SECRET
+      - key: TG_SESSION_STRING
+        scope: RUN_TIME
+        type: SECRET
+      - key: TG_CHANNEL
+        scope: RUN_TIME
+      - key: DB_PATH
+        scope: RUN_TIME
+        value: /app/data/trader.db   # must match the volume mount path
+
+# Persistent volume for SQLite DB
+# Attach via the DO UI: App → trader component → Storage → Add Volume
+# Mount path: /app/data
+# Then update TradeDatabase path to /app/data/trader.db via DB_PATH env var

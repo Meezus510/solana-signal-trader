@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from telethon.tl.types import Message
 
 from trader.config import Config
@@ -60,8 +61,13 @@ class TelegramListener:
 
         Raises on authentication failure or if the channel cannot be resolved.
         """
+        session = (
+            StringSession(self._cfg.tg_session_string)
+            if self._cfg.tg_session_string
+            else self._cfg.session_file
+        )
         self._client = TelegramClient(
-            self._cfg.session_file,
+            session,
             self._cfg.tg_api_id,
             self._cfg.tg_api_hash,
         )

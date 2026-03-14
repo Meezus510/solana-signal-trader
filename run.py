@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 
 import aiohttp
@@ -146,7 +147,7 @@ async def run_live(cfg: Config) -> None:
         3. monitor_positions() — polls prices and fires strategy rules
     """
     signal_queue: asyncio.Queue[TokenSignal] = asyncio.Queue()
-    db = TradeDatabase()
+    db = TradeDatabase(path=os.getenv("DB_PATH", "trader.db"))
 
     # Build and restore each strategy runner
     runners = build_runners(cfg, db=db)

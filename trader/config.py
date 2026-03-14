@@ -54,7 +54,8 @@ class Config:
     tg_api_hash: str = ""
     tg_phone: str = ""
     channel_username: str = ""
-    session_file: str = "trader/listener/tg_session"  # path to .session file
+    session_file: str = "trader/listener/tg_session"  # path to .session file (local)
+    tg_session_string: str = ""                        # StringSession value (cloud/DO)
 
     # ------------------------------------------------------------------
     # Factory
@@ -99,4 +100,5 @@ class Config:
             tg_api_hash=tg_api_hash,
             tg_phone=os.getenv("TG_PHONE", "").strip(),
             channel_username=channel,
+            tg_session_string=os.getenv("TG_SESSION_STRING", "").strip(),
         )
