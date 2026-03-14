@@ -167,8 +167,8 @@ class StrategyRunner:
                 self.name, signal.symbol,
             )
             signal_log.info(
-                "DUPLICATE  | %-10s | %-44s | strategy=%s",
-                signal.symbol, signal.mint_address, self.name,
+                "DUPLICATE  | %-10s | %-44s | ch=%-20s | strategy=%s",
+                signal.symbol, signal.mint_address, signal.source_channel, self.name,
             )
             if self._db:
                 self._db.log_signal(
@@ -180,8 +180,8 @@ class StrategyRunner:
         position = self._exchange.buy(signal, entry_price, self._cfg.buy_size_usd)
         if position is None:
             signal_log.info(
-                "NO_CASH    | %-10s | %-44s | strategy=%s",
-                signal.symbol, signal.mint_address, self.name,
+                "NO_CASH    | %-10s | %-44s | ch=%-20s | strategy=%s",
+                signal.symbol, signal.mint_address, signal.source_channel, self.name,
             )
             if self._db:
                 self._db.log_signal(

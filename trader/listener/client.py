@@ -133,6 +133,7 @@ class TelegramListener:
             logger.info("[CATCHUP] Processing missed message id=%d", msg.id)
             class _FakeEvent:
                 message = msg
+                chat = entity
             await self._on_new_message(_FakeEvent())
             caught += 1
 
@@ -166,6 +167,8 @@ class TelegramListener:
             5. Push a TokenSignal onto the queue.
         """
         msg: Message = event.message
+        chat = getattr(event, "chat", None)
+        channel = getattr(chat, "username", None) or getattr(chat, "title", None) or "unknown"
 
         if msg.id in self._seen_ids:
             return
@@ -193,14 +196,14 @@ class TelegramListener:
 
         if not result["is_first_call"]:
             logger.info("[TG] id=%d — update post, skipping", msg.id)
-            signal_log.info("UPDATE     | %-10s | %-44s | msg_id=%d", "-", "-", msg.id)
+            signal_log.info("UPDATE     | %-10s | %-44s | ch=%-20s | msg_id=%d", "-", "-", channel, msg.id)
             if self._db:
                 self._db.log_signal("UPDATE", msg_id=msg.id)
             return
 
         if not result["is_solana"]:
             logger.info("[TG] id=%d — not a Solana call, skipping", msg.id)
-            signal_log.info("NOT_SOLANA | %-10s | %-44s | msg_id=%d", "-", "-", msg.id)
+            signal_log.info("NOT_SOLANA | %-10s | %-44s | ch=%-20s | msg_id=%d", "-", "-", channel, msg.id)
             if self._db:
                 self._db.log_signal("NOT_SOLANA", msg_id=msg.id)
             return
@@ -210,7 +213,7 @@ class TelegramListener:
 
         if not mint:
             logger.info("[TG] id=%d — no mint address found, skipping", msg.id)
-            signal_log.info("NO_MINT    | %-10s | %-44s | msg_id=%d", symbol, "-", msg.id)
+            signal_log.info("NO_MINT    | %-10s | %-44s | ch=%-20s | msg_id=%d", symbol, "-", channel, msg.id)
             if self._db:
                 self._db.log_signal("NO_MINT", msg_id=msg.id, symbol=symbol)
             return
@@ -219,10 +222,11 @@ class TelegramListener:
             symbol=symbol,
             mint_address=mint,
             detected_at=datetime.now(timezone.utc),
+            source_channel=channel,
         )
 
-        logger.info("[QUEUE] %s | mint=%s | queue_depth=%d", symbol, mint, self._queue.qsize() + 1)
-        signal_log.info("QUEUED     | %-10s | %-44s | msg_id=%d", symbol, mint, msg.id)
+        logger.info("[QUEUE] %s | mint=%s | channel=%s | queue_depth=%d", symbol, mint, channel, self._queue.qsize() + 1)
+        signal_log.info("QUEUED     | %-10s | %-44s | ch=%-20s | msg_id=%d", symbol, mint, channel, msg.id)
         if self._db:
             self._db.log_signal("QUEUED", msg_id=msg.id, symbol=symbol, mint=mint)
 

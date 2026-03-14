@@ -67,8 +67,8 @@ class MultiStrategyEngine:
         Entry price is fetched once and shared — N strategies entering
         the same token costs 1 Birdeye call, not N calls.
         """
-        logger.info("[SIGNAL] %s | mint=%s", signal.symbol, signal.mint_address)
-        signal_log.info("SIGNAL     | %-10s | %-44s", signal.symbol, signal.mint_address)
+        logger.info("[SIGNAL] %s | mint=%s | channel=%s", signal.symbol, signal.mint_address, signal.source_channel)
+        signal_log.info("SIGNAL     | %-10s | %-44s | ch=%-20s", signal.symbol, signal.mint_address, signal.source_channel)
         if self._db:
             self._db.log_signal("SIGNAL", symbol=signal.symbol, mint=signal.mint_address)
 
@@ -79,7 +79,7 @@ class MultiStrategyEngine:
         entry_price = await self._birdeye.get_price(signal.mint_address)
         if entry_price is None:
             logger.warning("[SKIP] No live price for %s — entry aborted", signal.symbol)
-            signal_log.info("NO_PRICE   | %-10s | %-44s", signal.symbol, signal.mint_address)
+            signal_log.info("NO_PRICE   | %-10s | %-44s | ch=%-20s", signal.symbol, signal.mint_address, signal.source_channel)
             if self._db:
                 self._db.log_signal("NO_PRICE", symbol=signal.symbol, mint=signal.mint_address)
             return
