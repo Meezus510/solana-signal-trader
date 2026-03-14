@@ -177,8 +177,16 @@ class TelegramListener:
         if not raw_text.strip():
             return
 
+        # Extract URLs from Telegram hyperlink entities — some channels embed
+        # the GMGN URL behind a button label, not as plain text in msg.text
+        entity_urls = [
+            ent.url
+            for ent in (msg.entities or [])
+            if hasattr(ent, "url") and ent.url
+        ]
+
         try:
-            result = parse_message(raw_text)
+            result = parse_message(raw_text, extra_urls=entity_urls)
         except Exception:
             logger.exception("[TG] Parse error on message id=%d", msg.id)
             return

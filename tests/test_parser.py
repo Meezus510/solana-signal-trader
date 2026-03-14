@@ -14,6 +14,8 @@ from trader.listener.parser import (
     is_update_message,
     is_valid_solana_mint,
     parse_message,
+    _extract_mint_from_text,
+    _extract_symbol_near_mint,
 )
 
 # ---------------------------------------------------------------------------
@@ -35,6 +37,16 @@ BSC_MSG   = "$TOKEN launching on BSC!\nhttps://dexscreener.com/bsc/0xABCDEF1234"
 
 KNOWN_MINT = "9QMwJiVFrnCzuqCNvNy2fFUHUmNX5hvAavENz6z9pump"
 KNOWN_PAIR = "6nikn2kqczlvfrmjlyfwzzs4frawfpevrqwgefncycma"
+
+# Plain-text channel sample messages
+PT_INTO_PAREN   = "Just threw a bag into SAVE ACT (AGU7zCRVxHtYvhf3HoDfswXNQd8sNvWWecgWGGtQpump) — low mc, mad room to run."
+PT_INTO_AT      = "Just threw a bag into riposhima at contract QsqzYpqVuiwFYMipAvQ5p7fFmLza7tY7LXmidFApump — market cap tiny."
+PT_TOKEN_AT     = "Memehouse at E93JuGQcHiXZ9upFZWELgvu5QsC9DD1qzkcGhJrpump is a sleeper, low cap gem."
+PT_TOKEN_PAREN  = "Fiona (Fo5uXf6BpnSKYAzTCa3F9E3MBMo9HL8WEo1knSX8pump) is a sleeper."
+PT_MINT_FIRST   = "F5ikgxvyvDVuH963p3eTDPjSyBoK8w3bqAdp4iQTpump — Chad's low cap gem."
+PT_UPDATE_X2    = "🔥 X2 profit reached for QsqzYpqVuiwFYMipAvQ5p7fFmLza7tY7LXmidFApump!\nEntry MC: 31K | Current: 65K"
+PT_UPDATE_ENTRY = "MC: 94K | riposhima | 📊 GMGN Chart\nSource: Pumpview.fun\nProfit: +203% from signal entry\nUpdated: 2026-03-14 06:18:23 UTC"
+PT_GAINERS      = "Top 10 Gainers in Last 24h\n1. Pepper | MC: 31.0 → 333.0 | 📈 974.19%"
 
 
 # ---------------------------------------------------------------------------
