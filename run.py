@@ -40,7 +40,12 @@ from trader.persistence.database import TradeDatabase
 from trader.pricing.birdeye import BirdeyePriceClient
 from trader.trading.engine import MultiStrategyEngine
 from trader.trading.models import TokenSignal
-from trader.trading.strategy import StrategyConfig, StrategyRunner
+from trader.trading.strategy import (
+    InfiniteMoonbagRunner,
+    StrategyConfig,
+    StrategyRunner,
+    TakeProfitLevel,
+)
 from trader.utils.logging import configure_logging
 
 # ---------------------------------------------------------------------------
@@ -59,80 +64,71 @@ logger = logging.getLogger(__name__)
 # Each strategy is fully isolated: its own cash, positions, and PnL.
 # All strategies share the same Birdeye price feed.
 
-def build_strategies(cfg: Config) -> list[StrategyConfig]:
+def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
     """
-    Active strategy roster.
+    Active strategy roster — three independent runners, one shared Birdeye feed.
 
-    Each strategy runs independently with its own cash ($1000), positions,
-    and PnL. All three share a single Birdeye price feed.
+    quick_pop
+        Fast scalp: TP1 at 1.5× (sell 60% of original) → TP2 at 2.2× (sell 20%)
+        Trail at 25% below high after TP1.
+        Exit after 45 min if price < entry × 1.08. Max hold: 2 hours.
 
-    Strategy A — Balanced Momentum
-        TP1 at 1.8×, sell 50% → trail at 30% below high
-        Timeout: exit after 90 min if price < entry × 1.15
-        Max hold: 4 hours
+    trend_rider
+        Momentum hold: TP1 at 1.8× (sell 50% of original)
+        Trail at 30% below high after TP1.
+        Exit after 90 min if price < entry × 1.15. Max hold: 4 hours.
 
-    Strategy B — Aggressive Moonbag
-        TP1 at 2.5×, sell 50% → trail at 35% below high
-        Timeout: exit after 2 h if price < entry × 1.10
-        Max hold: 6 hours
-
-    Strategy C — Fast Scalp
-        TP1 at 1.5×, sell 60% of original → trail at 25% below high
-        TP2 at 2.2×, sell 20% of original
-        Timeout: exit after 45 min if price < entry × 1.08
-        Max hold: 2 hours
+    infinite_moonbag
+        Progressive ratcheting stop — no time exits.
+        De-risk at 3× (5% of original) and 10× (10% of original).
+        Stop ladder rises monotonically as highest_price advances.
     """
+    quick_pop_cfg = StrategyConfig(
+        name="quick_pop",
+        buy_size_usd=cfg.buy_size_usd,
+        stop_loss_pct=0.25,
+        take_profit_levels=(
+            TakeProfitLevel(multiple=1.5, sell_fraction_original=0.60),
+            TakeProfitLevel(multiple=2.2, sell_fraction_original=0.20),
+        ),
+        trailing_stop_pct=0.25,
+        starting_cash_usd=cfg.starting_cash_usd,
+        timeout_minutes=45.0,
+        timeout_min_gain_pct=0.08,
+        max_hold_minutes=120.0,
+    )
+
+    trend_rider_cfg = StrategyConfig(
+        name="trend_rider",
+        buy_size_usd=cfg.buy_size_usd,
+        stop_loss_pct=0.30,
+        take_profit_levels=(
+            TakeProfitLevel(multiple=1.8, sell_fraction_original=0.50),
+        ),
+        trailing_stop_pct=0.30,
+        starting_cash_usd=cfg.starting_cash_usd,
+        timeout_minutes=90.0,
+        timeout_min_gain_pct=0.15,
+        max_hold_minutes=240.0,
+    )
+
+    moonbag_cfg = StrategyConfig(
+        name="infinite_moonbag",
+        buy_size_usd=cfg.buy_size_usd,
+        stop_loss_pct=0.40,   # initial stop at entry × 0.60 (−40%)
+        take_profit_levels=(
+            TakeProfitLevel(multiple=3.0,  sell_fraction_original=0.05),
+            TakeProfitLevel(multiple=10.0, sell_fraction_original=0.10),
+        ),
+        trailing_stop_pct=0.40,   # not used — ladder overrides stop_loss_price
+        starting_cash_usd=cfg.starting_cash_usd,
+        # No timeout or max_hold — InfiniteMoonbagRunner ignores them
+    )
+
     return [
-        # ------------------------------------------------------------------
-        # Strategy A: Balanced Momentum
-        # ------------------------------------------------------------------
-        StrategyConfig(
-            name="balanced_momentum",
-            buy_size_usd=10.0,
-            stop_loss_pct=0.30,             # -30% from entry
-            take_profit_multiple=1.8,        # TP1 at 1.8×
-            take_profit_sell_fraction=0.50,  # sell 50% of remaining at TP1
-            trailing_stop_pct=0.30,          # trail at 30% below high-water
-            starting_cash_usd=cfg.starting_cash_usd,
-            timeout_minutes=90.0,
-            timeout_min_gain_pct=0.15,       # exit if price < entry × 1.15 after 90 min
-            max_hold_minutes=240.0,          # unconditional exit at 4 hours
-        ),
-
-        # ------------------------------------------------------------------
-        # Strategy B: Aggressive Moonbag
-        # ------------------------------------------------------------------
-        StrategyConfig(
-            name="aggressive_moonbag",
-            buy_size_usd=10.0,
-            stop_loss_pct=0.35,             # -35% from entry
-            take_profit_multiple=2.5,        # TP1 at 2.5×
-            take_profit_sell_fraction=0.50,  # sell 50% of remaining at TP1
-            trailing_stop_pct=0.35,          # trail at 35% below high-water
-            starting_cash_usd=cfg.starting_cash_usd,
-            timeout_minutes=120.0,
-            timeout_min_gain_pct=0.10,       # exit if price < entry × 1.10 after 2 h
-            max_hold_minutes=360.0,          # unconditional exit at 6 hours
-        ),
-
-        # ------------------------------------------------------------------
-        # Strategy C: Fast Scalp
-        # ------------------------------------------------------------------
-        StrategyConfig(
-            name="fast_scalp",
-            buy_size_usd=10.0,
-            stop_loss_pct=0.25,             # -25% from entry
-            take_profit_multiple=1.5,        # TP1 at 1.5×
-            take_profit_sell_fraction=0.60,  # sell 60% of remaining at TP1 (= 60% of original)
-            trailing_stop_pct=0.25,          # trail at 25% below high-water
-            starting_cash_usd=cfg.starting_cash_usd,
-            # TP2: sell 20% of ORIGINAL qty when price reaches 2.2×
-            take_profit2_multiple=2.2,
-            take_profit2_original_fraction=0.20,
-            timeout_minutes=45.0,
-            timeout_min_gain_pct=0.08,       # exit if price < entry × 1.08 after 45 min
-            max_hold_minutes=120.0,          # unconditional exit at 2 hours
-        ),
+        StrategyRunner(cfg=quick_pop_cfg, db=db),
+        StrategyRunner(cfg=trend_rider_cfg, db=db),
+        InfiniteMoonbagRunner(cfg=moonbag_cfg, db=db),
     ]
 
 
@@ -153,19 +149,16 @@ async def run_live(cfg: Config) -> None:
     db = TradeDatabase()
 
     # Build and restore each strategy runner
-    strategy_cfgs = build_strategies(cfg)
-    runners: list[StrategyRunner] = []
-    for scfg in strategy_cfgs:
-        runner = StrategyRunner(cfg=scfg, db=db)
-        saved = db.load_portfolio(scfg.name)
+    runners = build_runners(cfg, db=db)
+    for runner in runners:
+        saved = db.load_portfolio(runner.name)
         if saved:
             available_cash, starting_cash = saved
             runner.restore_cash(available_cash, starting_cash)
             logger.info(
-                "[RESTORE] Strategy '%s' | cash=$%.2f", scfg.name, available_cash
+                "[RESTORE] Strategy '%s' | cash=$%.2f", runner.name, available_cash
             )
-        runner.restore_positions(db.load_open_positions(scfg.name))
-        runners.append(runner)
+        runner.restore_positions(db.load_open_positions(runner.name))
 
     listener = TelegramListener(cfg=cfg, signal_queue=signal_queue, db=db)
     await listener.start()
@@ -195,10 +188,6 @@ async def run_live(cfg: Config) -> None:
         logger.info("  Paper trading session started (live mode)")
         logger.info("  Strategies : %s", names)
         logger.info("  Buy size   : $%.2f / strategy", cfg.buy_size_usd)
-        logger.info("  TP         : %.1f×  |  SL : %.0f%%  |  Trail : %.0f%%",
-                    cfg.take_profit_multiple,
-                    cfg.stop_loss_pct * 100,
-                    cfg.trailing_stop_pct * 100)
         logger.info("  Press Ctrl+C to stop and print final summary.")
         logger.info("=" * 60)
 
@@ -236,8 +225,7 @@ async def run_demo(cfg: Config) -> None:
         TokenSignal(symbol="BONK", mint_address="DezXAZ8z7PnrnRJjz3wXBoRgixCa6xpB263pB263pB26"),
     ]
 
-    strategy_cfgs = build_strategies(cfg)
-    runners = [StrategyRunner(cfg=scfg) for scfg in strategy_cfgs]
+    runners = build_runners(cfg)
 
     async with aiohttp.ClientSession() as http:
         birdeye = BirdeyePriceClient(cfg=cfg, session=http)

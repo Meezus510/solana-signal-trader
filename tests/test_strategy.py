@@ -18,26 +18,27 @@ from __future__ import annotations
 import pytest
 from datetime import datetime, timezone
 
-from trader.config import Config
 from trader.trading.exchange import PaperExchange
 from trader.trading.models import PortfolioState, TokenSignal
 from trader.trading.portfolio import PortfolioManager
+from trader.trading.strategy import StrategyConfig, TakeProfitLevel
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _cfg() -> Config:
-    """Minimal Config for testing — no env vars required."""
-    return Config(
-        birdeye_api_key="test-key",
-        starting_cash_usd=1_000.0,
+def _cfg() -> StrategyConfig:
+    """Minimal StrategyConfig for testing — TP at 2.5×, SL at -35%."""
+    return StrategyConfig(
+        name="test",
         buy_size_usd=10.0,
         stop_loss_pct=0.35,
-        take_profit_multiple=2.5,
-        take_profit_sell_fraction=0.50,
+        take_profit_levels=(
+            TakeProfitLevel(multiple=2.5, sell_fraction_original=0.50),
+        ),
         trailing_stop_pct=0.35,
+        starting_cash_usd=1_000.0,
     )
 
 

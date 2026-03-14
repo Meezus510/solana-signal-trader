@@ -34,8 +34,8 @@ class PaperExchange:
     PnL formula (applied consistently across partial and full sells):
         pnl = (exit_price − entry_price) × quantity_sold
 
-    cfg is duck-typed — accepts Config or StrategyConfig as long as it exposes
-    stop_loss_pct, take_profit_multiple, take_profit_sell_fraction, trailing_stop_pct.
+    cfg is duck-typed — accepts StrategyConfig as long as it exposes
+    stop_loss_pct, take_profit_levels, trailing_stop_pct.
     """
 
     def __init__(self, portfolio: PortfolioState, cfg) -> None:
@@ -82,7 +82,7 @@ class PaperExchange:
             opened_at=datetime.now(timezone.utc),
             closed_at=None,
             highest_price=entry_price,
-            take_profit_price=entry_price * cfg.take_profit_multiple,
+            take_profit_price=entry_price * cfg.take_profit_levels[0].multiple,
             stop_loss_price=entry_price * (1.0 - cfg.stop_loss_pct),
             trailing_active=False,
             trailing_stop_pct=cfg.trailing_stop_pct,

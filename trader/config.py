@@ -40,14 +40,6 @@ class Config:
     buy_size_usd: float = 10.0
 
     # ------------------------------------------------------------------
-    # Strategy
-    # ------------------------------------------------------------------
-    stop_loss_pct: float = 0.35              # hard stop at -35% below entry
-    take_profit_multiple: float = 2.5        # first TP fires at 2.5× entry
-    take_profit_sell_fraction: float = 0.50  # sell 50% of position at TP
-    trailing_stop_pct: float = 0.35          # 35% trailing stop on remainder
-
-    # ------------------------------------------------------------------
     # Operational
     # ------------------------------------------------------------------
     poll_interval_seconds: float = 1.0

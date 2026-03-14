@@ -1,29 +1,27 @@
 """
 trader/trading/strategy.py — Per-strategy configuration and isolated execution.
 
-StrategyConfig holds all tunable parameters for one strategy instance,
-including optional fields for TP2, timeout, and max-hold rules.
+TakeProfitLevel    — one TP milestone (price multiple + fraction of original qty)
+StrategyConfig     — full tunable config for one strategy instance
+StrategyRunner     — base class; handles entry, standard TP/trailing, reporting, DB
+InfiniteMoonbagRunner — subclass; overrides evaluate_position() with a progressive
+                        ratcheting stop ladder and no time-based exits
 
-StrategyRunner owns its own PortfolioManager + PaperExchange and applies
-strategy rules to positions independently of all other runners.
+Order of operations per price tick (StrategyRunner):
+    1. Update highest_price_seen if new high
+    2. Check existing stop (from PREVIOUS tick) — trailing_stop if active, else stop_loss
+    3. Check max_hold (unconditional time exit)
+    4. Check timeout (exit if stagnant)
+    5. Process TP milestones in ascending order — each sells % of ORIGINAL qty
+    6. Update trailing stop based on latest highest_price_seen
+    (No same-tick re-check so behavior is deterministic)
 
-Adding a new strategy: define a StrategyConfig and add it to run.py.
-No code duplication required.
-
-evaluate_position() state machine
-----------------------------------
-Phase 1 (trailing_active = False):
-    → max hold check
-    → timeout check
-    → stop loss check
-    → TP1 check  (sell fraction of remaining, activate trailing)
-
-Phase 2 (trailing_active = True):
-    → max hold check
-    → timeout check
-    → TP2 check  (optional — sell fixed % of ORIGINAL qty at a higher multiple)
-    → update trailing high-water mark
-    → trailing stop check  (sell all remaining)
+Order of operations per price tick (InfiniteMoonbagRunner):
+    1. Update highest_price_seen if new high
+    2. Check existing stop (stop_loss_price = progressive ladder from previous tick)
+    3. Process TP milestones in ascending order — each sells % of ORIGINAL qty
+    4. Recompute stop ladder (uses updated highest_price_seen, always monotonic)
+    (No timeout. No max hold.)
 """
 
 from __future__ import annotations
@@ -41,56 +39,64 @@ logger = logging.getLogger(__name__)
 trade_log = logging.getLogger("trades")
 signal_log = logging.getLogger("signals")
 
+_EPSILON = 1e-10  # treat remaining_quantity below this as zero
+
+
+# ---------------------------------------------------------------------------
+# Config types
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TakeProfitLevel:
+    """One TP milestone: fire when price >= entry * multiple, sell sell_fraction_original of ORIGINAL qty."""
+    multiple: float
+    sell_fraction_original: float   # fraction of position.initial_quantity, NOT remaining
+
 
 @dataclass(frozen=True)
 class StrategyConfig:
     """
     Tunable parameters for one strategy instance.
 
-    Required fields
-    ---------------
-    name, buy_size_usd, stop_loss_pct, take_profit_multiple,
-    take_profit_sell_fraction, trailing_stop_pct, starting_cash_usd
+    take_profit_levels must be ordered ascending by multiple so that milestones
+    are processed lowest-to-highest on each price tick.
 
     Optional fields
     ---------------
-    take_profit2_multiple          — price multiple for a second TP event
-    take_profit2_original_fraction — fraction of INITIAL qty to sell at TP2
-                                     (not fraction of remaining)
-    timeout_minutes                — exit if position is older than this …
-    timeout_min_gain_pct           — … AND current price < entry * (1 + this)
-    max_hold_minutes               — unconditional exit after this many minutes
+    timeout_minutes / timeout_min_gain_pct
+        Exit if age > timeout_minutes AND price < entry * (1 + timeout_min_gain_pct).
+    max_hold_minutes
+        Unconditional exit after this many minutes regardless of price.
     """
-    # Core
     name: str
     buy_size_usd: float
-    stop_loss_pct: float
-    take_profit_multiple: float
-    take_profit_sell_fraction: float
-    trailing_stop_pct: float
+    stop_loss_pct: float                          # initial stop: entry * (1 - pct)
+    take_profit_levels: tuple[TakeProfitLevel, ...] # TP milestones, ASC by multiple
+    trailing_stop_pct: float                      # trail: highest * (1 - pct) after TP1
     starting_cash_usd: float
 
-    # TP2 (optional — e.g. Strategy C fast-scalp second take-profit)
-    take_profit2_multiple: Optional[float] = None
-    take_profit2_original_fraction: Optional[float] = None
-
-    # Timeout: exit stagnant positions early
+    # Time-based exits (optional — InfiniteMoonbagRunner ignores these)
     timeout_minutes: Optional[float] = None
-    timeout_min_gain_pct: Optional[float] = None  # exit if price < entry*(1+pct)
-
-    # Max hold: unconditional time-based exit
+    timeout_min_gain_pct: Optional[float] = None
     max_hold_minutes: Optional[float] = None
 
 
+# ---------------------------------------------------------------------------
+# Base runner
+# ---------------------------------------------------------------------------
+
 class StrategyRunner:
     """
-    Manages the full lifecycle of one strategy in isolation:
-        - owns its own PortfolioManager and PaperExchange
-        - opens positions via enter_position()
-        - evaluates and closes positions via evaluate_position()
+    Manages the full lifecycle of one strategy in complete isolation.
 
-    Price fetching is NOT done here. MultiStrategyEngine fetches each mint
-    price once and fans it out to all StrategyRunners holding that mint.
+    Each runner owns its own PortfolioManager + PaperExchange so cash,
+    positions, and PnL are never shared with other strategies.
+
+    Price fetching lives in MultiStrategyEngine — runners only receive a
+    pre-fetched price, ensuring one Birdeye call per unique mint per cycle.
+
+    Subclass and override evaluate_position() to implement custom exit logic
+    (see InfiniteMoonbagRunner below).
     """
 
     def __init__(self, cfg: StrategyConfig, db=None) -> None:
@@ -152,9 +158,8 @@ class StrategyRunner:
 
     def enter_position(self, signal: TokenSignal, entry_price: float) -> Optional[Position]:
         """
-        Attempt to open a position for this strategy at the pre-fetched price.
-
-        Returns the opened Position, or None if skipped (duplicate / no cash).
+        Open a paper position at the pre-fetched price.
+        Returns None if skipped (duplicate mint or insufficient cash).
         """
         if self._portfolio.has_open_position(signal.mint_address):
             logger.info(
@@ -189,7 +194,7 @@ class StrategyRunner:
         self._portfolio.add_position(position)
 
         logger.info(
-            "[%s] [BUY] %s | qty=%.4f | entry=$%.8f | tp=$%.8f | sl=$%.8f | cash=$%.2f",
+            "[%s] [BUY] %s | qty=%.4f | entry=$%.8f | tp1=$%.8f | sl=$%.8f | cash=$%.2f",
             self.name, signal.symbol,
             position.initial_quantity, entry_price,
             position.take_profit_price, position.stop_loss_price,
@@ -213,19 +218,14 @@ class StrategyRunner:
 
     def evaluate_position(self, position: Position, current_price: float) -> None:
         """
-        Apply all strategy rules to one position at the current price.
+        Standard evaluation used by quick_pop and trend_rider.
 
-        Evaluation order (both phases):
-            1. Max hold  — unconditional time exit
-            2. Timeout   — exit if stagnant beyond the configured window
+        All TP sells use % of ORIGINAL position quantity (not remaining).
+        Trailing stop activates after TP1 and is monotonically tightened.
 
-        Phase 1 (trailing not yet active):
-            3. Stop loss — hard floor exit
-            4. TP1       — partial sell, activates trailing
-
-        Phase 2 (trailing active):
-            3. TP2       — optional second partial sell (% of ORIGINAL qty)
-            4. Trail     — update high-water mark, fire trailing stop
+        Key ordering rule: check existing stop BEFORE updating the trailing
+        stop, so that same-tick trailing tightening cannot cause same-tick
+        unexpected exits. TPs are processed first, trailing state updated after.
         """
         if position.status == "CLOSED":
             return
@@ -237,16 +237,36 @@ class StrategyRunner:
             opened_at = opened_at.replace(tzinfo=timezone.utc)
         age_minutes = (now - opened_at).total_seconds() / 60.0
 
-        # ---- Max hold (unconditional exit) ----
+        # 1. Update highest price seen
+        if current_price > position.highest_price:
+            position.highest_price = current_price
+
+        # 2. Check existing stop (values from previous tick — before any update this tick)
+        #    Trailing stop if active, else fixed stop_loss_price.
+        current_stop = (
+            position.trailing_stop_price
+            if position.trailing_active and position.trailing_stop_price is not None
+            else position.stop_loss_price
+        )
+        if current_price <= current_stop:
+            reason = "TRAILING_STOP" if position.trailing_active else "STOP_LOSS"
+            logger.info(
+                "[%s] [%s] %s | price=$%.8f | stop=$%.8f",
+                self.name, reason, position.symbol, current_price, current_stop,
+            )
+            self._close_position(position, current_price, reason, now)
+            return
+
+        # 3. Max hold (unconditional)
         if cfg.max_hold_minutes is not None and age_minutes >= cfg.max_hold_minutes:
             logger.info(
                 "[%s] [MAX_HOLD] %s | age=%.0fmin >= %.0fmin",
                 self.name, position.symbol, age_minutes, cfg.max_hold_minutes,
             )
-            self._close_position(position, current_price, "MAX_HOLD")
+            self._close_position(position, current_price, "MAX_HOLD", now)
             return
 
-        # ---- Timeout (position not gaining enough) ----
+        # 4. Timeout (position not gaining enough)
         if (
             cfg.timeout_minutes is not None
             and age_minutes >= cfg.timeout_minutes
@@ -254,139 +274,90 @@ class StrategyRunner:
             and current_price < position.entry_price * (1.0 + cfg.timeout_min_gain_pct)
         ):
             logger.info(
-                "[%s] [TIMEOUT] %s | age=%.0fmin | price=$%.8f < threshold=$%.8f",
+                "[%s] [TIMEOUT] %s | age=%.0fmin | price=$%.8f | threshold=$%.8f",
                 self.name, position.symbol, age_minutes,
                 current_price,
                 position.entry_price * (1.0 + cfg.timeout_min_gain_pct),
             )
-            self._close_position(position, current_price, "TIMEOUT_SLOW")
+            self._close_position(position, current_price, "TIMEOUT_SLOW", now)
             return
 
-        # ================================================================
-        # Phase 1 — TP1 not yet hit (trailing not active)
-        # ================================================================
-        if not position.trailing_active:
+        # 5. Process TP milestones in ascending order (config must be sorted ASC)
+        #    Each fires when price >= entry * level.multiple and the flag is not yet set.
+        #    Sells sell_fraction_original of ORIGINAL quantity (clamped to remaining).
+        for i, tp_level in enumerate(cfg.take_profit_levels):
+            if i > 1:
+                break  # Position model supports up to 2 TP flags
 
-            # ---- Hard stop loss ----
-            if current_price <= position.stop_loss_price:
-                logger.info(
-                    "[%s] [SL] %s | current=$%.8f | sl=$%.8f",
-                    self.name, position.symbol, current_price, position.stop_loss_price,
-                )
-                self._close_position(position, current_price, "STOP_LOSS")
+            already_hit = position.partial_take_profit_hit if i == 0 else position.tp2_hit
+            if already_hit:
+                continue
+
+            if current_price < position.entry_price * tp_level.multiple:
+                continue  # not reached yet
+
+            tp_qty = min(
+                position.initial_quantity * tp_level.sell_fraction_original,
+                position.remaining_quantity,
+            )
+            if tp_qty < _EPSILON:
+                continue
+
+            fraction = tp_qty / position.remaining_quantity
+            pnl = (current_price - position.entry_price) * tp_qty
+            label = f"TP{i + 1}"
+            self._exchange.sell_partial(position, fraction, current_price, label)
+
+            if i == 0:
+                position.partial_take_profit_hit = True
+                position.trailing_active = True
+            else:
+                position.tp2_hit = True
+
+            logger.info(
+                "[%s] [%s] %s %.1f× | sold %.0f%% of original | qty=%.6f | "
+                "pnl=$%+.4f | remaining=%.6f",
+                self.name, label, position.symbol, tp_level.multiple,
+                tp_level.sell_fraction_original * 100,
+                tp_qty, pnl, position.remaining_quantity,
+            )
+            trade_log.info(
+                "%-13s | %-10s | %-44s | price=$%.8f | qty=%.4f | pnl=$%+.4f | strategy=%s",
+                label, position.symbol, position.mint_address,
+                current_price, tp_qty, pnl, self.name,
+            )
+            if self._db:
+                self._db.upsert_position(position)
+                self._db.save_portfolio(self._exchange.portfolio, self.name)
+                self._db.log_trade(label, position, current_price, tp_qty, pnl)
+
+            if position.remaining_quantity < _EPSILON:
+                self._force_close(position, f"{label}_FULL", now)
                 return
 
-            # ---- TP1 (partial sell, activate trailing) ----
-            if current_price >= position.take_profit_price:
-                qty = position.remaining_quantity * cfg.take_profit_sell_fraction
-                pnl = (current_price - position.entry_price) * qty
-                self._exchange.sell_partial(
-                    position, cfg.take_profit_sell_fraction, current_price, "TP1"
-                )
-                position.trailing_active = True
-                position.partial_take_profit_hit = True
-                position.highest_price = current_price
-                position.trailing_stop_price = current_price * (1.0 - cfg.trailing_stop_pct)
-
-                logger.info(
-                    "[%s] [TP1] %s %.1f× | sold=%.0f%% | price=$%.8f | "
-                    "trail_stop=$%.8f | remaining_qty=%.6f",
-                    self.name, position.symbol, cfg.take_profit_multiple,
-                    cfg.take_profit_sell_fraction * 100, current_price,
-                    position.trailing_stop_price, position.remaining_quantity,
-                )
-                trade_log.info(
-                    "TP1          | %-10s | %-44s | price=$%.8f | qty=%.4f | pnl=$%+.4f | strategy=%s",
-                    position.symbol, position.mint_address,
-                    current_price, qty, pnl, self.name,
-                )
-                if self._db:
-                    self._db.upsert_position(position)
-                    self._db.save_portfolio(self._exchange.portfolio, self.name)
-                    self._db.log_trade("TP1", position, current_price, qty, pnl)
-
-                # Edge case: if sell fraction was 100%, position is now empty
-                if position.remaining_quantity < 1e-10:
-                    position.status = "CLOSED"
-                    position.closed_at = now
-                    position.sell_reason = "TP1_FULL"
-                    self._portfolio.close_position(position.mint_address)
-
-        # ================================================================
-        # Phase 2 — TP1 fired, trailing now active
-        # ================================================================
-        else:
-
-            # ---- TP2 (optional second take-profit, % of ORIGINAL qty) ----
-            if (
-                cfg.take_profit2_multiple is not None
-                and not position.tp2_hit
-                and current_price >= position.entry_price * cfg.take_profit2_multiple
-            ):
-                # Sell a fixed percentage of the ORIGINAL position size,
-                # not the remaining size — clamped so we never oversell.
-                tp2_qty = position.initial_quantity * (cfg.take_profit2_original_fraction or 0.0)
-                qty_to_sell = min(tp2_qty, position.remaining_quantity)
-
-                if qty_to_sell > 1e-12:
-                    fraction = qty_to_sell / position.remaining_quantity
-                    pnl = (current_price - position.entry_price) * qty_to_sell
-                    self._exchange.sell_partial(position, fraction, current_price, "TP2")
-                    position.tp2_hit = True
-
-                    logger.info(
-                        "[%s] [TP2] %s %.1f× | sold_qty=%.6f (%.0f%% of original) | "
-                        "price=$%.8f | pnl=$%+.4f | remaining_qty=%.6f",
-                        self.name, position.symbol, cfg.take_profit2_multiple,
-                        qty_to_sell,
-                        (cfg.take_profit2_original_fraction or 0) * 100,
-                        current_price, pnl, position.remaining_quantity,
-                    )
-                    trade_log.info(
-                        "TP2          | %-10s | %-44s | price=$%.8f | qty=%.4f | pnl=$%+.4f | strategy=%s",
-                        position.symbol, position.mint_address,
-                        current_price, qty_to_sell, pnl, self.name,
-                    )
-                    if self._db:
-                        self._db.upsert_position(position)
-                        self._db.save_portfolio(self._exchange.portfolio, self.name)
-                        self._db.log_trade("TP2", position, current_price, qty_to_sell, pnl)
-
-                    # If TP2 exhausted the remaining quantity, close cleanly
-                    if position.remaining_quantity < 1e-10:
-                        position.status = "CLOSED"
-                        position.closed_at = now
-                        position.sell_reason = "TP2_FULL"
-                        self._portfolio.close_position(position.mint_address)
-                        return
-
-            # ---- Update trailing high-water mark ----
-            if current_price > position.highest_price:
-                position.highest_price = current_price
-                position.trailing_stop_price = current_price * (1.0 - cfg.trailing_stop_pct)
-                logger.info(
-                    "[%s] [TRAIL] %s new high=$%.8f | trail_stop=$%.8f",
+        # 6. Update trailing stop based on latest highest_price_seen (monotonic)
+        if position.trailing_active:
+            candidate = position.highest_price * (1.0 - cfg.trailing_stop_pct)
+            if position.trailing_stop_price is None or candidate > position.trailing_stop_price:
+                position.trailing_stop_price = candidate
+                logger.debug(
+                    "[%s] [TRAIL] %s | high=$%.8f | new_stop=$%.8f",
                     self.name, position.symbol,
                     position.highest_price, position.trailing_stop_price,
                 )
 
-            # ---- Trailing stop triggered ----
-            if (
-                position.trailing_stop_price is not None
-                and current_price <= position.trailing_stop_price
-            ):
-                logger.info(
-                    "[%s] [TRAIL] %s stop triggered | current=$%.8f | trail_stop=$%.8f",
-                    self.name, position.symbol, current_price, position.trailing_stop_price,
-                )
-                self._close_position(position, current_price, "TRAILING_STOP")
-
     # ------------------------------------------------------------------
-    # Internal exit helper
+    # Internal helpers
     # ------------------------------------------------------------------
 
-    def _close_position(self, position: Position, price: float, reason: str) -> None:
-        """Sell all remaining quantity, close the position, and persist."""
+    def _close_position(
+        self,
+        position: Position,
+        price: float,
+        reason: str,
+        now: Optional[datetime] = None,
+    ) -> None:
+        """Sell all remaining, remove from open index, log, and persist."""
         qty = position.remaining_quantity
         pnl = (price - position.entry_price) * qty
         self._exchange.sell_all(position, price, reason)
@@ -401,12 +372,21 @@ class StrategyRunner:
             self._db.save_portfolio(self._exchange.portfolio, self.name)
             self._db.log_trade(reason, position, price, qty, pnl)
 
+    def _force_close(self, position: Position, reason: str, now: datetime) -> None:
+        """Mark a position closed when remaining_quantity hits zero after partial sells."""
+        position.status = "CLOSED"
+        position.closed_at = now
+        position.sell_reason = reason
+        self._portfolio.close_position(position.mint_address)
+        if self._db:
+            self._db.upsert_position(position)
+
     # ------------------------------------------------------------------
     # Reporting
     # ------------------------------------------------------------------
 
     def summary(self, current_prices: dict[str, float] | None = None) -> dict:
-        """Return a stats dict for this strategy — consumed by MultiStrategyEngine.print_summary()."""
+        """Per-strategy stats dict consumed by MultiStrategyEngine.print_summary()."""
         port = self._exchange.portfolio
         all_pos = self._portfolio.all_positions()
         open_pos = self._portfolio.get_open_positions()
@@ -425,7 +405,6 @@ class StrategyRunner:
         equity = port.available_cash_usd + market_value
         net_pnl = equity - port.starting_cash_usd
         net_pnl_pct = (net_pnl / port.starting_cash_usd * 100) if port.starting_cash_usd else 0.0
-
         wins = [p for p in closed_pos if p.realized_pnl_usd > 0]
         win_rate = (len(wins) / len(closed_pos) * 100) if closed_pos else 0.0
 
@@ -444,3 +423,155 @@ class StrategyRunner:
             "win_rate": win_rate,
             "positions": all_pos,
         }
+
+
+# ===========================================================================
+# Infinite Moonbag — progressive ratcheting stop ladder, no time exits
+# ===========================================================================
+
+class InfiniteMoonbagRunner(StrategyRunner):
+    """
+    Overrides evaluate_position() with a progressive monotonic stop ladder.
+
+    Stop ladder (stop_loss_price field — always moves UP, never loosens):
+
+        Default            : stop = entry * 0.60   (−40%)
+        highest ≥ 2× entry : stop ≥ entry * 1.00   (breakeven floor)
+        highest ≥ 3× entry : stop ≥ entry * 1.50   (+50% floor)
+        highest ≥ 5× entry : stop ≥ highest * 0.60 (40% trail)
+        highest ≥ 10× entry: stop ≥ highest * 0.70 (30% trail)
+        highest ≥ 20× entry: stop ≥ highest * 0.75 (25% trail)
+        highest ≥ 50× entry: stop ≥ highest * 0.80 (20% trail)
+
+    Milestones use highest_price_seen (not current price), so the stop never
+    reverts when price pulls back below a milestone.
+
+    TP events — tiny de-risks only, bulk of position kept open:
+        3×  entry: sell 5%  of original  →  partial_take_profit_hit = True
+        10× entry: sell 10% of original  →  tp2_hit = True
+
+    No timeout. No max hold. Position stays open until the stop is hit.
+
+    Persistence: stop_loss_price and highest_price are already stored in the
+    DB on every upsert, so on restart the ladder resumes correctly.
+    """
+
+    # Stop ladder definition — (price_multiple_of_entry, stop_computation)
+    # Processed in order; `max()` with running stop ensures monotonicity.
+    _FLOOR_MILESTONES: tuple[tuple[float, float], ...] = (
+        (2.0,  1.00),   # once highest ≥ 2×: floor at breakeven
+        (3.0,  1.50),   # once highest ≥ 3×: floor at +50%
+    )
+    _TRAIL_MILESTONES: tuple[tuple[float, float], ...] = (
+        (5.0,  0.60),   # once highest ≥ 5×:  keep 60% of high (40% trail)
+        (10.0, 0.70),   # once highest ≥ 10×: keep 70% of high (30% trail)
+        (20.0, 0.75),   # once highest ≥ 20×: keep 75% of high (25% trail)
+        (50.0, 0.80),   # once highest ≥ 50×: keep 80% of high (20% trail)
+    )
+
+    def evaluate_position(self, position: Position, current_price: float) -> None:
+        if position.status == "CLOSED":
+            return
+
+        now = datetime.now(timezone.utc)
+        entry = position.entry_price
+
+        # 1. Update highest_price_seen (only moves up)
+        if current_price > position.highest_price:
+            position.highest_price = current_price
+        highest = position.highest_price
+
+        # 2. Check existing stop (ladder value from PREVIOUS tick — monotonic)
+        if current_price <= position.stop_loss_price:
+            multiple = current_price / entry if entry > 0 else 0
+            logger.info(
+                "[%s] [STOP_LADDER] %s | price=$%.8f (%.2f×) | stop=$%.8f (%.2f×)",
+                self.name, position.symbol,
+                current_price, multiple,
+                position.stop_loss_price, position.stop_loss_price / entry,
+            )
+            self._close_position(position, current_price, "STOP_LADDER_EXIT", now)
+            return
+
+        # 3. Process TP milestones in ascending order (sell % of ORIGINAL qty)
+        for i, tp_level in enumerate(self._cfg.take_profit_levels):
+            if i > 1:
+                break
+
+            already_hit = position.partial_take_profit_hit if i == 0 else position.tp2_hit
+            if already_hit:
+                continue
+            if current_price < entry * tp_level.multiple:
+                continue
+
+            tp_qty = min(
+                position.initial_quantity * tp_level.sell_fraction_original,
+                position.remaining_quantity,
+            )
+            if tp_qty < _EPSILON:
+                continue
+
+            fraction = tp_qty / position.remaining_quantity
+            pnl = (current_price - entry) * tp_qty
+            label = f"TP{i + 1}"
+            self._exchange.sell_partial(position, fraction, current_price, label)
+
+            if i == 0:
+                position.partial_take_profit_hit = True
+                position.trailing_active = True
+            else:
+                position.tp2_hit = True
+
+            logger.info(
+                "[%s] [%s] %s %.0f× de-risk | sold %.0f%% of original | "
+                "qty=%.6f | pnl=$%+.4f | remaining=%.6f",
+                self.name, label, position.symbol, tp_level.multiple,
+                tp_level.sell_fraction_original * 100,
+                tp_qty, pnl, position.remaining_quantity,
+            )
+            trade_log.info(
+                "%-13s | %-10s | %-44s | price=$%.8f | qty=%.4f | pnl=$%+.4f | strategy=%s",
+                label, position.symbol, position.mint_address,
+                current_price, tp_qty, pnl, self.name,
+            )
+            if self._db:
+                self._db.upsert_position(position)
+                self._db.save_portfolio(self._exchange.portfolio, self.name)
+                self._db.log_trade(label, position, current_price, tp_qty, pnl)
+
+            if position.remaining_quantity < _EPSILON:
+                self._force_close(position, f"{label}_FULL", now)
+                return
+
+        # 4. Recompute progressive stop ladder (uses updated highest, monotonic via max())
+        #    Milestones trigger once highest_price_seen crosses the threshold —
+        #    they remain active even if current price later drops below the threshold.
+        new_stop = position.stop_loss_price  # seed from current (already monotonic)
+
+        for milestone_mult, floor_mult in self._FLOOR_MILESTONES:
+            if highest >= entry * milestone_mult:
+                new_stop = max(new_stop, entry * floor_mult)
+
+        for milestone_mult, keep_pct in self._TRAIL_MILESTONES:
+            if highest >= entry * milestone_mult:
+                new_stop = max(new_stop, highest * keep_pct)
+
+        if new_stop != position.stop_loss_price:
+            logger.info(
+                "[%s] [LADDER] %s | high=%.2f× | stop raised $%.8f → $%.8f (%.2f×)",
+                self.name, position.symbol,
+                highest / entry,
+                position.stop_loss_price, new_stop, new_stop / entry,
+            )
+        position.stop_loss_price = new_stop  # persisted on every DB upsert ✓
+
+        multiple = current_price / entry if entry > 0 else 0
+        logger.info(
+            "[%s] [MOONBAG] %-10s | %.2f× | stop=%.2f× | high=%.2f× | tp1=%s | tp2=%s",
+            self.name, position.symbol,
+            multiple,
+            position.stop_loss_price / entry,
+            highest / entry,
+            "✓" if position.partial_take_profit_hit else "—",
+            "✓" if position.tp2_hit else "—",
+        )
