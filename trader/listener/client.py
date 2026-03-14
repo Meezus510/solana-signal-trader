@@ -74,7 +74,7 @@ class TelegramListener:
 
         self._client.add_event_handler(
             self._on_new_message,
-            events.NewMessage(chats=self._cfg.channel_username),
+            events.NewMessage(chats=list(self._cfg.channel_usernames)),
         )
 
         await self._client.start(phone=self._cfg.tg_phone or None)
@@ -84,16 +84,18 @@ class TelegramListener:
         if self._db:
             self._seen_ids = self._db.load_seen_msg_ids()
 
-        try:
-            entity = await self._client.get_entity(self._cfg.channel_username)
-            logger.info("[TG] Monitoring channel id=%s", entity.id)
-        except Exception:
-            logger.exception(
-                "[TG] Could not resolve channel '%s'", self._cfg.channel_username
-            )
-            raise
+        entities = []
+        for username in self._cfg.channel_usernames:
+            try:
+                entity = await self._client.get_entity(username)
+                logger.info("[TG] Monitoring channel '%s' id=%s", username, entity.id)
+                entities.append(entity)
+            except Exception:
+                logger.exception("[TG] Could not resolve channel '%s'", username)
+                raise
 
-        await self._catch_up(entity)
+        for entity in entities:
+            await self._catch_up(entity)
 
     async def _catch_up(self, entity, limit: int = 50) -> None:
         """
