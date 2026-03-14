@@ -94,26 +94,30 @@ class TelegramListener:
         Fetch the most recent `limit` messages and process any that arrived
         after the last message we saw in a previous session.
 
-        The high-water mark is max(seen_msg_ids).  Messages at or below it are
-        already accounted for.  On a fresh database (no seen IDs) the
-        high-water mark is 0, so every fetched message is marked seen but
-        none are traded — preventing a cold-start flood of historical signals.
+        High-water mark = max(seen_msg_ids).  Only messages with a higher ID
+        are traded; everything else is just marked seen.
+
+        Fresh database (no seen IDs): skips catch-up entirely and starts
+        listening for new signals from this point forward.
         """
-        last_seen_id: int = max(self._seen_ids) if self._seen_ids else 0
+        if not self._seen_ids:
+            logger.info("[TG] Fresh database — skipping catch-up, listening for new signals.")
+            return
+
+        last_seen_id: int = max(self._seen_ids)
         logger.info(
             "[TG] Catching up on last %d messages (last seen id=%d)...",
             limit, last_seen_id,
         )
         caught = skipped_old = 0
         async for msg in self._client.iter_messages(entity, limit=limit):
-            # Mark as seen so it's never re-processed on next boot
             self._seen_ids.add(msg.id)
             if self._db:
                 self._db.add_seen_msg_id(msg.id)
 
             if msg.id <= last_seen_id:
                 skipped_old += 1
-                continue  # already handled in a prior session
+                continue
 
             if not (msg.text or "").strip():
                 continue
@@ -123,6 +127,7 @@ class TelegramListener:
                 message = msg
             await self._on_new_message(_FakeEvent())
             caught += 1
+
         logger.info(
             "[TG] Catch-up complete — %d processed, %d skipped (already seen)",
             caught, skipped_old,
