@@ -72,6 +72,10 @@ class MultiStrategyEngine:
         if self._db:
             self._db.log_signal("SIGNAL", symbol=signal.symbol, mint=signal.mint_address)
 
+        if self._cfg.dry_run:
+            logger.info("[DRY_RUN] %s — skipping Birdeye and entry", signal.symbol)
+            return
+
         entry_price = await self._birdeye.get_price(signal.mint_address)
         if entry_price is None:
             logger.warning("[SKIP] No live price for %s — entry aborted", signal.symbol)
@@ -108,6 +112,10 @@ class MultiStrategyEngine:
 
         A mint is tracked until ALL strategies have exited it.
         """
+        if self._cfg.dry_run:
+            logger.info("[DRY_RUN] Monitor loop disabled — no positions will be opened")
+            return
+
         mode = f"{cycles} cycles" if cycles is not None else "live (∞)"
         logger.info(
             "[MONITOR] Starting | strategies=%d | mode=%s | interval=%.1fs",

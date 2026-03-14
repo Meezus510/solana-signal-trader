@@ -42,6 +42,7 @@ class Config:
     # ------------------------------------------------------------------
     # Operational
     # ------------------------------------------------------------------
+    dry_run: bool = False          # if True, log signals but skip Birdeye and all trades
     poll_interval_seconds: float = 1.0
     request_timeout_seconds: int = 10
     max_concurrent_price_requests: int = 10
@@ -102,4 +103,5 @@ class Config:
             tg_phone=os.getenv("TG_PHONE", "").strip(),
             channel_usernames=channel_usernames,
             tg_session_string=os.getenv("TG_SESSION_STRING", "").strip(),
+            dry_run=os.getenv("DRY_RUN", "").strip().lower() in ("1", "true", "yes"),
         )
