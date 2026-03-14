@@ -72,7 +72,8 @@ class Position:
     total_fees_usd: float         # reserved for fee modelling (0.0 for now)
 
     # Flags
-    partial_take_profit_hit: bool = False
+    partial_take_profit_hit: bool = False   # True after TP1 sell fires
+    tp2_hit: bool = False                   # True after TP2 sell fires (Strategy C)
 
     # Multi-strategy identity (set by StrategyRunner after buy)
     strategy_name: str = "default"

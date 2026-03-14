@@ -61,31 +61,78 @@ logger = logging.getLogger(__name__)
 
 def build_strategies(cfg: Config) -> list[StrategyConfig]:
     """
-    Define all strategies to run.
+    Active strategy roster.
 
-    The first entry mirrors the previous single-strategy behaviour exactly.
-    Duplicate this block (with a different name and parameters) to add more.
+    Each strategy runs independently with its own cash ($1000), positions,
+    and PnL. All three share a single Birdeye price feed.
+
+    Strategy A — Balanced Momentum
+        TP1 at 1.8×, sell 50% → trail at 30% below high
+        Timeout: exit after 90 min if price < entry × 1.15
+        Max hold: 4 hours
+
+    Strategy B — Aggressive Moonbag
+        TP1 at 2.5×, sell 50% → trail at 35% below high
+        Timeout: exit after 2 h if price < entry × 1.10
+        Max hold: 6 hours
+
+    Strategy C — Fast Scalp
+        TP1 at 1.5×, sell 60% of original → trail at 25% below high
+        TP2 at 2.2×, sell 20% of original
+        Timeout: exit after 45 min if price < entry × 1.08
+        Max hold: 2 hours
     """
     return [
+        # ------------------------------------------------------------------
+        # Strategy A: Balanced Momentum
+        # ------------------------------------------------------------------
         StrategyConfig(
-            name="default",
-            buy_size_usd=cfg.buy_size_usd,
-            stop_loss_pct=cfg.stop_loss_pct,
-            take_profit_multiple=cfg.take_profit_multiple,
-            take_profit_sell_fraction=cfg.take_profit_sell_fraction,
-            trailing_stop_pct=cfg.trailing_stop_pct,
+            name="balanced_momentum",
+            buy_size_usd=10.0,
+            stop_loss_pct=0.30,             # -30% from entry
+            take_profit_multiple=1.8,        # TP1 at 1.8×
+            take_profit_sell_fraction=0.50,  # sell 50% of remaining at TP1
+            trailing_stop_pct=0.30,          # trail at 30% below high-water
             starting_cash_usd=cfg.starting_cash_usd,
+            timeout_minutes=90.0,
+            timeout_min_gain_pct=0.15,       # exit if price < entry × 1.15 after 90 min
+            max_hold_minutes=240.0,          # unconditional exit at 4 hours
         ),
-        # Example: a more aggressive strategy running alongside
-        # StrategyConfig(
-        #     name="aggressive",
-        #     buy_size_usd=20.0,
-        #     stop_loss_pct=0.20,
-        #     take_profit_multiple=3.0,
-        #     take_profit_sell_fraction=0.50,
-        #     trailing_stop_pct=0.25,
-        #     starting_cash_usd=cfg.starting_cash_usd,
-        # ),
+
+        # ------------------------------------------------------------------
+        # Strategy B: Aggressive Moonbag
+        # ------------------------------------------------------------------
+        StrategyConfig(
+            name="aggressive_moonbag",
+            buy_size_usd=10.0,
+            stop_loss_pct=0.35,             # -35% from entry
+            take_profit_multiple=2.5,        # TP1 at 2.5×
+            take_profit_sell_fraction=0.50,  # sell 50% of remaining at TP1
+            trailing_stop_pct=0.35,          # trail at 35% below high-water
+            starting_cash_usd=cfg.starting_cash_usd,
+            timeout_minutes=120.0,
+            timeout_min_gain_pct=0.10,       # exit if price < entry × 1.10 after 2 h
+            max_hold_minutes=360.0,          # unconditional exit at 6 hours
+        ),
+
+        # ------------------------------------------------------------------
+        # Strategy C: Fast Scalp
+        # ------------------------------------------------------------------
+        StrategyConfig(
+            name="fast_scalp",
+            buy_size_usd=10.0,
+            stop_loss_pct=0.25,             # -25% from entry
+            take_profit_multiple=1.5,        # TP1 at 1.5×
+            take_profit_sell_fraction=0.60,  # sell 60% of remaining at TP1 (= 60% of original)
+            trailing_stop_pct=0.25,          # trail at 25% below high-water
+            starting_cash_usd=cfg.starting_cash_usd,
+            # TP2: sell 20% of ORIGINAL qty when price reaches 2.2×
+            take_profit2_multiple=2.2,
+            take_profit2_original_fraction=0.20,
+            timeout_minutes=45.0,
+            timeout_min_gain_pct=0.08,       # exit if price < entry × 1.08 after 45 min
+            max_hold_minutes=120.0,          # unconditional exit at 2 hours
+        ),
     ]
 
 

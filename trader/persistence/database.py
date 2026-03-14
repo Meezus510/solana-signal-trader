@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS positions (
     total_proceeds_usd      REAL NOT NULL DEFAULT 0,
     total_fees_usd          REAL NOT NULL DEFAULT 0,
     partial_take_profit_hit INTEGER NOT NULL DEFAULT 0,
+    tp2_hit                 INTEGER NOT NULL DEFAULT 0,
     sell_reason             TEXT,
     last_price              REAL,
     opened_at               TEXT NOT NULL,
@@ -138,7 +139,7 @@ class TradeDatabase:
                 :highest_price, :take_profit_price, :stop_loss_price,
                 :trailing_active, :trailing_stop_pct, :trailing_stop_price,
                 :realized_pnl_usd, :total_proceeds_usd, :total_fees_usd,
-                :partial_take_profit_hit, :sell_reason, :last_price,
+                :partial_take_profit_hit, :tp2_hit, :sell_reason, :last_price,
                 :opened_at, :closed_at
             )
             """,
@@ -161,6 +162,7 @@ class TradeDatabase:
                 "total_proceeds_usd": position.total_proceeds_usd,
                 "total_fees_usd": position.total_fees_usd,
                 "partial_take_profit_hit": int(position.partial_take_profit_hit),
+                "tp2_hit": int(position.tp2_hit),
                 "sell_reason": position.sell_reason,
                 "last_price": position.last_price,
                 "opened_at": position.opened_at.isoformat(),
@@ -187,7 +189,7 @@ class TradeDatabase:
             highest_price, take_profit_price, stop_loss_price,
             trailing_active, trailing_stop_pct, trailing_stop_price,
             realized_pnl_usd, total_proceeds_usd, total_fees_usd,
-            partial_take_profit_hit, sell_reason, last_price,
+            partial_take_profit_hit, tp2_hit, sell_reason, last_price,
             opened_at, closed_at,
         ) = row
         return Position(
@@ -209,6 +211,7 @@ class TradeDatabase:
             total_proceeds_usd=total_proceeds_usd,
             total_fees_usd=total_fees_usd,
             partial_take_profit_hit=bool(partial_take_profit_hit),
+            tp2_hit=bool(tp2_hit),
             sell_reason=sell_reason,
             last_price=last_price,
             opened_at=datetime.fromisoformat(opened_at),
