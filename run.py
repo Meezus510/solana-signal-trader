@@ -80,9 +80,9 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         Exit after 90 min if price < entry × 1.15. Max hold: 4 hours.
 
     infinite_moonbag (v2)
-        Grace period 90s: catastrophic −45% floor. After grace: −30% floor.
+        Grace period 90s: −30% floor. After grace: −22% floor.
         TP ladder: 1.8×/20%, 2.5×/15%, 4.0×/15%, 6.0×/10% of original.
-        Stop ladder rises monotonically as highest_price advances.
+        Stop ladder: 1.8×→1.35×, 2.5×→1.90×, 4.0×→2.80×, 6.0×→3.50×.
     """
     quick_pop_cfg = StrategyConfig(
         name="quick_pop",
@@ -114,15 +114,15 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
 
     moonbag_cfg = StrategyConfig(
         name="infinite_moonbag",
-        buy_size_usd=20.0,
-        stop_loss_pct=0.45,   # initial stop at entry × 0.55 (−45% grace floor)
+        buy_size_usd=15.0,
+        stop_loss_pct=0.30,   # initial stop at entry × 0.70 (−30% grace floor)
         take_profit_levels=(
             TakeProfitLevel(multiple=1.8, sell_fraction_original=0.20),
             TakeProfitLevel(multiple=2.5, sell_fraction_original=0.15),
             TakeProfitLevel(multiple=4.0, sell_fraction_original=0.15),
             TakeProfitLevel(multiple=6.0, sell_fraction_original=0.10),
         ),
-        trailing_stop_pct=0.45,   # not used — ladder overrides stop_loss_price
+        trailing_stop_pct=0.30,   # not used — ladder overrides stop_loss_price
         starting_cash_usd=cfg.starting_cash_usd,
         # No timeout or max_hold — InfiniteMoonbagRunner ignores them
     )

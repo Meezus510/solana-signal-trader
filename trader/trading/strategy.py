@@ -434,15 +434,15 @@ class InfiniteMoonbagRunner(StrategyRunner):
     infinite_moonbag_v2: grace-period catastrophic stop → normal floor → ratcheting ladder.
 
     Grace period (first 90s after entry):
-        stop floor = entry × 0.55  (−45% catastrophic)
+        stop floor = entry × 0.70  (−30% catastrophic)
 
     After grace:
-        stop floor = entry × 0.70  (−30% normal)
+        stop floor = entry × 0.78  (−22% normal)
 
     Stop ladder (floor multiples of entry, triggered by highest_price_seen):
-        highest ≥ 1.8× → stop ≥ entry × 0.98
-        highest ≥ 2.5× → stop ≥ entry × 1.40
-        highest ≥ 4.0× → stop ≥ entry × 2.20
+        highest ≥ 1.8× → stop ≥ entry × 1.35
+        highest ≥ 2.5× → stop ≥ entry × 1.90
+        highest ≥ 4.0× → stop ≥ entry × 2.80
         highest ≥ 6.0× → stop ≥ entry × 3.50
 
     All stops are monotonic (only ever raised, never lowered).
@@ -457,14 +457,14 @@ class InfiniteMoonbagRunner(StrategyRunner):
     """
 
     _GRACE_SECONDS = 90.0
-    _GRACE_FLOOR   = 0.55   # entry × 0.55 during grace  (−45%)
-    _POST_GRACE_FLOOR = 0.70  # entry × 0.70 after grace (−30%)
+    _GRACE_FLOOR      = 0.70  # entry × 0.70 during grace  (−30%)
+    _POST_GRACE_FLOOR = 0.78  # entry × 0.78 after grace   (−22%)
 
     # Fixed floor milestones — (highest_multiple, stop_floor_multiple_of_entry)
     _STOP_MILESTONES: tuple[tuple[float, float], ...] = (
-        (1.8, 0.98),   # highest ≥ 1.8× → stop ≥ entry × 0.98
-        (2.5, 1.40),   # highest ≥ 2.5× → stop ≥ entry × 1.40
-        (4.0, 2.20),   # highest ≥ 4.0× → stop ≥ entry × 2.20
+        (1.8, 1.35),   # highest ≥ 1.8× → stop ≥ entry × 1.35
+        (2.5, 1.90),   # highest ≥ 2.5× → stop ≥ entry × 1.90
+        (4.0, 2.80),   # highest ≥ 4.0× → stop ≥ entry × 2.80
         (6.0, 3.50),   # highest ≥ 6.0× → stop ≥ entry × 3.50
     )
 
