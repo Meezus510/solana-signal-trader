@@ -74,7 +74,9 @@ class Position:
 
     # Flags
     partial_take_profit_hit: bool = False   # True after TP1 sell fires
-    tp2_hit: bool = False                   # True after TP2 sell fires (Strategy C)
+    tp2_hit: bool = False                   # True after TP2 sell fires
+    tp3_hit: bool = False                   # True after TP3 sell fires
+    tp4_hit: bool = False                   # True after TP4 sell fires
 
     # Multi-strategy identity (set by StrategyRunner after buy)
     strategy_name: str = "default"

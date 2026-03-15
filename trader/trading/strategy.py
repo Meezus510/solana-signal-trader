@@ -16,11 +16,11 @@ Order of operations per price tick (StrategyRunner):
     6. Update trailing stop based on latest highest_price_seen
     (No same-tick re-check so behavior is deterministic)
 
-Order of operations per price tick (InfiniteMoonbagRunner):
+Order of operations per price tick (InfiniteMoonbagRunner / v2):
     1. Update highest_price_seen if new high
     2. Check existing stop (stop_loss_price = progressive ladder from previous tick)
-    3. Process TP milestones in ascending order — each sells % of ORIGINAL qty
-    4. Recompute stop ladder (uses updated highest_price_seen, always monotonic)
+    3. Process TP milestones in ascending order — each sells % of ORIGINAL qty (4 levels)
+    4. Recompute stop: grace-period baseline + floor milestones (always monotonic)
     (No timeout. No max hold.)
 """
 
@@ -426,47 +426,54 @@ class StrategyRunner:
 
 
 # ===========================================================================
-# Infinite Moonbag — progressive ratcheting stop ladder, no time exits
+# Infinite Moonbag v2 — grace-period floor + progressive stop ladder
 # ===========================================================================
 
 class InfiniteMoonbagRunner(StrategyRunner):
     """
-    Overrides evaluate_position() with a progressive monotonic stop ladder.
+    infinite_moonbag_v2: grace-period catastrophic stop → normal floor → ratcheting ladder.
 
-    Stop ladder (stop_loss_price field — always moves UP, never loosens):
+    Grace period (first 90s after entry):
+        stop floor = entry × 0.55  (−45% catastrophic)
 
-        Default            : stop = entry * 0.60   (−40%)
-        highest ≥ 2× entry : stop ≥ entry * 1.00   (breakeven floor)
-        highest ≥ 3× entry : stop ≥ entry * 1.50   (+50% floor)
-        highest ≥ 5× entry : stop ≥ highest * 0.60 (40% trail)
-        highest ≥ 10× entry: stop ≥ highest * 0.70 (30% trail)
-        highest ≥ 20× entry: stop ≥ highest * 0.75 (25% trail)
-        highest ≥ 50× entry: stop ≥ highest * 0.80 (20% trail)
+    After grace:
+        stop floor = entry × 0.70  (−30% normal)
 
-    Milestones use highest_price_seen (not current price), so the stop never
-    reverts when price pulls back below a milestone.
+    Stop ladder (floor multiples of entry, triggered by highest_price_seen):
+        highest ≥ 1.8× → stop ≥ entry × 0.98
+        highest ≥ 2.5× → stop ≥ entry × 1.40
+        highest ≥ 4.0× → stop ≥ entry × 2.20
+        highest ≥ 6.0× → stop ≥ entry × 3.50
 
-    TP events — tiny de-risks only, bulk of position kept open:
-        3×  entry: sell 5%  of original  →  partial_take_profit_hit = True
-        10× entry: sell 10% of original  →  tp2_hit = True
+    All stops are monotonic (only ever raised, never lowered).
+
+    TP ladder (% of ORIGINAL quantity):
+        1.8× → sell 20%  (partial_take_profit_hit)
+        2.5× → sell 15%  (tp2_hit)
+        4.0× → sell 15%  (tp3_hit)
+        6.0× → sell 10%  (tp4_hit)
 
     No timeout. No max hold. Position stays open until the stop is hit.
-
-    Persistence: stop_loss_price and highest_price are already stored in the
-    DB on every upsert, so on restart the ladder resumes correctly.
     """
 
-    # Stop ladder definition — (price_multiple_of_entry, stop_computation)
-    # Processed in order; `max()` with running stop ensures monotonicity.
-    _FLOOR_MILESTONES: tuple[tuple[float, float], ...] = (
-        (2.0,  1.00),   # once highest ≥ 2×: floor at breakeven
-        (3.0,  1.50),   # once highest ≥ 3×: floor at +50%
+    _GRACE_SECONDS = 90.0
+    _GRACE_FLOOR   = 0.55   # entry × 0.55 during grace  (−45%)
+    _POST_GRACE_FLOOR = 0.70  # entry × 0.70 after grace (−30%)
+
+    # Fixed floor milestones — (highest_multiple, stop_floor_multiple_of_entry)
+    _STOP_MILESTONES: tuple[tuple[float, float], ...] = (
+        (1.8, 0.98),   # highest ≥ 1.8× → stop ≥ entry × 0.98
+        (2.5, 1.40),   # highest ≥ 2.5× → stop ≥ entry × 1.40
+        (4.0, 2.20),   # highest ≥ 4.0× → stop ≥ entry × 2.20
+        (6.0, 3.50),   # highest ≥ 6.0× → stop ≥ entry × 3.50
     )
-    _TRAIL_MILESTONES: tuple[tuple[float, float], ...] = (
-        (5.0,  0.60),   # once highest ≥ 5×:  keep 60% of high (40% trail)
-        (10.0, 0.70),   # once highest ≥ 10×: keep 70% of high (30% trail)
-        (20.0, 0.75),   # once highest ≥ 20×: keep 75% of high (25% trail)
-        (50.0, 0.80),   # once highest ≥ 50×: keep 80% of high (20% trail)
+
+    # Maps TP index → Position flag attribute name
+    _TP_FLAG_ATTRS = (
+        "partial_take_profit_hit",
+        "tp2_hit",
+        "tp3_hit",
+        "tp4_hit",
     )
 
     def evaluate_position(self, position: Position, current_price: float) -> None:
@@ -495,11 +502,11 @@ class InfiniteMoonbagRunner(StrategyRunner):
 
         # 3. Process TP milestones in ascending order (sell % of ORIGINAL qty)
         for i, tp_level in enumerate(self._cfg.take_profit_levels):
-            if i > 1:
+            if i >= len(self._TP_FLAG_ATTRS):
                 break
 
-            already_hit = position.partial_take_profit_hit if i == 0 else position.tp2_hit
-            if already_hit:
+            flag_attr = self._TP_FLAG_ATTRS[i]
+            if getattr(position, flag_attr):
                 continue
             if current_price < entry * tp_level.multiple:
                 continue
@@ -515,15 +522,10 @@ class InfiniteMoonbagRunner(StrategyRunner):
             pnl = (current_price - entry) * tp_qty
             label = f"TP{i + 1}"
             self._exchange.sell_partial(position, fraction, current_price, label)
-
-            if i == 0:
-                position.partial_take_profit_hit = True
-                position.trailing_active = True
-            else:
-                position.tp2_hit = True
+            setattr(position, flag_attr, True)
 
             logger.info(
-                "[%s] [%s] %s %.0f× de-risk | sold %.0f%% of original | "
+                "[%s] [%s] %s %.1f× de-risk | sold %.0f%% of original | "
                 "qty=%.6f | pnl=$%+.4f | remaining=%.6f",
                 self.name, label, position.symbol, tp_level.multiple,
                 tp_level.sell_fraction_original * 100,
@@ -543,18 +545,24 @@ class InfiniteMoonbagRunner(StrategyRunner):
                 self._force_close(position, f"{label}_FULL", now)
                 return
 
-        # 4. Recompute progressive stop ladder (uses updated highest, monotonic via max())
-        #    Milestones trigger once highest_price_seen crosses the threshold —
-        #    they remain active even if current price later drops below the threshold.
-        new_stop = position.stop_loss_price  # seed from current (already monotonic)
+        # 4. Recompute stop (grace period baseline + progressive floor ladder)
+        opened_at = position.opened_at
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=timezone.utc)
+        age_seconds = (now - opened_at).total_seconds()
 
-        for milestone_mult, floor_mult in self._FLOOR_MILESTONES:
+        new_stop = position.stop_loss_price  # seed — already monotonic
+
+        # Baseline floor: catastrophic during grace, normal after
+        if age_seconds <= self._GRACE_SECONDS:
+            new_stop = max(new_stop, entry * self._GRACE_FLOOR)
+        else:
+            new_stop = max(new_stop, entry * self._POST_GRACE_FLOOR)
+
+        # Progressive floor milestones (trigger once highest crosses threshold)
+        for milestone_mult, floor_mult in self._STOP_MILESTONES:
             if highest >= entry * milestone_mult:
                 new_stop = max(new_stop, entry * floor_mult)
-
-        for milestone_mult, keep_pct in self._TRAIL_MILESTONES:
-            if highest >= entry * milestone_mult:
-                new_stop = max(new_stop, highest * keep_pct)
 
         if new_stop != position.stop_loss_price:
             logger.info(
@@ -566,12 +574,15 @@ class InfiniteMoonbagRunner(StrategyRunner):
         position.stop_loss_price = new_stop  # persisted on every DB upsert ✓
 
         multiple = current_price / entry if entry > 0 else 0
+        tp_flags = "".join(
+            "✓" if getattr(position, a) else "—"
+            for a in self._TP_FLAG_ATTRS
+        )
         logger.info(
-            "[%s] [MOONBAG] %-10s | %.2f× | stop=%.2f× | high=%.2f× | tp1=%s | tp2=%s",
+            "[%s] [MOONBAG] %-10s | %.2f× | stop=%.2f× | high=%.2f× | tp=%s",
             self.name, position.symbol,
             multiple,
             position.stop_loss_price / entry,
             highest / entry,
-            "✓" if position.partial_take_profit_hit else "—",
-            "✓" if position.tp2_hit else "—",
+            tp_flags,
         )
