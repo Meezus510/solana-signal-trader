@@ -192,7 +192,16 @@ class TradeDatabase:
     def load_open_positions(self, strategy_name: str = "default") -> list[Position]:
         """Restore all OPEN positions for a given strategy (called on startup)."""
         rows = self._conn.execute(
-            "SELECT * FROM positions WHERE status = 'OPEN' AND strategy = ?",
+            """
+            SELECT strategy, mint, symbol, status,
+                   entry_price, initial_quantity, remaining_quantity, usd_size,
+                   highest_price, take_profit_price, stop_loss_price,
+                   trailing_active, trailing_stop_pct, trailing_stop_price,
+                   realized_pnl_usd, total_proceeds_usd, total_fees_usd,
+                   partial_take_profit_hit, tp2_hit, tp3_hit, tp4_hit,
+                   sell_reason, last_price, opened_at, closed_at
+            FROM positions WHERE status = 'OPEN' AND strategy = ?
+            """,
             (strategy_name,),
         ).fetchall()
         positions = [self._row_to_position(r) for r in rows]
