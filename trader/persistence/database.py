@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS positions (
     total_fees_usd          REAL NOT NULL DEFAULT 0,
     partial_take_profit_hit INTEGER NOT NULL DEFAULT 0,
     tp2_hit                 INTEGER NOT NULL DEFAULT 0,
+    tp3_hit                 INTEGER NOT NULL DEFAULT 0,
+    tp4_hit                 INTEGER NOT NULL DEFAULT 0,
     sell_reason             TEXT,
     last_price              REAL,
     opened_at               TEXT NOT NULL,
@@ -123,7 +125,20 @@ class TradeDatabase:
         c.execute(_CREATE_SIGNALS)
         c.execute(_CREATE_PORTFOLIO)
         c.execute(_CREATE_SEEN)
+        self._migrate(c)
         c.commit()
+
+    def _migrate(self, c: sqlite3.Connection) -> None:
+        """Add columns introduced after initial schema (safe to re-run)."""
+        for col, definition in [
+            ("tp3_hit", "INTEGER NOT NULL DEFAULT 0"),
+            ("tp4_hit", "INTEGER NOT NULL DEFAULT 0"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE positions ADD COLUMN {col} {definition}")
+                logger.info("[DB] Migrated: added column %s to positions", col)
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
     # ------------------------------------------------------------------
     # Positions
@@ -139,7 +154,8 @@ class TradeDatabase:
                 :highest_price, :take_profit_price, :stop_loss_price,
                 :trailing_active, :trailing_stop_pct, :trailing_stop_price,
                 :realized_pnl_usd, :total_proceeds_usd, :total_fees_usd,
-                :partial_take_profit_hit, :tp2_hit, :sell_reason, :last_price,
+                :partial_take_profit_hit, :tp2_hit, :tp3_hit, :tp4_hit,
+                :sell_reason, :last_price,
                 :opened_at, :closed_at
             )
             """,
@@ -163,6 +179,8 @@ class TradeDatabase:
                 "total_fees_usd": position.total_fees_usd,
                 "partial_take_profit_hit": int(position.partial_take_profit_hit),
                 "tp2_hit": int(position.tp2_hit),
+                "tp3_hit": int(position.tp3_hit),
+                "tp4_hit": int(position.tp4_hit),
                 "sell_reason": position.sell_reason,
                 "last_price": position.last_price,
                 "opened_at": position.opened_at.isoformat(),
@@ -189,7 +207,8 @@ class TradeDatabase:
             highest_price, take_profit_price, stop_loss_price,
             trailing_active, trailing_stop_pct, trailing_stop_price,
             realized_pnl_usd, total_proceeds_usd, total_fees_usd,
-            partial_take_profit_hit, tp2_hit, sell_reason, last_price,
+            partial_take_profit_hit, tp2_hit, tp3_hit, tp4_hit,
+            sell_reason, last_price,
             opened_at, closed_at,
         ) = row
         return Position(
@@ -212,6 +231,8 @@ class TradeDatabase:
             total_fees_usd=total_fees_usd,
             partial_take_profit_hit=bool(partial_take_profit_hit),
             tp2_hit=bool(tp2_hit),
+            tp3_hit=bool(tp3_hit),
+            tp4_hit=bool(tp4_hit),
             sell_reason=sell_reason,
             last_price=last_price,
             opened_at=datetime.fromisoformat(opened_at),

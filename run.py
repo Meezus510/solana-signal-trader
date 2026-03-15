@@ -70,33 +70,32 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
     Active strategy roster — three independent runners, one shared Birdeye feed.
 
     quick_pop
-        Fast scalp: TP1 at 1.5× (sell 60% of original) → TP2 at 2.2× (sell 20%)
-        Trail at 25% below high after TP1.
-        Exit after 45 min if price < entry × 1.08. Max hold: 2 hours.
+        Fast scalp: TP1 at 1.5× (sell 60%) → TP2 at 2.0× (sell 40%) — fully exits.
+        Trail at 22% below high after TP1.
+        Exit after 45 min if TP1 not yet hit (price still < 1.49×).
 
     trend_rider
         Momentum hold: TP1 at 1.8× (sell 50% of original)
         Trail at 30% below high after TP1.
         Exit after 90 min if price < entry × 1.15. Max hold: 4 hours.
 
-    infinite_moonbag
-        Progressive ratcheting stop — no time exits.
-        De-risk at 3× (5% of original) and 10× (10% of original).
+    infinite_moonbag (v2)
+        Grace period 90s: catastrophic −45% floor. After grace: −30% floor.
+        TP ladder: 1.8×/20%, 2.5×/15%, 4.0×/15%, 6.0×/10% of original.
         Stop ladder rises monotonically as highest_price advances.
     """
     quick_pop_cfg = StrategyConfig(
         name="quick_pop",
-        buy_size_usd=cfg.buy_size_usd,
-        stop_loss_pct=0.25,
+        buy_size_usd=30.0,
+        stop_loss_pct=0.20,
         take_profit_levels=(
             TakeProfitLevel(multiple=1.5, sell_fraction_original=0.60),
-            TakeProfitLevel(multiple=2.2, sell_fraction_original=0.20),
+            TakeProfitLevel(multiple=2.0, sell_fraction_original=0.40),
         ),
-        trailing_stop_pct=0.25,
+        trailing_stop_pct=0.22,
         starting_cash_usd=cfg.starting_cash_usd,
         timeout_minutes=45.0,
-        timeout_min_gain_pct=0.08,
-        max_hold_minutes=120.0,
+        timeout_min_gain_pct=0.49,  # exit if price still below 1.49× (TP1 not hit)
     )
 
     trend_rider_cfg = StrategyConfig(
@@ -115,13 +114,15 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
 
     moonbag_cfg = StrategyConfig(
         name="infinite_moonbag",
-        buy_size_usd=cfg.buy_size_usd,
-        stop_loss_pct=0.40,   # initial stop at entry × 0.60 (−40%)
+        buy_size_usd=20.0,
+        stop_loss_pct=0.45,   # initial stop at entry × 0.55 (−45% grace floor)
         take_profit_levels=(
-            TakeProfitLevel(multiple=3.0,  sell_fraction_original=0.05),
-            TakeProfitLevel(multiple=10.0, sell_fraction_original=0.10),
+            TakeProfitLevel(multiple=1.8, sell_fraction_original=0.20),
+            TakeProfitLevel(multiple=2.5, sell_fraction_original=0.15),
+            TakeProfitLevel(multiple=4.0, sell_fraction_original=0.15),
+            TakeProfitLevel(multiple=6.0, sell_fraction_original=0.10),
         ),
-        trailing_stop_pct=0.40,   # not used — ladder overrides stop_loss_price
+        trailing_stop_pct=0.45,   # not used — ladder overrides stop_loss_price
         starting_cash_usd=cfg.starting_cash_usd,
         # No timeout or max_hold — InfiniteMoonbagRunner ignores them
     )
