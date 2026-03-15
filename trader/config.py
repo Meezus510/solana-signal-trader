@@ -42,6 +42,7 @@ class Config:
     # ------------------------------------------------------------------
     # Operational
     # ------------------------------------------------------------------
+    dry_run: bool = False          # if True, log signals but skip Birdeye and all trades
     poll_interval_seconds: float = 1.0
     request_timeout_seconds: int = 10
     max_concurrent_price_requests: int = 10
@@ -53,7 +54,7 @@ class Config:
     tg_api_id: int = 0
     tg_api_hash: str = ""
     tg_phone: str = ""
-    channel_username: str = ""
+    channel_usernames: tuple[str, ...] = ()            # one or more channels to monitor
     session_file: str = "trader/listener/tg_session"  # path to .session file (local)
     tg_session_string: str = ""                        # StringSession value (cloud/DO)
 
@@ -90,15 +91,17 @@ class Config:
                 f"TG_API_ID must be an integer, got: {tg_api_id_raw!r}"
             )
 
-        channel = os.getenv("TG_CHANNEL", "").strip()
-        if not channel:
+        channels_raw = os.getenv("TG_CHANNEL", "").strip()
+        if not channels_raw:
             raise ValueError("TG_CHANNEL is required. Set it in your .env file.")
+        channel_usernames = tuple(c.strip() for c in channels_raw.split(",") if c.strip())
 
         return cls(
             birdeye_api_key=birdeye_api_key,
             tg_api_id=tg_api_id,
             tg_api_hash=tg_api_hash,
             tg_phone=os.getenv("TG_PHONE", "").strip(),
-            channel_username=channel,
+            channel_usernames=channel_usernames,
             tg_session_string=os.getenv("TG_SESSION_STRING", "").strip(),
+            dry_run=os.getenv("DRY_RUN", "").strip().lower() in ("1", "true", "yes"),
         )

@@ -35,6 +35,13 @@ _BASE58_RE = re.compile(
 _MINT_MIN_LEN = 32
 _MINT_MAX_LEN = 50
 
+# Pump.fun addresses: valid base58, 32-50 chars, ending in "pump"
+# Used to detect Solana calls and extract mints from plain text (no URLs)
+_PUMP_FUN_RE = re.compile(r"\b([1-9A-HJ-NP-Za-km-z]{30,46}pump)\b")
+
+# Generic base58 word — fallback for non-pump Solana mints in plain text
+_BASE58_WORD_RE = re.compile(r"\b([1-9A-HJ-NP-Za-km-z]{32,50})\b")
+
 # Non-Solana chain keywords — any of these disqualifies a message
 _REJECT_CHAINS = frozenset({
     "bsc", "eth", "ethereum", "base", "tron", "avax", "arbitrum"
@@ -71,6 +78,9 @@ _UPDATE_PATTERNS = re.compile(
     | \bhover(?:ing)?\s+around\b  # "hovering around"
     | \bup\s+\d+%               # "up 300%"
     | \b\d+x\s+from\b           # "10x from entry"
+    | \bprofit\s+reached\b      # "X2 profit reached"
+    | \bfrom\s+signal\s+entry\b # "Profit: +41% from signal entry"
+    | \bTop\s+\d+\s+Gainers\b   # "Top 10 Gainers in Last 24h"
     """,
     re.IGNORECASE | re.VERBOSE,
 )
@@ -109,6 +119,10 @@ def is_solana_call(text: str, urls: list[str]) -> bool:
             return False
 
     if re.search(r"\bsolana\b", lower):
+        return True
+
+    # Pump.fun mint address in the text body is a reliable Solana indicator
+    if _PUMP_FUN_RE.search(text):
         return True
 
     for url in urls:
@@ -201,6 +215,88 @@ def is_valid_solana_mint(mint: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Plain-text mint extraction (for channels without GMGN/DexScreener URLs)
+# ---------------------------------------------------------------------------
+
+def _extract_mint_from_text(text: str) -> Optional[str]:
+    """
+    Scan message text for a Solana mint address.
+
+    Prefers pump.fun addresses (ending in 'pump') as they are unambiguous.
+    Falls back to any valid base58 address of the right length.
+    Used when GMGN/DexScreener URL extraction finds nothing (mint is in the text body).
+    """
+    for m in _PUMP_FUN_RE.finditer(text):
+        candidate = m.group(1)
+        if is_valid_solana_mint(candidate):
+            return candidate
+    for m in _BASE58_WORD_RE.finditer(text):
+        candidate = m.group(1)
+        if is_valid_solana_mint(candidate):
+            return candidate
+    return None
+
+
+def _extract_symbol_near_mint(text: str, mint: str) -> Optional[str]:
+    """
+    Infer the token symbol from the words surrounding the mint address in text.
+
+    Handles common plain-text patterns where the symbol is adjacent to the mint:
+        "into TOKEN ("          → "Just threw a bag into SAVE ACT (MINT..."
+        "into TOKEN at"         → "Just threw a bag into atoms at contract MINT"
+        "TOKEN (" at line start → "Fiona (MINT) is a sleeper"
+        "TOKEN at" at line start→ "Memehouse at MINT is a sleeper"
+        "— TOKEN's" after mint  → "MINT — Chad's low cap gem"
+
+    Returns the symbol uppercased, or None if no pattern matches.
+    """
+    idx = text.find(mint)
+    if idx == -1:
+        return None
+    before = text[:idx]
+    after = text[idx + len(mint):]
+
+    # "into TOKEN (" — e.g. "into SAVE ACT ("
+    m = re.search(
+        r"\binto\s+([A-Za-zπ][A-Za-z0-9 ]{0,30?}?)\s*\(\s*$",
+        before, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).strip().upper()
+
+    # "into TOKEN at [contract]" — e.g. "into atoms at contract"
+    m = re.search(
+        r"\binto\s+([A-Za-zπ][A-Za-z0-9 ]{0,30?}?)\s+at\s+(?:contract\s+)?$",
+        before, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).strip().upper()
+
+    # "TOKEN (" at start of line — e.g. "Fiona ("
+    m = re.search(
+        r"(?:^|\n)[^\w\n]*([A-Za-z][A-Za-z0-9 ]{0,30?}?)\s*\(\s*$",
+        before, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).strip().upper()
+
+    # "TOKEN at" at start of line — e.g. "Memehouse at"
+    m = re.search(
+        r"(?:^|\n)[^\w\n]*([A-Za-z][A-Za-z0-9 ]{0,30?}?)\s+at\s+$",
+        before, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).strip().upper()
+
+    # "— TOKEN's" or "— TOKEN " after mint — e.g. "pump — Chad's low cap gem"
+    m = re.search(r"^\s*[—–\-]+\s*([A-Za-z][A-Za-z0-9]{0,20})", after)
+    if m:
+        return m.group(1).strip().upper()
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Symbol hint extraction
 # ---------------------------------------------------------------------------
 
@@ -221,7 +317,7 @@ def extract_symbol_hint(text: str) -> Optional[str]:
 # Top-level parse function
 # ---------------------------------------------------------------------------
 
-def parse_message(text: str) -> dict:
+def parse_message(text: str, extra_urls: list[str] | None = None) -> dict:
     """
     Parse a raw Telegram message and return a structured signal dict.
 
@@ -240,6 +336,8 @@ def parse_message(text: str) -> dict:
         }
     """
     urls = extract_urls(text)
+    if extra_urls:
+        urls = urls + [u for u in extra_urls if u not in urls]
     update = is_update_message(text)
     solana = is_solana_call(text, urls)
 
@@ -255,12 +353,23 @@ def parse_message(text: str) -> dict:
 
         pair_address = _extract_dexscreener_pair(urls)
 
+        # Fallback: extract mint directly from text body for channels that
+        # embed the mint address in the message text rather than a URL
+        if mint_address is None:
+            mint_address = _extract_mint_from_text(text)
+
+    # $TICKER-style symbol (WizzyTrades and similar)
+    symbol_hint = extract_symbol_hint(text)
+    # Fallback: infer symbol from context around the mint in plain text
+    if symbol_hint is None and mint_address is not None:
+        symbol_hint = _extract_symbol_near_mint(text, mint_address)
+
     return {
         "is_first_call": not update,
         "is_solana": solana,
         "mint_address": mint_address,
         "pair_address": pair_address,
-        "symbol_hint": extract_symbol_hint(text),
+        "symbol_hint": symbol_hint,
         "urls": urls,
         "raw_text": text,
     }

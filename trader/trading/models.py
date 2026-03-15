@@ -26,6 +26,7 @@ class TokenSignal:
     detected_at: datetime = field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
+    source_channel: str = ""   # Telegram channel username the signal came from
 
 
 @dataclass
