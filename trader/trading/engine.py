@@ -176,14 +176,35 @@ class MultiStrategyEngine:
                 )
 
         for runner in self._runners:
-            try:
-                position = runner.enter_position(signal, entry_price, chart_ctx)
-            except Exception:
-                logger.exception(
-                    "[ERROR] %s: enter_position failed for %s", runner.name, signal.symbol
+            # ML filter — skip if score is below threshold.
+            # If score is None (not enough training data yet), always allow through.
+            ml_blocked = (
+                runner.cfg.use_ml_filter
+                and ml_score is not None
+                and ml_score < runner.cfg.ml_min_score
+            )
+            if ml_blocked:
+                logger.info(
+                    "[ML_SKIP] [%-12s] %s | score=%.1f < threshold=%.1f",
+                    runner.name, signal.symbol, ml_score, runner.cfg.ml_min_score,
                 )
-                continue
+                signal_log.info(
+                    "ML_SKIP    | %-10s | %-44s | score=%.1f",
+                    signal.symbol, signal.mint_address, ml_score,
+                )
 
+            position = None
+            if not ml_blocked:
+                try:
+                    position = runner.enter_position(signal, entry_price, chart_ctx)
+                except Exception:
+                    logger.exception(
+                        "[ERROR] %s: enter_position failed for %s", runner.name, signal.symbol
+                    )
+                    continue
+
+            # Save snapshot for ML-filter runners even when blocked — these become
+            # labeled training examples (entered=False) once their outcome is known.
             if runner.cfg.save_chart_data and ml_candles and self._db:
                 snapshot_id = self._db.save_chart_snapshot(
                     strategy=runner.name,

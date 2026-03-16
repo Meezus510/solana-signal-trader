@@ -93,6 +93,14 @@ class StrategyConfig:
     # persisted to chart_snapshots.  Does not affect entry decisions.
     save_chart_data: bool = False
 
+    # ML-based entry filter (optional — requires save_chart_data=True on the same
+    # strategy so training data accumulates).
+    # When True, signals with an ML confidence score below ml_min_score are skipped.
+    # If the scorer returns None (fewer than MIN_SAMPLES closed examples), the signal
+    # is always allowed through so the bot keeps accumulating training data.
+    use_ml_filter: bool = False
+    ml_min_score: float = 5.0
+
 
 # ---------------------------------------------------------------------------
 # Base runner
