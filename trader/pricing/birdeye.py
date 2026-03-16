@@ -243,6 +243,7 @@ class BirdeyePriceClient:
         mint_address: str,
         bars: int = 20,
         interval: str = "1m",
+        time_to: Optional[int] = None,
     ) -> list[OHLCVCandle]:
         """
         Fetch the last `bars` OHLCV candles for a token at 1-minute resolution.
@@ -250,17 +251,22 @@ class BirdeyePriceClient:
         Returns an empty list on any error so callers can safely fall back to
         entering without chart data rather than blocking the signal.
 
+        time_to — optional Unix timestamp upper bound (defaults to now).
+                   Pass a historical timestamp to fetch candles as they looked
+                   at a specific point in time (used for backtesting).
+
         Endpoint: GET /defi/ohlcv?address=<mint>&type=1m&time_from=<ts>&time_to=<ts>
         """
-        now = int(time.time())
+        if time_to is None:
+            time_to = int(time.time())
         # fetch a slightly wider window to guarantee we have `bars` full candles
-        time_from = now - (bars + 5) * 60
+        time_from = time_to - (bars + 5) * 60
         url = f"{self._cfg.birdeye_base_url}/defi/ohlcv"
         params = {
             "address": mint_address,
             "type": interval,
             "time_from": time_from,
-            "time_to": now,
+            "time_to": time_to,
         }
 
         try:
