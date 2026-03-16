@@ -167,7 +167,9 @@ class TradeDatabase:
 
         # chart_snapshots columns added after initial release
         for col, definition in [
-            ("ml_score", "REAL"),
+            ("ml_score",        "REAL"),
+            ("pair_stats_json", "TEXT"),
+            ("candles_1m_json", "TEXT"),
         ]:
             try:
                 c.execute(f"ALTER TABLE chart_snapshots ADD COLUMN {col} {definition}")
@@ -378,28 +380,34 @@ class TradeDatabase:
         chart_ctx,                    # ChartContext | None
         entered: bool,
         ml_score: Optional[float] = None,
+        pair_stats: Optional[dict] = None,
+        candles_1m: Optional[list] = None,
     ) -> int:
         """
         Persist OHLCV candles + signal metadata at entry time.
+
+        candles      — high-res candles used for ML (e.g. 10s × 100 bars)
+        candles_1m   — standard 1m Birdeye candles, saved for future strategy use
+
         Returns the new row id so the runner can later fill in outcome fields.
         """
-        candles_json = json.dumps([
-            {
-                "t": c.unix_time,
-                "o": c.open,
-                "h": c.high,
-                "l": c.low,
-                "c": c.close,
-                "v": c.volume,
-            }
-            for c in candles
-        ])
+        def _serialise(bars: list) -> str:
+            return json.dumps([
+                {"t": c.unix_time, "o": c.open, "h": c.high,
+                 "l": c.low, "c": c.close, "v": c.volume}
+                for c in bars
+            ])
+
+        candles_json    = _serialise(candles)
+        candles_1m_json = _serialise(candles_1m) if candles_1m else None
+
         cursor = self._conn.execute(
             """
             INSERT INTO chart_snapshots
                 (ts, strategy, symbol, mint, entry_price,
-                 pump_ratio, vol_trend, candle_count, candles_json, entered, ml_score)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                 pump_ratio, vol_trend, candle_count, candles_json,
+                 entered, ml_score, pair_stats_json, candles_1m_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 datetime.now(timezone.utc).isoformat(),
@@ -413,6 +421,8 @@ class TradeDatabase:
                 candles_json,
                 int(entered),
                 ml_score,
+                json.dumps(pair_stats) if pair_stats else None,
+                candles_1m_json,
             ),
         )
         self._conn.commit()
@@ -425,7 +435,8 @@ class TradeDatabase:
         """
         rows = self._conn.execute(
             """
-            SELECT ts, candles_json, outcome_pnl_pct, pump_ratio, vol_trend
+            SELECT ts, candles_json, outcome_pnl_pct, pump_ratio, vol_trend,
+                   pair_stats_json
               FROM chart_snapshots
              WHERE strategy = ? AND closed = 1 AND outcome_pnl_pct IS NOT NULL
              ORDER BY ts ASC
@@ -437,8 +448,9 @@ class TradeDatabase:
                 "ts":              r[0],
                 "candles_json":    r[1],
                 "outcome_pnl_pct": r[2],
-                "pump_ratio":      r[3],   # from 1-minute chart filter
-                "vol_trend":       r[4],   # from 1-minute chart filter
+                "pump_ratio":      r[3],
+                "vol_trend":       r[4],
+                "pair_stats_json": r[5],   # None for snapshots before this feature
             }
             for r in rows
         ]

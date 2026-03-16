@@ -23,8 +23,10 @@ Recency-weighted K-Nearest Neighbours (no external dependencies).
        recency_weight    = exp(−age_days / HALFLIFE_DAYS)
 6. Compute the weighted average PnL% of the K neighbours.
 7. Map that average to [0, 10]:
-       score = clamp((weighted_pnl_pct + 20) / 40 × 10, 0, 10)
-   i.e. −20 % PnL → 0 | 0 % PnL → 5 | +20 % PnL → 10.
+       score = clamp((weighted_pnl_pct − (−35)) / 120 × 10, 0, 10)
+   i.e. −35 % PnL → 0 | +25 % PnL → 5 | +85 % PnL → 10.
+   PnL% is price-based (weighted avg exit / entry − 1) × 100, so it is
+   independent of position size across different capital-risk regimes.
 
 Returns None when fewer than MIN_SAMPLES closed snapshots exist.
 
@@ -37,6 +39,7 @@ pre-pump setup and early momentum of a quick_pop signal.
 
 Features (one vector per chart window)
 ---------------------------------------
+OHLCV features (from Birdeye 1m candles):
 1. pump_ratio        — current_price / recent_low
 2. vol_momentum      — avg volume last 5 bars / avg volume earlier bars
 3. price_slope_pct   — (close[-1] / open[0] − 1) × 100
@@ -44,8 +47,14 @@ Features (one vector per chart window)
 5. price_volatility  — std-dev of bar-to-bar % returns
 6. candle_count_norm — candle_count / 20  (proxy for token age)
 7. pump_ratio_1m     — same pump_ratio from the separate 1m chart-filter fetch
-                       (kept for backward compat — same resolution now)
 8. vol_trend_1m      — RISING=1.0 | FLAT=0.5 | DYING=0.0 from chart filter
+
+Pair stats features (from Moralis live pair stats — fallback to neutral when unavailable):
+9.  buy_ratio_5m          — buys / (buys + sells) in last 5 min  [0–1, fallback 0.5]
+10. activity_5m_norm      — (buys + sells) / 20, capped at 3.0   [0–3, fallback 0.0]
+11. price_change_5m_norm  — price % change last 5 min / 50, clamped [-1, 1]  [fallback 0.0]
+12. buy_vol_ratio_1h      — buy USD vol / total USD vol last hour  [0–1, fallback 0.5]
+13. liquidity_change_1h   — liquidity % change last hour / 20, clamped [-1, 1]  [fallback 0.0]
 """
 
 from __future__ import annotations
@@ -66,14 +75,23 @@ MIN_SAMPLES: int = 5        # refuse to score until this many closed examples ex
 K: int = 5                  # nearest neighbours to use
 HALFLIFE_DAYS: float = 14.0 # recency weight half-life (older data counts less)
 
-# Candle resolution used for ML snapshots — separate from the 1-minute chart filter.
-# 15-second bars at 40 bars = 10 minutes of high-resolution entry data.
+# Candle resolution used for ML snapshots via Birdeye (1m is finest available).
+# 40 bars × 1m = 40-minute window.
 ML_OHLCV_BARS: int = 40
 ML_OHLCV_INTERVAL: str = "1m"
 
-# Score mapping: PnL% range covered by [0, 10]
-_SCORE_LOW_PCT:  float = -20.0   # maps to score 0
-_SCORE_HIGH_PCT: float =  20.0   # maps to score 10
+# Higher-resolution ML candles via Moralis (supports sub-minute intervals).
+# 100 bars × 10s ≈ 17-minute window at 6× the detail of 1m bars.
+# Used when MORALIS_API_KEY is set — captures pump shape with much finer granularity.
+MORALIS_OHLCV_BARS: int = 100
+MORALIS_OHLCV_INTERVAL: str = "10s"
+
+# Score mapping: PnL% range covered by [0, 10].
+# Uses price-based return (weighted avg exit price / entry price - 1) × 100,
+# which is position-size-independent.
+# Range chosen from observed quick_pop data: losses -20% to -35%, wins +35% to +85%.
+_SCORE_LOW_PCT:  float = -35.0   # maps to score 0
+_SCORE_HIGH_PCT: float =  85.0   # maps to score 10
 
 # Encoding for the 1-minute vol_trend label → numeric feature
 _VOL_TREND_ENC: dict[str, float] = {"RISING": 1.0, "FLAT": 0.5, "DYING": 0.0}
@@ -87,22 +105,21 @@ def extract_features(
     candles_data: list[dict],
     pump_ratio_1m: Optional[float] = None,
     vol_trend_1m: Optional[str] = None,
+    pair_stats: Optional[dict] = None,
 ) -> Optional[list[float]]:
     """
-    Extract an 8-element feature vector from a list of candle dicts.
+    Extract a 13-element feature vector from candle data + optional pair stats.
 
-    Features 1-6 come from the 15-second candles.
-    Features 7-8 come from the 1-minute chart filter context and add a
-    broader time-scale perspective that the 15s window alone can't see:
+    Features 1-6: OHLCV-derived (resolution-agnostic).
+    Features 7-8: 1-minute chart filter context (fall back to neutral).
+    Features 9-13: Moralis live pair stats (fall back to neutral when unavailable
+                   — old snapshots without pair stats still produce valid vectors).
 
-        7. pump_ratio_1m  — current_price / 20-minute recent low (1m candles).
-                            Falls back to the 15s pump_ratio when unavailable.
-        8. vol_trend_1m   — RISING=1.0 | FLAT=0.5 | DYING=0.0 (1m candles).
-                            Falls back to 0.5 (neutral) when unavailable.
+    pair_stats dict keys (all optional, each falls back independently):
+        buys_5m, sells_5m, buy_volume_1h, total_volume_1h,
+        price_change_5m_pct, liquidity_change_1h_pct
 
-    Accepts dicts with keys {t, o, h, l, c, v} (the format stored in
-    candles_json) or any dict with those same keys.
-
+    Accepts candle dicts with keys {t, o, h, l, c, v}.
     Returns None if there are fewer than 3 candles.
     """
     if len(candles_data) < 3:
@@ -157,10 +174,40 @@ def extract_features(
     #    Falls back to 0.5 (FLAT / neutral) when unavailable.
     f_vol_trend_1m = _VOL_TREND_ENC.get(vol_trend_1m, 0.5) if vol_trend_1m else 0.5
 
+    # ------------------------------------------------------------------
+    # Features 9-13: Moralis live pair stats
+    # All fall back to neutral values when pair_stats is None (old snapshots,
+    # tokens without Moralis coverage, or API failures).
+    # ------------------------------------------------------------------
+    ps = pair_stats or {}
+
+    # 9. Buy ratio in last 5 min: 0 = all sells, 0.5 = balanced, 1 = all buys
+    buys_5m  = ps.get("buys_5m",  0) or 0
+    sells_5m = ps.get("sells_5m", 0) or 0
+    f_buy_ratio_5m = buys_5m / (buys_5m + sells_5m + 1e-9) if (buys_5m + sells_5m) > 0 else 0.5
+
+    # 10. Activity level: normalised trade count in last 5 min (capped at 3)
+    f_activity_5m = min((buys_5m + sells_5m) / 20.0, 3.0)
+
+    # 11. Price momentum: % change in last 5 min, normalised to [-1, 1]
+    price_5m = ps.get("price_change_5m_pct", 0.0) or 0.0
+    f_price_change_5m = max(-1.0, min(1.0, price_5m / 50.0))
+
+    # 12. Buy volume dominance over the last hour [0-1]
+    buy_vol_1h   = ps.get("buy_volume_1h",   0.0) or 0.0
+    total_vol_1h = ps.get("total_volume_1h", 0.0) or 0.0
+    f_buy_vol_ratio_1h = buy_vol_1h / (total_vol_1h + 1e-9) if total_vol_1h > 0 else 0.5
+
+    # 13. Liquidity trend last hour: normalised to [-1, 1]
+    liq_1h = ps.get("liquidity_change_1h_pct", 0.0) or 0.0
+    f_liquidity_change_1h = max(-1.0, min(1.0, liq_1h / 20.0))
+
     return [
         pump_ratio, vol_momentum, price_slope, recent_momentum,
         volatility, candle_count_norm,
         f_pump_1m, f_vol_trend_1m,
+        f_buy_ratio_5m, f_activity_5m, f_price_change_5m,
+        f_buy_vol_ratio_1h, f_liquidity_change_1h,
     ]
 
 
@@ -223,7 +270,7 @@ class ChartMLScorer:
         self._k = k
         self._halflife = recency_halflife_days
 
-    def score(self, candles: list, chart_ctx=None) -> Optional[float]:
+    def score(self, candles: list, chart_ctx=None, pair_stats=None) -> Optional[float]:
         """
         Score incoming candles against historical closed snapshots.
 
@@ -232,6 +279,9 @@ class ChartMLScorer:
         chart_ctx  — ChartContext from the 1-minute chart filter (optional).
                      When provided, features 7 and 8 (pump_ratio_1m, vol_trend_1m)
                      are included, giving the model a broader time-scale view.
+        pair_stats — dict from MoralisOHLCVClient.get_pair_stats() (optional).
+                     When provided, features 9-13 (buy pressure, activity, price
+                     momentum, buy volume dominance, liquidity trend) are included.
 
         Returns a float in [0.0, 10.0] or None if there are fewer than
         MIN_SAMPLES closed snapshots to learn from.
@@ -258,6 +308,7 @@ class ChartMLScorer:
             candle_dicts,
             pump_ratio_1m=chart_ctx.pump_ratio if chart_ctx else None,
             vol_trend_1m=chart_ctx.vol_trend if chart_ctx else None,
+            pair_stats=pair_stats,
         )
         if query_feat is None:
             return None
@@ -267,11 +318,13 @@ class ChartMLScorer:
 
         for snap in snapshots:
             snap_candles = json.loads(snap["candles_json"])
-            # Pass stored 1-minute features so training vectors match query shape
+            snap_pair_stats = json.loads(snap["pair_stats_json"]) \
+                if snap.get("pair_stats_json") else None
             feat = extract_features(
                 snap_candles,
                 pump_ratio_1m=snap.get("pump_ratio"),
                 vol_trend_1m=snap.get("vol_trend"),
+                pair_stats=snap_pair_stats,
             )
             if feat is None:
                 continue

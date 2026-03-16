@@ -20,9 +20,13 @@ import logging
 from typing import Optional
 
 from trader.analysis.chart import OHLCV_BARS, compute_chart_context
-from trader.analysis.ml_scorer import ChartMLScorer, ML_OHLCV_BARS, ML_OHLCV_INTERVAL
+from trader.analysis.ml_scorer import (
+    ChartMLScorer, ML_OHLCV_BARS, ML_OHLCV_INTERVAL,
+    MORALIS_OHLCV_BARS, MORALIS_OHLCV_INTERVAL,
+)
 from trader.config import Config
 from trader.pricing.birdeye import BirdeyePriceClient
+from trader.pricing.moralis import MoralisOHLCVClient
 from trader.trading.models import TokenSignal
 from trader.trading.strategy import StrategyRunner
 
@@ -52,10 +56,12 @@ class MultiStrategyEngine:
         runners: list[StrategyRunner],
         birdeye_client: BirdeyePriceClient,
         db=None,
+        moralis_client: MoralisOHLCVClient | None = None,
     ) -> None:
         self._cfg = cfg
         self._runners = runners
         self._birdeye = birdeye_client
+        self._moralis = moralis_client
         self._db = db
         # Mints currently awaiting reanalysis — prevents duplicate scheduling
         self._pending_reanalysis: set[str] = set()
@@ -97,11 +103,12 @@ class MultiStrategyEngine:
             signal.symbol, entry_price, len(self._runners),
         )
 
-        # Fetch chart context once if any runner uses the chart filter.
-        # Non-chart runners receive it too but will ignore it.
+        # Fetch 1m Birdeye candles if any runner uses the chart filter OR saves
+        # chart data (stored as candles_1m_json for future strategy use).
         candles = []
         chart_ctx = None
-        if any(r.cfg.use_chart_filter for r in self._runners):
+        needs_1m = any(r.cfg.use_chart_filter or r.cfg.save_chart_data for r in self._runners)
+        if needs_1m:
             candles = await self._birdeye.get_ohlcv(signal.mint_address, bars=OHLCV_BARS)
             chart_ctx = compute_chart_context(candles, entry_price)
             if chart_ctx:
@@ -116,22 +123,57 @@ class MultiStrategyEngine:
                     signal.symbol,
                 )
 
-        # Fetch higher-resolution candles for ML (15s × 40 bars = 10 min window).
-        # Separate from the 1-minute chart filter fetch so filter thresholds are unchanged.
+        # ------------------------------------------------------------------
+        # ML candles — try Moralis (high-res) first, fall back to Birdeye.
+        # Any Moralis failure is caught silently; Birdeye is always the safety net.
+        # The interval/bars are controlled by MORALIS_OHLCV_INTERVAL /
+        # MORALIS_OHLCV_BARS in ml_scorer.py — change those constants to switch
+        # to any supported resolution (10s, 30s, 1min, etc.).
+        # ------------------------------------------------------------------
         ml_candles = []
+        ml_source  = "none"
         if self._ml_scorer:
-            ml_candles = await self._birdeye.get_ohlcv(
-                signal.mint_address,
-                bars=ML_OHLCV_BARS,
-                interval=ML_OHLCV_INTERVAL,
-            )
+            if self._moralis:
+                try:
+                    ml_candles = await self._moralis.get_ohlcv(
+                        signal.mint_address,
+                        bars=MORALIS_OHLCV_BARS,
+                        interval=MORALIS_OHLCV_INTERVAL,
+                    )
+                    if ml_candles:
+                        ml_source = f"moralis/{MORALIS_OHLCV_INTERVAL}"
+                except Exception:
+                    logger.debug("[ML] Moralis OHLCV failed for %s — falling back", signal.symbol)
+
+            if not ml_candles:
+                try:
+                    ml_candles = await self._birdeye.get_ohlcv(
+                        signal.mint_address,
+                        bars=ML_OHLCV_BARS,
+                        interval=ML_OHLCV_INTERVAL,
+                    )
+                    if ml_candles:
+                        ml_source = f"birdeye/{ML_OHLCV_INTERVAL}"
+                except Exception:
+                    logger.debug("[ML] Birdeye OHLCV failed for %s", signal.symbol)
+
+        # Moralis pair stats — completely optional, never blocks scoring.
+        pair_stats = None
+        if self._moralis:
+            try:
+                pair_stats = await self._moralis.get_pair_stats(signal.mint_address)
+            except Exception:
+                logger.debug("[ML] Moralis pair stats failed for %s — skipping", signal.symbol)
 
         # ML confidence score
         ml_score: float | None = None
         if self._ml_scorer and ml_candles:
-            ml_score = self._ml_scorer.score(ml_candles, chart_ctx=chart_ctx)
+            ml_score = self._ml_scorer.score(ml_candles, chart_ctx=chart_ctx, pair_stats=pair_stats)
             if ml_score is not None:
-                logger.info("[ML] %s | confidence=%.1f/10", signal.symbol, ml_score)
+                logger.info(
+                    "[ML] %s | confidence=%.1f/10 | src=%s | pair_stats=%s",
+                    signal.symbol, ml_score, ml_source, "yes" if pair_stats else "no",
+                )
 
         for runner in self._runners:
             try:
@@ -152,6 +194,8 @@ class MultiStrategyEngine:
                     chart_ctx=chart_ctx,
                     entered=position is not None,
                     ml_score=ml_score,
+                    pair_stats=pair_stats,
+                    candles_1m=candles if candles else None,
                 )
                 if position is not None:
                     runner.set_chart_snapshot_id(signal.mint_address, snapshot_id)

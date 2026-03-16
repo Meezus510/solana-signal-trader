@@ -34,6 +34,12 @@ class Config:
     birdeye_base_url: str = "https://public-api.birdeye.so"
 
     # ------------------------------------------------------------------
+    # Moralis market data (sub-minute OHLCV, optional)
+    # ------------------------------------------------------------------
+    moralis_api_key: str = ""
+    moralis_base_url: str = "https://solana-gateway.moralis.io"
+
+    # ------------------------------------------------------------------
     # Portfolio
     # ------------------------------------------------------------------
     starting_cash_usd: float = 1_000.0
@@ -98,6 +104,7 @@ class Config:
 
         return cls(
             birdeye_api_key=birdeye_api_key,
+            moralis_api_key=os.getenv("MORALIS_API_KEY", "").strip(),
             tg_api_id=tg_api_id,
             tg_api_hash=tg_api_hash,
             tg_phone=os.getenv("TG_PHONE", "").strip(),
