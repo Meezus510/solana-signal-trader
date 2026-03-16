@@ -28,6 +28,13 @@ Recency-weighted K-Nearest Neighbours (no external dependencies).
 
 Returns None when fewer than MIN_SAMPLES closed snapshots exist.
 
+Candle resolution
+-----------------
+Birdeye's OHLCV endpoint supports 1m as its finest granularity — sub-minute
+intervals (1s, 5s, 15s, 30s) are not available. ML_OHLCV_INTERVAL is "1m"
+and ML_OHLCV_BARS is 40, giving a 40-minute window that captures the full
+pre-pump setup and early momentum of a quick_pop signal.
+
 Features (one vector per chart window)
 ---------------------------------------
 1. pump_ratio        — current_price / recent_low
@@ -36,6 +43,9 @@ Features (one vector per chart window)
 4. recent_momentum   — (close[-1] / close[-6] − 1) × 100 (last 5 bars)
 5. price_volatility  — std-dev of bar-to-bar % returns
 6. candle_count_norm — candle_count / 20  (proxy for token age)
+7. pump_ratio_1m     — same pump_ratio from the separate 1m chart-filter fetch
+                       (kept for backward compat — same resolution now)
+8. vol_trend_1m      — RISING=1.0 | FLAT=0.5 | DYING=0.0 from chart filter
 """
 
 from __future__ import annotations
@@ -59,7 +69,7 @@ HALFLIFE_DAYS: float = 14.0 # recency weight half-life (older data counts less)
 # Candle resolution used for ML snapshots — separate from the 1-minute chart filter.
 # 15-second bars at 40 bars = 10 minutes of high-resolution entry data.
 ML_OHLCV_BARS: int = 40
-ML_OHLCV_INTERVAL: str = "15s"
+ML_OHLCV_INTERVAL: str = "1m"
 
 # Score mapping: PnL% range covered by [0, 10]
 _SCORE_LOW_PCT:  float = -20.0   # maps to score 0
