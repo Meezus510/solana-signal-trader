@@ -52,7 +52,7 @@ SEP = "-" * 72
 # Strategy whose closed positions we read from
 SOURCE_STRATEGY = "quick_pop"
 # Strategy we save snapshots under (what the ML scorer queries)
-TARGET_STRATEGY = "quick_pop_chart"
+TARGET_STRATEGY = "quick_pop_chart_ml"
 
 
 # ---------------------------------------------------------------------------
