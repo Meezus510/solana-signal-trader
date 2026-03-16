@@ -249,7 +249,11 @@ class TestEnterPositionChartFilter:
 # MultiStrategyEngine reanalysis
 # ---------------------------------------------------------------------------
 
-def _make_engine(use_filter_runners: int = 1, no_filter_runners: int = 1):
+def _make_engine(
+    use_filter_runners: int = 1,
+    no_filter_runners: int = 1,
+    use_reanalyze: bool = True,
+):
     """Build a minimal MultiStrategyEngine with mocked Birdeye."""
     from trader.trading.engine import MultiStrategyEngine
     from trader.config import Config
@@ -274,6 +278,7 @@ def _make_engine(use_filter_runners: int = 1, no_filter_runners: int = 1):
             take_profit_levels=(TakeProfitLevel(2.0, 0.5),),
             trailing_stop_pct=0.20, starting_cash_usd=500.0,
             use_chart_filter=True,
+            use_reanalyze=use_reanalyze,
         )))
 
     birdeye = MagicMock()
@@ -388,3 +393,60 @@ class TestReanalysis:
             await engine._reanalyze(signal, delay=0.0)
 
         assert signal.mint_address not in engine._pending_reanalysis
+
+    def test_reanalyze_not_scheduled_when_flag_off(self):
+        """use_reanalyze=False — runner with chart filter but no reanalyze
+        should never trigger a reanalysis task."""
+        engine, runners, birdeye = _make_engine(use_reanalyze=False)
+        signal = _signal(mint="noreanalyze1")
+
+        # No runners have use_reanalyze=True so condition must be False
+        has_reanalyze_runner = any(
+            r.cfg.use_chart_filter and r.cfg.use_reanalyze for r in runners
+        )
+        assert has_reanalyze_runner is False
+        assert signal.mint_address not in engine._pending_reanalysis
+
+    async def test_reanalyze_does_not_enter_runner_with_flag_off(self):
+        """When reanalysis fires, runners with use_reanalyze=False are skipped
+        even if use_chart_filter=True."""
+        from trader.trading.engine import MultiStrategyEngine
+        from trader.config import Config
+
+        cfg = MagicMock(spec=Config)
+        cfg.dry_run = False
+
+        # One chart runner WITH reanalyze, one WITHOUT
+        runner_with = StrategyRunner(cfg=StrategyConfig(
+            name="chart_reanalyze_on",
+            buy_size_usd=10.0, stop_loss_pct=0.20,
+            take_profit_levels=(TakeProfitLevel(2.0, 0.5),),
+            trailing_stop_pct=0.20, starting_cash_usd=500.0,
+            use_chart_filter=True, use_reanalyze=True,
+        ))
+        runner_without = StrategyRunner(cfg=StrategyConfig(
+            name="chart_reanalyze_off",
+            buy_size_usd=10.0, stop_loss_pct=0.20,
+            take_profit_levels=(TakeProfitLevel(2.0, 0.5),),
+            trailing_stop_pct=0.20, starting_cash_usd=500.0,
+            use_chart_filter=True, use_reanalyze=False,
+        ))
+
+        birdeye = MagicMock()
+        birdeye.get_price = AsyncMock(return_value=0.001)
+        birdeye.get_ohlcv = AsyncMock(return_value=_candles(20))
+
+        engine = MultiStrategyEngine(
+            cfg=cfg, runners=[runner_with, runner_without], birdeye_client=birdeye,
+        )
+        signal = _signal(mint="selective_reanalyze")
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            with patch(
+                "trader.trading.engine.compute_chart_context",
+                return_value=self._ok_ctx(),
+            ):
+                await engine._reanalyze(signal, delay=0.0)
+
+        assert runner_with.has_open_position(signal.mint_address)
+        assert not runner_without.has_open_position(signal.mint_address)

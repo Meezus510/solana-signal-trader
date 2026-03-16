@@ -83,6 +83,11 @@ class StrategyConfig:
     # Chart-based entry filter (optional — set True for chart-enabled strategies)
     use_chart_filter: bool = False
 
+    # Reanalysis after a chart SKIP (only meaningful when use_chart_filter=True).
+    # When True, a skipped signal is re-checked after a calculated delay and
+    # entered if the chart has improved.  When False, a SKIP is final.
+    use_reanalyze: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Base runner

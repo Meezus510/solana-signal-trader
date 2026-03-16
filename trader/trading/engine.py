@@ -118,14 +118,14 @@ class MultiStrategyEngine:
                     "[ERROR] %s: enter_position failed for %s", runner.name, signal.symbol
                 )
 
-        # Schedule reanalysis if chart filter skipped this signal and it looks
-        # worth re-checking (chart_ctx.reanalyze_in_secs is set).
+        # Schedule reanalysis if chart filter skipped this signal, at least one
+        # runner has reanalysis enabled, and this mint isn't already pending.
         if (
             chart_ctx is not None
             and not chart_ctx.should_enter
             and chart_ctx.reanalyze_in_secs is not None
             and signal.mint_address not in self._pending_reanalysis
-            and any(r.cfg.use_chart_filter for r in self._runners)
+            and any(r.cfg.use_chart_filter and r.cfg.use_reanalyze for r in self._runners)
         ):
             self._pending_reanalysis.add(signal.mint_address)
             delay = chart_ctx.reanalyze_in_secs
@@ -184,9 +184,9 @@ class MultiStrategyEngine:
             signal.symbol, signal.mint_address, ctx.reason,
         )
 
-        # Enter only chart-filtered runners that don't already hold this mint
+        # Enter only runners with both use_chart_filter and use_reanalyze
         for runner in self._runners:
-            if not runner.cfg.use_chart_filter:
+            if not (runner.cfg.use_chart_filter and runner.cfg.use_reanalyze):
                 continue
             try:
                 runner.enter_position(signal, entry_price, ctx)

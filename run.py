@@ -168,6 +168,7 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         timeout_min_gain_pct=0.15,
         max_hold_minutes=240.0,
         use_chart_filter=True,
+        use_reanalyze=True,   # re-check skipped signals — suits trend reversals
     )
 
     moonbag_chart_cfg = StrategyConfig(
