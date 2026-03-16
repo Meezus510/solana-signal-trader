@@ -1,18 +1,15 @@
 """
 scripts/test_ml_scorer.py — Offline leave-one-out evaluation of the KNN ML scorer.
 
-Uses the known March 15 quick_pop trades as a labelled dataset.
-For each trade it:
-  1. Fetches 40×15s + 20×1m candles at entry time from Birdeye (cached to
-     scripts/candle_cache.json so re-runs are instant and free).
-  2. Builds a training set from all OTHER trades in the dataset.
-  3. Runs the KNN scorer to get a 0–10 confidence score.
-  4. Compares the prediction to the actual outcome.
+Reads completed quick_pop positions from a trades.log file, fetches OHLCV
+candles at each entry time from Birdeye (cached to scripts/candle_cache.json
+so re-runs are instant), and runs leave-one-out cross-validation.
 
 Usage:
     source venv/bin/activate
-    python scripts/test_ml_scorer.py           # full LOO evaluation
-    python scripts/test_ml_scorer.py --fetch   # force-refresh candle cache
+    python scripts/test_ml_scorer.py --log trades.log
+    python scripts/test_ml_scorer.py --log trades.log --fetch   # force-refresh cache
+    python scripts/test_ml_scorer.py --log trades.log --limit 20  # first 20 trades only
 """
 
 from __future__ import annotations
@@ -21,7 +18,9 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
+from collections import defaultdict
 from datetime import datetime, timezone
 
 import aiohttp
@@ -30,7 +29,7 @@ from dotenv import load_dotenv
 load_dotenv()
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from trader.analysis.chart import OHLCV_BARS, compute_chart_context
+from trader.analysis.chart import OHLCV_BARS, OHLCVCandle, compute_chart_context
 from trader.analysis.ml_scorer import (
     K, MIN_SAMPLES, extract_features, zscore_normalize, euclidean,
     ML_OHLCV_BARS, ML_OHLCV_INTERVAL,
@@ -40,82 +39,82 @@ from trader.config import Config
 from trader.pricing.birdeye import BirdeyePriceClient
 
 CACHE_PATH = os.path.join(os.path.dirname(__file__), "candle_cache.json")
-SEP = "-" * 80
+SEP = "-" * 84
+
+CLOSE_EVENTS = {"TP1", "TP2", "TP3", "TP4", "STOP_LOSS", "TRAILING_STOP", "TIMEOUT_SLOW"}
 
 # ---------------------------------------------------------------------------
-# Known trades from 2026-03-15 quick_pop session
+# Log parser
 # ---------------------------------------------------------------------------
-# entry_ts  — ISO UTC timestamp of the BUY event
-# pnl_pct   — realized_pnl_usd / usd_size * 100  (all positions were $30)
-# outcome   — human label
 
-TRADES = [
-    {
-        "symbol":   "NETAINYAHU",
-        "mint":     "BBkUQdTDdVySDKXT4TngbmbpC2ktwBeymMSdn41ppump",
-        # BUY not in log — estimated ~3 min before TP1 at 18:13:34
-        "entry_ts": "2026-03-15T18:10:00+00:00",
-        "entry_ts_note": "(estimated — BUY not in log)",
-        "pnl_pct":  11.3036 / 30 * 100,   # +37.7%
-        "outcome":  "WIN  (TP1)",
-    },
-    {
-        "symbol":   "MVM",
-        "mint":     "9yKLqa49XBvfdGtvVXa3GDYPbQvLZCMKYneof6xmpump",
-        "entry_ts": "2026-03-15T18:27:57+00:00",
-        "pnl_pct":  -6.3539 / 30 * 100,   # -21.2%
-        "outcome":  "LOSS (STOP_LOSS)",
-    },
-    {
-        "symbol":   "ELONGATE",
-        "mint":     "3aGbWBEpCfDxMSb5KfpSvWrBo3tCCbMiZP9x8PpKpump",
-        "entry_ts": "2026-03-15T19:06:04+00:00",
-        "pnl_pct":  -6.5404 / 30 * 100,   # -21.8%
-        "outcome":  "LOSS (STOP_LOSS)",
-    },
-    {
-        "symbol":   "BAGWORKOOR",
-        "mint":     "FDQ77aHDgV6ozbv1b4WM5oXuHGV1cMnjSXpxvgSzpump",
-        "entry_ts": "2026-03-15T19:10:08+00:00",
-        "pnl_pct":  (9.2196 + 2.8354) / 30 * 100,  # +40.2%
-        "outcome":  "WIN  (TP1 + TRAILING_STOP)",
-    },
-    {
-        "symbol":   "BTC",
-        "mint":     "KWmej3HSuuLgaoWWdELniXGhA3gKzLxkf7FRj7xpump",
-        "entry_ts": "2026-03-15T19:31:18+00:00",
-        "pnl_pct":  -6.3811 / 30 * 100,   # -21.3%
-        "outcome":  "LOSS (STOP_LOSS)",
-    },
-    {
-        "symbol":   "PEEP",
-        "mint":     "8HeSKdX9XkJB9PBZiXhFuTYaWbfn3u6sftyPbAcxpump",
-        "entry_ts": "2026-03-15T19:39:29+00:00",
-        "pnl_pct":  -8.4896 / 30 * 100,   # -28.3%
-        "outcome":  "LOSS (STOP_LOSS)",
-    },
-    {
-        "symbol":   "MEFAI",
-        "mint":     "7gcoey4EXJcZ8u3iGYhgTBrh3JuhLWzV4Gs1zNaPtu3U",
-        "entry_ts": "2026-03-15T20:18:17+00:00",
-        "pnl_pct":  4.5249 / 30 * 100,    # +15.1%
-        "outcome":  "WIN  (TIMEOUT_SLOW)",
-    },
-    {
-        "symbol":   "PIXEL",
-        "mint":     "C2hH5X3GGSo4UtFV4evV2r56aMBy2m3KjCeW3wNipump",
-        "entry_ts": "2026-03-15T20:26:16+00:00",
-        "pnl_pct":  -6.0356 / 30 * 100,   # -20.1%
-        "outcome":  "LOSS (STOP_LOSS)",
-    },
-    {
-        "symbol":   "SILKROAD",
-        "mint":     "25PaVmYrnFBSJikKU1kKNS4Zjo4NyiMXr9DnhNT9pump",
-        "entry_ts": "2026-03-15T20:29:17+00:00",
-        "pnl_pct":  -7.2428 / 30 * 100,   # -24.1%
-        "outcome":  "LOSS (STOP_LOSS)",
-    },
-]
+_LOG_RE = re.compile(
+    r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"   # timestamp
+    r"\s*\|\s*(\S+)"                              # event
+    r"\s*\|\s*(\S+)"                              # symbol
+    r"\s*\|\s*(\S+)"                              # mint
+    r".*?price=\$([0-9.]+)"                       # price
+    r".*?qty=([0-9.]+)"                            # qty
+    r".*?pnl=\$([+\-]?[0-9.]+)"                   # pnl (sign optional on BUY lines)
+    r"(?:.*?strategy=(\S+))?"                      # strategy (optional)
+)
+
+
+def parse_log(path: str, strategy: str = "quick_pop") -> list[dict]:
+    """
+    Parse a trades.log file and return completed positions as a list of dicts.
+
+    Handles both log formats:
+      - New (server): has  | strategy=quick_pop  at the end
+      - Old (local):  no strategy field — all lines are included
+
+    Positions where only a BUY exists (still open or close not in log) are skipped.
+    Multi-close positions (TP1 + TRAILING_STOP, TP1 + TP2, etc.) have pnl summed.
+    """
+    buys: dict[str, dict]          = {}   # mint -> buy data
+    closes: dict[str, list[float]] = defaultdict(list)
+
+    with open(path) as f:
+        for line in f:
+            m = _LOG_RE.search(line)
+            if not m:
+                continue
+            ts, event, symbol, mint, price, qty, pnl, strat = m.groups()
+            # If log has strategy field, filter by it; otherwise include all lines
+            if strat is not None and strat != strategy:
+                continue
+
+            if event == "BUY":
+                if mint not in buys:   # first BUY wins (no re-entry on same mint)
+                    buys[mint] = {
+                        "symbol":   symbol,
+                        "mint":     mint,
+                        "entry_ts": ts.replace(" ", "T") + "+00:00",
+                        "entry_price": float(price),
+                        "initial_qty": float(qty),
+                    }
+            elif event in CLOSE_EVENTS:
+                closes[mint].append(float(pnl))
+
+    result = []
+    for mint, buy in buys.items():
+        if mint not in closes:
+            continue   # still open or close not in this log file
+
+        usd_size  = buy["entry_price"] * buy["initial_qty"]
+        total_pnl = sum(closes[mint])
+        pnl_pct   = (total_pnl / usd_size * 100.0) if usd_size > 0 else 0.0
+
+        result.append({
+            "symbol":    buy["symbol"],
+            "mint":      mint,
+            "entry_ts":  buy["entry_ts"],
+            "pnl_pct":   pnl_pct,
+            "total_pnl": total_pnl,
+            "usd_size":  usd_size,
+            "outcome":   "WIN" if total_pnl > 0 else "LOSS",
+        })
+
+    return sorted(result, key=lambda x: x["entry_ts"])
 
 
 # ---------------------------------------------------------------------------
@@ -141,196 +140,158 @@ async def fetch_all_candles(
     force_refresh: bool,
     delay: float = 1.0,
 ) -> None:
-    """Fetch ML candles (40 × 1m) + chart-filter candles (20 × 1m) for every trade."""
-    for trade in trades:
-        key_ml = f"{trade['mint']}|ml"
-        key_1m = f"{trade['mint']}|1m"
+    """Fetch 40×1m ML candles + 20×1m chart candles for every trade."""
+    needs_fetch = [
+        t for t in trades
+        if force_refresh
+        or f"{t['mint']}|ml" not in cache
+        or f"{t['mint']}|1m" not in cache
+    ]
+
+    if not needs_fetch:
+        print(f"  All {len(trades)} trade(s) loaded from cache.")
+        return
+
+    print(f"  Fetching {len(needs_fetch)} trade(s) (cached: {len(trades)-len(needs_fetch)}) ...")
+
+    for i, trade in enumerate(needs_fetch, 1):
         entry_unix = int(datetime.fromisoformat(trade["entry_ts"]).timestamp())
+        symbol     = trade["symbol"]
 
-        if not force_refresh and key_ml in cache and key_1m in cache:
-            print(f"  [CACHE] {trade['symbol']}")
-            continue
-
-        print(f"  [FETCH] {trade['symbol']} @ {trade['entry_ts'][:19]} UTC ...")
-
-        # ML candles: 40 × 1m = 40-minute window
         ml_candles = await birdeye.get_ohlcv(
-            trade["mint"],
-            bars=ML_OHLCV_BARS,
-            interval=ML_OHLCV_INTERVAL,
+            trade["mint"], bars=ML_OHLCV_BARS, interval=ML_OHLCV_INTERVAL,
             time_to=entry_unix,
         )
-        # Chart-filter candles: 20 × 1m (shorter window)
         chart_candles = await birdeye.get_ohlcv(
-            trade["mint"],
-            bars=OHLCV_BARS,
-            interval="1m",
+            trade["mint"], bars=OHLCV_BARS, interval="1m",
             time_to=entry_unix,
         )
 
-        cache[key_ml] = [
+        cache[f"{trade['mint']}|ml"] = [
             {"t": c.unix_time, "o": c.open, "h": c.high,
              "l": c.low,       "c": c.close, "v": c.volume}
             for c in ml_candles
         ]
-        cache[key_1m] = [
+        cache[f"{trade['mint']}|1m"] = [
             {"t": c.unix_time, "o": c.open, "h": c.high,
              "l": c.low,       "c": c.close, "v": c.volume}
             for c in chart_candles
         ]
 
         bars_ml = len(ml_candles)
-        bars_1m = len(chart_candles)
-        if bars_ml == 0:
-            print(f"    [WARN] no ML candles — token may be delisted or too new")
-        else:
-            print(f"    OK — {bars_ml} × {ML_OHLCV_INTERVAL} ML bars, {bars_1m} × 1m chart bars")
+        status  = f"{bars_ml} bars" if bars_ml else "NO DATA"
+        print(f"  [{i:>3}/{len(needs_fetch)}] {symbol:<14} {trade['entry_ts'][:16]}  {status}")
 
         await asyncio.sleep(delay)
 
     save_cache(cache)
+    print()
 
 
 # ---------------------------------------------------------------------------
 # Leave-one-out evaluation
 # ---------------------------------------------------------------------------
 
-def knn_score_raw(
+def knn_score(
     query_feat: list[float],
     training_feats: list[list[float]],
     training_pnl: list[float],
     k: int = K,
 ) -> float | None:
-    """Pure KNN score (no recency weighting — all data from the same day)."""
     if len(training_feats) < MIN_SAMPLES:
         return None
-
-    norm_query, norm_training = zscore_normalize(query_feat, training_feats)
-
-    candidates = []
-    for i, feat in enumerate(norm_training):
-        dist = euclidean(norm_query, feat)
-        w = 1.0 / (dist + 1e-6)
-        candidates.append((dist, w, training_pnl[i]))
-
-    candidates.sort(key=lambda x: x[0])
+    norm_q, norm_t = zscore_normalize(query_feat, training_feats)
+    candidates = sorted(
+        [(euclidean(norm_q, f), 1.0 / (euclidean(norm_q, f) + 1e-6), training_pnl[i])
+         for i, f in enumerate(norm_t)],
+        key=lambda x: x[0],
+    )
     neighbours = candidates[:k]
-
-    total_w      = sum(w   for _, w, _   in neighbours)
-    weighted_pnl = sum(w * p for _, w, p in neighbours)
+    total_w = sum(w for _, w, _ in neighbours)
     if total_w == 0:
         return 5.0
-
-    avg_pnl   = weighted_pnl / total_w
-    pnl_range = _SCORE_HIGH_PCT - _SCORE_LOW_PCT
-    raw_score = (avg_pnl - _SCORE_LOW_PCT) / pnl_range * 10.0
+    avg_pnl   = sum(w * p for _, w, p in neighbours) / total_w
+    raw_score = (avg_pnl - _SCORE_LOW_PCT) / (_SCORE_HIGH_PCT - _SCORE_LOW_PCT) * 10.0
     return max(0.0, min(10.0, raw_score))
 
 
-def run_loo_evaluation(trades: list[dict], cache: dict) -> None:
-    """
-    Leave-one-out cross-validation.
-    For each trade: train on all others, score the held-out trade, compare to truth.
-    Falls back to 1m candles when 15s data has expired (Birdeye keeps 15s for ~4h only).
-    """
-    # 1. Extract features for every trade
+def run_loo_evaluation(trades: list[dict], cache: dict, threshold: float = 5.0) -> None:
+    # Build feature records
     records = []
+    skipped = 0
     for trade in trades:
-        key_ml = f"{trade['mint']}|ml"
-        key_1m = f"{trade['mint']}|1m"
-
-        ml_candles    = cache.get(key_ml, [])
-        chart_candles = cache.get(key_1m, [])
+        ml_candles    = cache.get(f"{trade['mint']}|ml", [])
+        chart_candles = cache.get(f"{trade['mint']}|1m", [])
 
         if not ml_candles:
-            print(f"  [SKIP] {trade['symbol']} — no candle data in cache")
+            skipped += 1
             continue
 
-        # Derive 1-minute chart context (pump_ratio, vol_trend)
-        pump_ratio_1m = None
-        vol_trend_1m  = None
+        pump_ratio_1m = vol_trend_1m = None
         if chart_candles:
-            # Reconstruct OHLCVCandle objects for compute_chart_context
-            from trader.analysis.chart import OHLCVCandle
-            candle_objs = [
-                OHLCVCandle(
-                    unix_time=c["t"], open=c["o"], high=c["h"],
-                    low=c["l"], close=c["c"], volume=c["v"],
-                )
-                for c in chart_candles
-            ]
-            # Use last close as a proxy entry price
-            entry_price = candle_objs[-1].close if candle_objs else 0.0
-            ctx = compute_chart_context(candle_objs, entry_price)
+            objs = [OHLCVCandle(unix_time=c["t"], open=c["o"], high=c["h"],
+                                low=c["l"], close=c["c"], volume=c["v"])
+                    for c in chart_candles]
+            ctx = compute_chart_context(objs, objs[-1].close if objs else 0.0)
             if ctx:
                 pump_ratio_1m = ctx.pump_ratio
                 vol_trend_1m  = ctx.vol_trend
 
-        feat = extract_features(
-            ml_candles,
-            pump_ratio_1m=pump_ratio_1m,
-            vol_trend_1m=vol_trend_1m,
-        )
+        feat = extract_features(ml_candles, pump_ratio_1m=pump_ratio_1m,
+                                 vol_trend_1m=vol_trend_1m)
         if feat is None:
-            print(f"  [SKIP] {trade['symbol']} — feature extraction failed (< 3 candles)")
+            skipped += 1
             continue
 
-        records.append({
-            "symbol":   trade["symbol"],
-            "outcome":  trade["outcome"],
-            "pnl_pct":  trade["pnl_pct"],
-            "feat":     feat,
-            "pump_1m":  pump_ratio_1m,
-            "vol_1m":   vol_trend_1m,
-            "note":     trade.get("entry_ts_note", ""),
-        })
+        records.append({**trade, "feat": feat})
 
-    print()
     print(SEP)
-    print("  LEAVE-ONE-OUT EVALUATION  (training K={}, min_samples={})".format(K, MIN_SAMPLES))
+    print(f"  LEAVE-ONE-OUT EVALUATION  (K={K}, min_samples={MIN_SAMPLES}, threshold={threshold:.0f})")
+    print(f"  Trades: {len(records)} scorable, {skipped} skipped (no candle data)")
     print(SEP)
-    print(f"  {'Symbol':<12} {'Actual PnL%':>11}  {'Score':>5}  {'Label':<28}  {'Prediction'}")
-    print(f"  {'-'*12} {'-'*11}  {'-'*5}  {'-'*28}  {'-'*14}")
+    print(f"  {'Symbol':<14} {'PnL%':>8}  {'Score':>5}  {'Outcome':<10}  Prediction")
+    print(f"  {'-'*14} {'-'*8}  {'-'*5}  {'-'*10}  {'-'*14}")
 
-    correct = 0
-    scored  = 0
-    threshold = 5.0  # score ≥ 5 → predicted win, < 5 → predicted skip
+    correct = scored = true_pos = false_pos = true_neg = false_neg = 0
 
     for i, rec in enumerate(records):
         train_feats = [r["feat"]    for j, r in enumerate(records) if j != i]
         train_pnl   = [r["pnl_pct"] for j, r in enumerate(records) if j != i]
 
-        score = knn_score_raw(rec["feat"], train_feats, train_pnl)
-        if score is None:
-            tag = "NOT ENOUGH DATA"
-            pred_label = "—"
-        else:
-            scored += 1
-            is_win      = rec["pnl_pct"] > 0
-            pred_win    = score >= threshold
-            correct    += 1 if is_win == pred_win else 0
-            pred_label  = "BUY" if pred_win else "SKIP"
-            ok = "✓" if is_win == pred_win else "✗"
-            tag = f"{ok}  ({pred_label})"
+        score = knn_score(rec["feat"], train_feats, train_pnl)
 
-        score_str = f"{score:.1f}" if score is not None else "—"
-        note = f"  {rec['note']}" if rec["note"] else ""
+        if score is None:
+            print(f"  {rec['symbol']:<14} {rec['pnl_pct']:>+7.1f}%  {'—':>5}  {rec['outcome']:<10}  not enough data")
+            continue
+
+        scored   += 1
+        is_win    = rec["pnl_pct"] > 0
+        pred_win  = score >= threshold
+        ok        = is_win == pred_win
+        correct  += ok
+
+        if is_win and pred_win:   true_pos  += 1
+        elif not is_win and pred_win: false_pos += 1
+        elif is_win and not pred_win: false_neg += 1
+        else:                         true_neg  += 1
+
+        pred_label = "BUY ✓" if (pred_win and ok) else "BUY ✗" if pred_win else "SKIP ✓" if ok else "SKIP ✗"
         print(
-            f"  {rec['symbol']:<12} {rec['pnl_pct']:>+10.1f}%  {score_str:>5}  "
-            f"{rec['outcome']:<28}  {tag}{note}"
+            f"  {rec['symbol']:<14} {rec['pnl_pct']:>+7.1f}%  {score:>5.1f}  {rec['outcome']:<10}  {pred_label}"
         )
 
     print(SEP)
     if scored:
-        accuracy = correct / scored * 100
-        print(f"  Accuracy: {correct}/{scored}  ({accuracy:.0f}%)")
-        print(f"  Threshold: score >= {threshold:.0f} → BUY, else SKIP")
+        accuracy  = correct / scored * 100
+        precision = true_pos / (true_pos + false_pos) * 100 if (true_pos + false_pos) else 0
+        recall    = true_pos / (true_pos + false_neg) * 100 if (true_pos + false_neg) else 0
+        wins      = sum(1 for r in records if r["pnl_pct"] > 0)
+        print(f"  Accuracy  : {correct}/{scored}  ({accuracy:.0f}%)")
+        print(f"  Precision : {true_pos}/{true_pos+false_pos}  ({precision:.0f}%)  — of predicted BUYs, how many won")
+        print(f"  Recall    : {true_pos}/{true_pos+false_neg}  ({recall:.0f}%)  — of actual wins, how many were caught")
+        print(f"  Base rate : {wins}/{len(records)} trades were wins  ({wins/len(records)*100:.0f}%)")
+        print(f"  Threshold : score >= {threshold:.0f} → BUY, else SKIP")
     print(SEP)
-    print()
-    print("  NOTE: Leave-one-out with 9 trades is a rough signal only.")
-    print("  The real scorer will improve significantly once the backfill")
-    print("  seeds 50+ historical snapshots from the full trade history.")
-    print()
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +299,23 @@ def run_loo_evaluation(trades: list[dict], cache: dict) -> None:
 # ---------------------------------------------------------------------------
 
 async def run(args: argparse.Namespace, cfg: Config) -> None:
+    print(SEP)
+    print(f"  PARSING  {args.log}")
+    print(SEP)
+
+    trades = parse_log(args.log, strategy=args.strategy)
+    if not trades:
+        print(f"[ERROR] No completed {args.strategy} positions found in {args.log}")
+        return
+
+    if args.limit:
+        trades = trades[: args.limit]
+
+    wins   = sum(1 for t in trades if t["pnl_pct"] > 0)
+    losses = len(trades) - wins
+    print(f"  {len(trades)} completed positions  ({wins} wins / {losses} losses)")
+    print()
+
     cache = load_cache()
 
     print(SEP)
@@ -345,24 +323,32 @@ async def run(args: argparse.Namespace, cfg: Config) -> None:
     print(SEP)
     async with aiohttp.ClientSession() as session:
         birdeye = BirdeyePriceClient(cfg, session)
-        await fetch_all_candles(TRADES, birdeye, cache, args.fetch, delay=args.delay)
+        await fetch_all_candles(trades, birdeye, cache, args.fetch, delay=args.delay)
 
-    run_loo_evaluation(TRADES, cache)
+    run_loo_evaluation(trades, cache, threshold=args.threshold)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Leave-one-out evaluation of the KNN ML scorer on March 15 trades."
+        description="Leave-one-out ML scorer evaluation from a trades.log file."
     )
-    parser.add_argument(
-        "--fetch", action="store_true",
-        help="Force-refresh all candles (ignore cache)",
-    )
-    parser.add_argument(
-        "--delay", type=float, default=1.0, metavar="SECS",
-        help="Delay between Birdeye calls when fetching (default: 1.0)",
-    )
+    parser.add_argument("--log", required=True, metavar="FILE",
+                        help="Path to trades.log")
+    parser.add_argument("--strategy", default="quick_pop",
+                        help="Strategy to evaluate (default: quick_pop)")
+    parser.add_argument("--fetch", action="store_true",
+                        help="Force-refresh all candles (ignore cache)")
+    parser.add_argument("--limit", type=int, default=0, metavar="N",
+                        help="Only process first N trades (0 = all)")
+    parser.add_argument("--threshold", type=float, default=5.0, metavar="SCORE",
+                        help="Score threshold for BUY prediction (default: 5.0)")
+    parser.add_argument("--delay", type=float, default=1.0, metavar="SECS",
+                        help="Delay between Birdeye calls (default: 1.0)")
     args = parser.parse_args()
+
+    if not os.path.exists(args.log):
+        print(f"[ERROR] Log file not found: {args.log}", file=sys.stderr)
+        sys.exit(1)
 
     try:
         cfg = Config.load()
