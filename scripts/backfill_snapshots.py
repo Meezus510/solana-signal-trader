@@ -71,6 +71,8 @@ def load_closed_positions(db_path: str) -> list[dict]:
            AND opened_at IS NOT NULL
            AND closed_at IS NOT NULL
            AND realized_pnl_usd IS NOT NULL
+           AND opened_at LIKE '20%'
+           AND closed_at LIKE '20%'
          ORDER BY opened_at ASC
         """,
         (SOURCE_STRATEGY,),
