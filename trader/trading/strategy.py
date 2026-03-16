@@ -88,6 +88,11 @@ class StrategyConfig:
     # entered if the chart has improved.  When False, a SKIP is final.
     use_reanalyze: bool = False
 
+    # Save chart snapshots for ML training (optional).
+    # When True, every incoming signal's OHLCV candles + outcome metrics are
+    # persisted to chart_snapshots.  Does not affect entry decisions.
+    save_chart_data: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Base runner
@@ -116,6 +121,8 @@ class StrategyRunner:
         )
         self._exchange = PaperExchange(portfolio=portfolio, cfg=cfg)
         self._portfolio = PortfolioManager()
+        # mint → chart_snapshot row id (populated by engine when save_chart_data=True)
+        self._chart_snapshot_ids: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Properties
@@ -136,6 +143,10 @@ class StrategyRunner:
     # ------------------------------------------------------------------
     # State restoration (called on startup from DB)
     # ------------------------------------------------------------------
+
+    def set_chart_snapshot_id(self, mint: str, snapshot_id: int) -> None:
+        """Called by the engine after saving a chart snapshot for an entered position."""
+        self._chart_snapshot_ids[mint] = snapshot_id
 
     def restore_cash(self, available_cash: float, starting_cash: float) -> None:
         self._exchange.portfolio.available_cash_usd = available_cash
@@ -404,6 +415,7 @@ class StrategyRunner:
             self._db.upsert_position(position)
             self._db.save_portfolio(self._exchange.portfolio, self.name)
             self._db.log_trade(reason, position, price, qty, pnl)
+            self._flush_chart_snapshot(position, reason)
 
     def _force_close(self, position: Position, reason: str, now: datetime) -> None:
         """Mark a position closed when remaining_quantity hits zero after partial sells."""
@@ -413,6 +425,25 @@ class StrategyRunner:
         self._portfolio.close_position(position.mint_address)
         if self._db:
             self._db.upsert_position(position)
+            self._flush_chart_snapshot(position, reason)
+
+    def _flush_chart_snapshot(self, position: Position, reason: str) -> None:
+        """Update chart snapshot outcome metrics when a position closes."""
+        if not self._cfg.save_chart_data or not self._db:
+            return
+        snapshot_id = self._chart_snapshot_ids.pop(position.mint_address, None)
+        if snapshot_id is None:
+            return
+        opened_at = position.opened_at
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=timezone.utc)
+        closed_at = position.closed_at or datetime.now(timezone.utc)
+        if closed_at.tzinfo is None:
+            closed_at = closed_at.replace(tzinfo=timezone.utc)
+        hold_secs = (closed_at - opened_at).total_seconds()
+        max_gain_pct = (position.highest_price / position.entry_price - 1.0) * 100.0
+        pnl_pct = (position.realized_pnl_usd / position.usd_size * 100.0) if position.usd_size else 0.0
+        self._db.update_chart_snapshot_outcome(snapshot_id, pnl_pct, reason, hold_secs, max_gain_pct)
 
     # ------------------------------------------------------------------
     # Reporting

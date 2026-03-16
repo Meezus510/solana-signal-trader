@@ -115,6 +115,7 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         timeout_minutes=45.0,
         timeout_min_gain_pct=0.49,
         use_chart_filter=True,
+        save_chart_data=True,
     )
 
     trend_rider_chart_cfg = StrategyConfig(

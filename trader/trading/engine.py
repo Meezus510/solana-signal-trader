@@ -20,6 +20,7 @@ import logging
 from typing import Optional
 
 from trader.analysis.chart import OHLCV_BARS, compute_chart_context
+from trader.analysis.ml_scorer import ChartMLScorer, ML_OHLCV_BARS, ML_OHLCV_INTERVAL
 from trader.config import Config
 from trader.pricing.birdeye import BirdeyePriceClient
 from trader.trading.models import TokenSignal
@@ -58,6 +59,10 @@ class MultiStrategyEngine:
         self._db = db
         # Mints currently awaiting reanalysis — prevents duplicate scheduling
         self._pending_reanalysis: set[str] = set()
+        # ML scorer — only instantiated when at least one runner saves chart data
+        self._ml_scorer: ChartMLScorer | None = (
+            ChartMLScorer(db) if db and any(r.cfg.save_chart_data for r in runners) else None
+        )
 
     # ------------------------------------------------------------------
     # Signal handling
@@ -94,6 +99,7 @@ class MultiStrategyEngine:
 
         # Fetch chart context once if any runner uses the chart filter.
         # Non-chart runners receive it too but will ignore it.
+        candles = []
         chart_ctx = None
         if any(r.cfg.use_chart_filter for r in self._runners):
             candles = await self._birdeye.get_ohlcv(signal.mint_address, bars=OHLCV_BARS)
@@ -110,13 +116,45 @@ class MultiStrategyEngine:
                     signal.symbol,
                 )
 
+        # Fetch higher-resolution candles for ML (15s × 40 bars = 10 min window).
+        # Separate from the 1-minute chart filter fetch so filter thresholds are unchanged.
+        ml_candles = []
+        if self._ml_scorer:
+            ml_candles = await self._birdeye.get_ohlcv(
+                signal.mint_address,
+                bars=ML_OHLCV_BARS,
+                interval=ML_OHLCV_INTERVAL,
+            )
+
+        # ML confidence score
+        ml_score: float | None = None
+        if self._ml_scorer and ml_candles:
+            ml_score = self._ml_scorer.score(ml_candles, chart_ctx=chart_ctx)
+            if ml_score is not None:
+                logger.info("[ML] %s | confidence=%.1f/10", signal.symbol, ml_score)
+
         for runner in self._runners:
             try:
-                runner.enter_position(signal, entry_price, chart_ctx)
+                position = runner.enter_position(signal, entry_price, chart_ctx)
             except Exception:
                 logger.exception(
                     "[ERROR] %s: enter_position failed for %s", runner.name, signal.symbol
                 )
+                continue
+
+            if runner.cfg.save_chart_data and ml_candles and self._db:
+                snapshot_id = self._db.save_chart_snapshot(
+                    strategy=runner.name,
+                    symbol=signal.symbol,
+                    mint=signal.mint_address,
+                    entry_price=entry_price,
+                    candles=ml_candles,
+                    chart_ctx=chart_ctx,
+                    entered=position is not None,
+                    ml_score=ml_score,
+                )
+                if position is not None:
+                    runner.set_chart_snapshot_id(signal.mint_address, snapshot_id)
 
         # Schedule reanalysis if chart filter skipped this signal, at least one
         # runner has reanalysis enabled, and this mint isn't already pending.
