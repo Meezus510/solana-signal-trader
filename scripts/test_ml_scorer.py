@@ -308,6 +308,11 @@ async def run(args: argparse.Namespace, cfg: Config) -> None:
         print(f"[ERROR] No completed {args.strategy} positions found in {args.log}")
         return
 
+    if args.min_usd:
+        before = len(trades)
+        trades = [t for t in trades if t["usd_size"] >= args.min_usd]
+        print(f"  Filtered to usd_size >= ${args.min_usd:.0f}: {len(trades)}/{before} trades kept")
+
     if args.limit:
         trades = trades[: args.limit]
 
@@ -340,6 +345,8 @@ def main() -> None:
                         help="Force-refresh all candles (ignore cache)")
     parser.add_argument("--limit", type=int, default=0, metavar="N",
                         help="Only process first N trades (0 = all)")
+    parser.add_argument("--min-usd", type=float, default=0.0, metavar="USD",
+                        help="Only include positions with usd_size >= this value (default: 0 = all)")
     parser.add_argument("--threshold", type=float, default=5.0, metavar="SCORE",
                         help="Score threshold for BUY prediction (default: 5.0)")
     parser.add_argument("--delay", type=float, default=1.0, metavar="SECS",
