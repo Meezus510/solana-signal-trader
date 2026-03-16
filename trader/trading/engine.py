@@ -56,6 +56,8 @@ class MultiStrategyEngine:
         self._runners = runners
         self._birdeye = birdeye_client
         self._db = db
+        # Mints currently awaiting reanalysis — prevents duplicate scheduling
+        self._pending_reanalysis: set[str] = set()
 
     # ------------------------------------------------------------------
     # Signal handling
@@ -114,6 +116,84 @@ class MultiStrategyEngine:
             except Exception:
                 logger.exception(
                     "[ERROR] %s: enter_position failed for %s", runner.name, signal.symbol
+                )
+
+        # Schedule reanalysis if chart filter skipped this signal and it looks
+        # worth re-checking (chart_ctx.reanalyze_in_secs is set).
+        if (
+            chart_ctx is not None
+            and not chart_ctx.should_enter
+            and chart_ctx.reanalyze_in_secs is not None
+            and signal.mint_address not in self._pending_reanalysis
+            and any(r.cfg.use_chart_filter for r in self._runners)
+        ):
+            self._pending_reanalysis.add(signal.mint_address)
+            delay = chart_ctx.reanalyze_in_secs
+            logger.info(
+                "[REANALYZE] %s — scheduled in %.0fs (%.1f min) | reason: %s",
+                signal.symbol, delay, delay / 60, chart_ctx.reason,
+            )
+            asyncio.create_task(self._reanalyze(signal, delay))
+
+    # ------------------------------------------------------------------
+    # Reanalysis
+    # ------------------------------------------------------------------
+
+    async def _reanalyze(self, signal: TokenSignal, delay: float) -> None:
+        """
+        Wait `delay` seconds, then re-fetch chart data and decide whether to
+        enter the previously skipped signal.
+
+        Only chart-filtered runners are evaluated — baseline runners already
+        entered at the original signal time.  One attempt only; if the chart
+        still says SKIP the signal is abandoned.
+        """
+        await asyncio.sleep(delay)
+        self._pending_reanalysis.discard(signal.mint_address)
+
+        logger.info("[REANALYZE] %s — re-checking chart after %.0fs", signal.symbol, delay)
+
+        # Fresh price at reanalysis time
+        entry_price = await self._birdeye.get_price(signal.mint_address)
+        if entry_price is None:
+            logger.warning("[REANALYZE] %s — no price available, abandoning", signal.symbol)
+            return
+
+        # Fresh OHLCV (current candles, not historical)
+        candles = await self._birdeye.get_ohlcv(signal.mint_address, bars=OHLCV_BARS)
+        ctx = compute_chart_context(candles, entry_price)
+
+        if ctx is None or not ctx.should_enter:
+            reason = ctx.reason if ctx else "no candle data"
+            logger.info(
+                "[REANALYZE] %s @ $%.8f — still SKIP: %s — abandoning",
+                signal.symbol, entry_price, reason,
+            )
+            signal_log.info(
+                "REANALYZE_SKIP | %-10s | %-44s | %s",
+                signal.symbol, signal.mint_address, reason,
+            )
+            return
+
+        logger.info(
+            "[REANALYZE] %s @ $%.8f — now BUY: %s — entering chart runners",
+            signal.symbol, entry_price, ctx.reason,
+        )
+        signal_log.info(
+            "REANALYZE_BUY  | %-10s | %-44s | %s",
+            signal.symbol, signal.mint_address, ctx.reason,
+        )
+
+        # Enter only chart-filtered runners that don't already hold this mint
+        for runner in self._runners:
+            if not runner.cfg.use_chart_filter:
+                continue
+            try:
+                runner.enter_position(signal, entry_price, ctx)
+            except Exception:
+                logger.exception(
+                    "[ERROR] %s: reanalysis enter_position failed for %s",
+                    runner.name, signal.symbol,
                 )
 
     # ------------------------------------------------------------------

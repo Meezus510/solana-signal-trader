@@ -35,6 +35,15 @@ OHLCV_BARS: int = 20        # number of 1-minute candles to fetch
 PUMP_RATIO_MAX: float = 3.5  # skip entry if already >Nx above recent low
 VOL_WINDOW: int = 5          # bars for recent-vs-earlier volume comparison
 
+# Reanalysis delays (seconds) — how long to wait before re-checking a
+# skipped signal.  Tuned to give the chart time to improve:
+#   pumped only  — wait for a natural retrace after the initial spike
+#   dying volume — volume can flip quickly; shorter wait
+#   both         — worst case; give it the most time
+REANALYZE_PUMP_DELAY: float = 8 * 60    # 8 minutes
+REANALYZE_VOL_DELAY:  float = 4 * 60    # 4 minutes
+REANALYZE_BOTH_DELAY: float = 10 * 60   # 10 minutes
+
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -55,17 +64,25 @@ class ChartContext:
     """
     Computed chart metrics for one token at signal time.
 
-    pump_ratio    current_price / lowest low over the fetched candles
-    vol_trend     "RISING" | "FLAT" | "DYING"
-    should_enter  True when chart conditions favour entry
-    reason        human-readable explanation (logged on every signal)
-    candle_count  actual number of candles returned (may be < OHLCV_BARS for new tokens)
+    pump_ratio          current_price / lowest low over the fetched candles
+    vol_trend           "RISING" | "FLAT" | "DYING"
+    should_enter        True when chart conditions favour entry
+    reason              human-readable explanation (logged on every signal)
+    candle_count        actual number of candles returned (may be < OHLCV_BARS for new tokens)
+    reanalyze_in_secs   seconds to wait before re-checking a skipped signal.
+                        None when should_enter=True (no reanalysis needed).
+                        Set automatically by compute_chart_context() based on
+                        the skip reason:
+                            pumped only  → REANALYZE_PUMP_DELAY
+                            volume dying → REANALYZE_VOL_DELAY
+                            both         → REANALYZE_BOTH_DELAY
     """
     pump_ratio: float
     vol_trend: str        # "RISING" | "FLAT" | "DYING"
     should_enter: bool
     reason: str
     candle_count: int
+    reanalyze_in_secs: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -111,23 +128,28 @@ def compute_chart_context(
     pumped_too_much = pump_ratio >= PUMP_RATIO_MAX
     volume_dead = vol_trend == "DYING"
 
+    reanalyze_in_secs: Optional[float] = None
+
     if pumped_too_much and volume_dead:
         reason = (
             f"SKIP: already {pump_ratio:.1f}x from recent low + volume dying"
         )
         should_enter = False
+        reanalyze_in_secs = REANALYZE_BOTH_DELAY
     elif pumped_too_much:
         reason = (
             f"SKIP: already {pump_ratio:.1f}x from recent low "
             f"(max {PUMP_RATIO_MAX}x)"
         )
         should_enter = False
+        reanalyze_in_secs = REANALYZE_PUMP_DELAY
     elif volume_dead:
         reason = (
             f"SKIP: volume dying "
             f"(recent avg {avg_recent:.0f} vs earlier {avg_earlier:.0f})"
         )
         should_enter = False
+        reanalyze_in_secs = REANALYZE_VOL_DELAY
     else:
         reason = f"OK: {pump_ratio:.1f}x from low | vol={vol_trend}"
         should_enter = True
@@ -138,4 +160,5 @@ def compute_chart_context(
         should_enter=should_enter,
         reason=reason,
         candle_count=len(candles),
+        reanalyze_in_secs=reanalyze_in_secs,
     )
