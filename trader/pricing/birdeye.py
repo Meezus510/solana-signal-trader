@@ -26,10 +26,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Optional
 
 import aiohttp
 
+from trader.analysis.chart import OHLCVCandle
 from trader.config import Config
 
 logger = logging.getLogger(__name__)
@@ -235,6 +237,74 @@ class BirdeyePriceClient:
             logger.error("[ERROR] Unexpected batch error: %s — skipping cycle", exc)
 
         return {m: None for m in mint_addresses}
+
+    async def get_ohlcv(
+        self,
+        mint_address: str,
+        bars: int = 20,
+        interval: str = "1m",
+    ) -> list[OHLCVCandle]:
+        """
+        Fetch the last `bars` OHLCV candles for a token at 1-minute resolution.
+
+        Returns an empty list on any error so callers can safely fall back to
+        entering without chart data rather than blocking the signal.
+
+        Endpoint: GET /defi/ohlcv?address=<mint>&type=1m&time_from=<ts>&time_to=<ts>
+        """
+        now = int(time.time())
+        # fetch a slightly wider window to guarantee we have `bars` full candles
+        time_from = now - (bars + 5) * 60
+        url = f"{self._cfg.birdeye_base_url}/defi/ohlcv"
+        params = {
+            "address": mint_address,
+            "type": interval,
+            "time_from": time_from,
+            "time_to": now,
+        }
+
+        try:
+            async with self._session.get(
+                url,
+                headers=self._headers(),
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=self._cfg.request_timeout_seconds),
+            ) as resp:
+                if resp.status == 401:
+                    logger.warning("[OHLCV] 401 Unauthorized for %s — chart filter disabled this signal", mint_address)
+                    return []
+                if resp.status == 429:
+                    logger.warning("[OHLCV] 429 rate limit for %s — skipping chart filter", mint_address)
+                    return []
+                if resp.status != 200:
+                    logger.warning("[OHLCV] HTTP %d for %s — skipping chart filter", resp.status, mint_address)
+                    return []
+
+                data = await resp.json()
+                items = (data.get("data") or {}).get("items") or []
+                candles = [
+                    OHLCVCandle(
+                        unix_time=int(item.get("unixTime", 0)),
+                        open=float(item.get("o", 0)),
+                        high=float(item.get("h", 0)),
+                        low=float(item.get("l", 0)),
+                        close=float(item.get("c", 0)),
+                        volume=float(item.get("v", 0)),
+                    )
+                    for item in items
+                    if item.get("l") is not None
+                ]
+                logger.debug("[OHLCV] %s — %d candles fetched", mint_address, len(candles))
+                return candles[-bars:]  # keep only the most recent `bars`
+
+        except asyncio.TimeoutError:
+            logger.warning("[OHLCV] Timeout for %s — skipping chart filter", mint_address)
+        except aiohttp.ClientError as exc:
+            logger.warning("[OHLCV] HTTP error for %s: %s — skipping chart filter", mint_address, exc)
+        except Exception as exc:
+            logger.error("[OHLCV] Unexpected error for %s: %s", mint_address, exc)
+
+        return []
 
     async def _individual_with_rate_limit(
         self,

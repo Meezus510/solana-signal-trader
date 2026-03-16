@@ -19,6 +19,7 @@ import asyncio
 import logging
 from typing import Optional
 
+from trader.analysis.chart import OHLCV_BARS, compute_chart_context
 from trader.config import Config
 from trader.pricing.birdeye import BirdeyePriceClient
 from trader.trading.models import TokenSignal
@@ -88,9 +89,28 @@ class MultiStrategyEngine:
             "[ENTRY] %s @ $%.8f — distributing to %d strategy(s)",
             signal.symbol, entry_price, len(self._runners),
         )
+
+        # Fetch chart context once if any runner uses the chart filter.
+        # Non-chart runners receive it too but will ignore it.
+        chart_ctx = None
+        if any(r.cfg.use_chart_filter for r in self._runners):
+            candles = await self._birdeye.get_ohlcv(signal.mint_address, bars=OHLCV_BARS)
+            chart_ctx = compute_chart_context(candles, entry_price)
+            if chart_ctx:
+                logger.info(
+                    "[CHART] %s | pump=%.1fx | vol=%s | enter=%s | %s",
+                    signal.symbol, chart_ctx.pump_ratio, chart_ctx.vol_trend,
+                    chart_ctx.should_enter, chart_ctx.reason,
+                )
+            else:
+                logger.info(
+                    "[CHART] %s | insufficient candle data — chart filter bypassed",
+                    signal.symbol,
+                )
+
         for runner in self._runners:
             try:
-                runner.enter_position(signal, entry_price)
+                runner.enter_position(signal, entry_price, chart_ctx)
             except Exception:
                 logger.exception(
                     "[ERROR] %s: enter_position failed for %s", runner.name, signal.symbol
