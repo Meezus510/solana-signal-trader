@@ -52,7 +52,7 @@ SEP = "-" * 72
 # Strategy whose closed positions we read from
 SOURCE_STRATEGY = "quick_pop"
 # Strategy we save snapshots under (what the ML scorer queries)
-TARGET_STRATEGY = "quick_pop_chart"
+TARGET_STRATEGY = "quick_pop_chart_ml"
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +71,8 @@ def load_closed_positions(db_path: str) -> list[dict]:
            AND opened_at IS NOT NULL
            AND closed_at IS NOT NULL
            AND realized_pnl_usd IS NOT NULL
+           AND opened_at LIKE '20%'
+           AND closed_at LIKE '20%'
          ORDER BY opened_at ASC
         """,
         (SOURCE_STRATEGY,),
