@@ -1,12 +1,14 @@
 # Solana Signal Trader
 
-Algorithmic trading bot for Solana tokens. Ingests token signals from a Telegram channel, fetches real-time prices from Birdeye, and executes a take-profit / trailing-stop strategy via Jupiter.
+Algorithmic paper trading bot for Solana tokens. Ingests token call signals from a Telegram channel, fetches real-time prices via Birdeye, and runs **six parallel strategies** with independent cash, positions, and PnL tracking.
 
-Currently running in **paper mode** for strategy validation — live on-chain execution is wired and ready to activate by swapping `PaperExchange` for `JupiterSwapExecutor`.
+Three strategies run a **chart filter** (OHLCV-based pump/volume check) and three enter every signal unconditionally — enabling direct A/B comparison of filter performance.
+
+Currently running in **paper mode** for strategy validation. On-chain execution via Jupiter is wired and ready to activate.
 
 ---
 
-## Architecture
+## Signal Flow
 
 ```
 Telegram Channel
@@ -15,44 +17,40 @@ Telegram Channel
 TelegramListener              trader/listener/client.py
   parse_message()             trader/listener/parser.py
       │
-      │  asyncio.Queue[TokenSignal]      ← decouples I/O from execution
+      │  asyncio.Queue[TokenSignal]
       ▼
-TradingEngine                 trader/trading/engine.py
+MultiStrategyEngine           trader/trading/engine.py
   handle_new_signal()
       │
-      ├─→ BirdeyePriceClient            trader/pricing/birdeye.py
-      │     get_price()        ← entry price (single token)
-      │     get_prices_batch() ← monitoring (all open positions)
+      ├─→ BirdeyePriceClient           trader/pricing/birdeye.py
+      │     get_price()        ← entry price (fetched once, shared)
+      │     get_ohlcv()        ← 20 × 1-min candles (fetched once if any chart strategy active)
+      │     get_prices_batch() ← monitoring loop (unique mints only)
       │
-      ├─→ PaperExchange / JupiterSwapExecutor    trader/trading/exchange.py
-      │     buy() / sell_partial() / sell_all()
+      ├─→ [Group A] StrategyRunner × 3   ← enter every signal
       │
-      └─→ PortfolioManager              trader/trading/portfolio.py
-            in-memory position registry
-
-Live execution (webhook server):
-POST /webhook ──→ solana_api/my_bot_script.py
-                    perform_swap()        ← Jupiter market swap (entry)
-                    create_limit_order()  ← Jupiter limit orders (TP exits)
+      └─→ [Group B] StrategyRunner × 3   ← chart-filtered; may schedule reanalysis
 ```
 
 ---
 
-## Strategy
+## Strategies
 
-| Event | Rule | Action |
-|-------|------|--------|
-| Entry | Signal received, price available, cash sufficient | Buy $10 at live price |
-| Stop loss | Price ≤ entry × 0.65 | Sell 100% → CLOSE |
-| Take profit | Price ≥ entry × 2.5 | Sell 50% → activate trailing stop |
-| Trailing — new high | Price > highest seen | Update trailing stop level |
-| Trailing stop | Price ≤ highest × 0.65 | Sell remaining 100% → CLOSE |
+Six strategies run in parallel, each with its own cash, positions, and PnL:
 
-PnL is tracked per sell event and accumulated across partial and full closes:
+| Name | Buy | TP Ladder | Trail | Timeout | Chart Filter | Reanalyze |
+|------|-----|-----------|-------|---------|:------------:|:---------:|
+| `quick_pop` | $30 | 1.5× (60%) → 2.0× (40%) | 22% | 45 min | — | — |
+| `trend_rider` | cfg | 1.8× (50%) | 30% | 90 min | — | — |
+| `infinite_moonbag` | $15 | 1.8/2.5/4.0/6.0× | 30% | — | — | — |
+| `quick_pop_chart` | $30 | 1.5× (60%) → 2.0× (40%) | 22% | 45 min | ✓ | — |
+| `trend_rider_chart` | cfg | 1.8× (50%) | 30% | 90 min | ✓ | ✓ |
+| `infinite_moonbag_chart` | $15 | 1.8/2.5/4.0/6.0× | 30% | — | ✓ | — |
 
-```
-pnl_per_sell = (exit_price − entry_price) × quantity_sold
-```
+**Chart filter logic** (20 × 1-min OHLCV candles):
+- `pump_ratio = current_price / lowest_low` — skip if ≥ 3.5×
+- `vol_trend` — skip if volume is DYING (recent 5 bars avg < 60% of prior bars avg)
+- **Reanalysis**: if skipped but chart looks recoverable, re-checks after a calculated delay (pump → 8 min, vol → 4 min, both → 10 min). Only `trend_rider_chart` has this enabled.
 
 ---
 
@@ -60,37 +58,51 @@ pnl_per_sell = (exit_price − entry_price) × quantity_sold
 
 ```
 .
-├── run.py                      # entry point (live / demo mode)
-├── pyproject.toml              # packaging & dev dependencies
-├── Makefile                    # common dev tasks
-├── .env.example                # environment variable template
+├── run.py                          # entry point (live / demo mode)
+├── pyproject.toml                  # packaging & dependencies
+├── Makefile                        # common dev tasks
 │
-├── trader/                     # core trading package
-│   ├── config.py               # centralised, immutable Config dataclass
+├── trader/                         # core trading package
+│   ├── config.py                   # Config dataclass — loaded from .env
+│   │
+│   ├── analysis/
+│   │   └── chart.py                # OHLCV chart filter — compute_chart_context()
 │   │
 │   ├── listener/
-│   │   ├── client.py           # TelegramListener — channel → asyncio.Queue
-│   │   └── parser.py           # parse_message(), is_update_message(), etc.
+│   │   ├── client.py               # TelegramListener → asyncio.Queue
+│   │   └── parser.py               # parse_message() — mint + symbol extraction
+│   │
+│   ├── persistence/
+│   │   └── database.py             # SQLite — open positions, portfolio, signal log
 │   │
 │   ├── pricing/
-│   │   └── birdeye.py          # BirdeyePriceClient — single + batch REST
+│   │   └── birdeye.py              # BirdeyePriceClient — price + OHLCV
+│   │
+│   ├── strategies/
+│   │   └── registry.py             # build_runners() — single source of truth for all strategies
 │   │
 │   ├── trading/
-│   │   ├── models.py           # TokenSignal, Position, PortfolioState
-│   │   ├── portfolio.py        # PortfolioManager
-│   │   ├── exchange.py         # PaperExchange  ← swap for JupiterSwapExecutor here
-│   │   └── engine.py           # TradingEngine — strategy orchestration
+│   │   ├── models.py               # TokenSignal, Position, PortfolioState
+│   │   ├── strategy.py             # StrategyRunner, InfiniteMoonbagRunner, StrategyConfig
+│   │   └── engine.py               # MultiStrategyEngine — orchestrates all runners
 │   │
 │   └── utils/
-│       └── logging.py          # structured logging setup
+│       └── logging.py              # structured logging setup
 │
-├── solana_api/                 # on-chain execution package
-│   ├── RestClientHelper.py     # Jupiter / Solana RPC sync REST client
-│   └── my_bot_script.py        # Quart webhook server — market swaps + limit orders
+├── services/                       # on-chain execution (live trading)
+│   ├── rest_client.py              # Jupiter / Solana RPC REST client
+│   └── webhook_server.py           # Quart webhook — market swaps + limit orders
+│
+├── scripts/                        # offline tools
+│   ├── summary.py                  # print PnL snapshot from trader.db
+│   ├── backtest_chart.py           # replay chart filter against trades.log
+│   ├── analyze_channel.py          # inspect Telegram channel metadata
+│   └── generate_session_string.py  # create Telethon session string
 │
 └── tests/
-    ├── test_parser.py          # parser unit tests (pure, no network)
-    └── test_strategy.py        # strategy math, exchange, portfolio tests
+    ├── test_parser.py              # parser unit tests (pure, no network)
+    ├── test_strategy.py            # strategy math, exchange, portfolio
+    └── test_chart.py               # chart filter + reanalysis (25 tests)
 ```
 
 ---
@@ -100,10 +112,10 @@ pnl_per_sell = (exit_price − entry_price) × quantity_sold
 ### 1. Prerequisites
 
 - Python 3.11+
-- A Telegram account with API credentials from [my.telegram.org/apps](https://my.telegram.org/apps)
-- A [Birdeye API key](https://birdeye.so/)
-- A [Jupiter API key](https://jup.ag/) *(live execution only)*
-- A funded Solana wallet *(live execution only)*
+- Telegram account with API credentials from [my.telegram.org/apps](https://my.telegram.org/apps)
+- [Birdeye API key](https://birdeye.so/)
+- [Jupiter API key](https://jup.ag/) *(live execution only)*
+- Funded Solana wallet *(live execution only)*
 
 ### 2. Install
 
@@ -112,7 +124,7 @@ git clone <repo>
 cd <repo>
 
 python -m venv venv
-source venv/bin/activate          # Windows: venv\Scripts\activate
+source venv/bin/activate       # Windows: venv\Scripts\activate
 
 pip install -e ".[dev]"
 ```
@@ -143,45 +155,79 @@ SOLANA_RPC_URL=https://api.mainnet-beta.solana.com
 
 ### 4. First-time Telegram authentication
 
-On first run, Telethon will prompt for your phone number and OTP and save a session file:
+On first run, Telethon prompts for your phone number and OTP and saves a session file:
 
 ```bash
 python run.py
 # Enter phone number and OTP when prompted
-# trader/listener/tg_session.session is saved for future runs
+# Session saved to trader/listener/tg_session.session
+```
+
+Or generate a session string directly:
+
+```bash
+python scripts/generate_session_string.py
 ```
 
 ### 5. Run
 
 ```bash
-# Live mode — listens to Telegram and executes strategy
+# Live mode — Telegram listener + all 6 strategies
 python run.py
+make run
 
-# Demo mode — injects sample tokens, no Telegram required
+# Demo mode — inject sample tokens, no Telegram required
 python run.py --demo
-
-# On-chain execution webhook (separate process, live trading)
-python solana_api/my_bot_script.py
+make demo
 
 # Tests
 pytest tests/ -v
+make test
+
+# Print PnL summary from DB (safe while bot is running)
+python scripts/summary.py
+make summary
+
+# Backtest chart filter against trades.log
+python scripts/backtest_chart.py
+make backtest
 ```
+
+---
+
+## Adding or Tuning Strategies
+
+Edit `trader/strategies/registry.py`. Each `StrategyConfig` is fully isolated:
+
+```python
+my_cfg = StrategyConfig(
+    name="my_strategy",
+    buy_size_usd=25.0,
+    stop_loss_pct=0.25,
+    take_profit_levels=(
+        TakeProfitLevel(multiple=2.0, sell_fraction_original=0.50),
+    ),
+    trailing_stop_pct=0.25,
+    starting_cash_usd=cfg.starting_cash_usd,
+    use_chart_filter=True,   # enable OHLCV filter
+    use_reanalyze=True,      # re-check skipped signals after delay
+)
+# Append to the list returned by build_runners()
+```
+
+All strategies share a single Birdeye price feed. OHLCV is fetched at most once per signal regardless of how many chart strategies are active.
 
 ---
 
 ## Going Live
 
-The system is designed to transition from paper to live trading with a single swap in `run.py`:
+Swap `PaperExchange` for `JupiterSwapExecutor` in `trader/trading/strategy.py` and start the webhook server:
 
-```python
-# Current — paper mode
-exchange = PaperExchange(portfolio=portfolio, cfg=cfg)
-
-# Live — replace with:
-exchange = JupiterSwapExecutor(cfg=cfg)
+```bash
+python services/webhook_server.py
 ```
 
-The `solana_api/my_bot_script.py` webhook server handles on-chain execution independently and can receive signals from any source via POST `/webhook`.
+The webhook server handles on-chain execution independently and accepts signals via `POST /webhook`.
 
 ---
 
@@ -189,11 +235,9 @@ The `solana_api/my_bot_script.py` webhook server handles on-chain execution inde
 
 | Goal | Where to change |
 |------|----------------|
-| Enable live on-chain execution | Replace `PaperExchange` with `JupiterSwapExecutor` in `run.py` |
+| Add / tune a strategy | `trader/strategies/registry.py` |
+| Tune chart filter thresholds | `trader/analysis/chart.py` — `PUMP_RATIO_MAX`, `VOL_WINDOW`, `VOL_DYING_THRESHOLD` |
+| Add a new signal source | New listener class alongside `TelegramListener` |
 | WebSocket price feed | Add `subscribe()` to `BirdeyePriceClient`; remove polling loop in `engine.py` |
-| Tune TP / SL levels | Edit constants in `trader/config.py` |
-| Additional TP ladders | Extend `evaluate_position()` in `engine.py` |
-| Custom limit order exits | Edit `create_limit_order` calls in `handle_buy()` in `my_bot_script.py` |
-| Fee / slippage modelling | Add to `PaperExchange.sell_*`; use `total_fees_usd` field |
-| Persistent trade log | Add a `TradeRepository` and inject into `TradingEngine` |
-| Multiple signal sources | Add new listener classes alongside `TelegramListener` |
+| Enable live on-chain execution | Replace `PaperExchange` with `JupiterSwapExecutor` in `trader/trading/strategy.py` |
+| Fee / slippage modelling | Add to `PaperExchange.sell_*`; use `total_fees_usd` field on `PortfolioState` |
