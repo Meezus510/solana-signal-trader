@@ -20,8 +20,13 @@ import logging
 from typing import Optional
 
 from trader.analysis.chart import OHLCV_BARS, compute_chart_context
+from trader.analysis.ml_scorer import (
+    ChartMLScorer, ML_OHLCV_BARS, ML_OHLCV_INTERVAL,
+    MORALIS_OHLCV_BARS, MORALIS_OHLCV_INTERVAL,
+)
 from trader.config import Config
 from trader.pricing.birdeye import BirdeyePriceClient
+from trader.pricing.moralis import MoralisOHLCVClient
 from trader.trading.models import TokenSignal
 from trader.trading.strategy import StrategyRunner
 
@@ -51,13 +56,19 @@ class MultiStrategyEngine:
         runners: list[StrategyRunner],
         birdeye_client: BirdeyePriceClient,
         db=None,
+        moralis_client: MoralisOHLCVClient | None = None,
     ) -> None:
         self._cfg = cfg
         self._runners = runners
         self._birdeye = birdeye_client
+        self._moralis = moralis_client
         self._db = db
         # Mints currently awaiting reanalysis — prevents duplicate scheduling
         self._pending_reanalysis: set[str] = set()
+        # ML scorer — only instantiated when at least one runner saves chart data
+        self._ml_scorer: ChartMLScorer | None = (
+            ChartMLScorer(db) if db and any(r.cfg.save_chart_data for r in runners) else None
+        )
 
     # ------------------------------------------------------------------
     # Signal handling
@@ -92,10 +103,12 @@ class MultiStrategyEngine:
             signal.symbol, entry_price, len(self._runners),
         )
 
-        # Fetch chart context once if any runner uses the chart filter.
-        # Non-chart runners receive it too but will ignore it.
+        # Fetch 1m Birdeye candles if any runner uses the chart filter OR saves
+        # chart data (stored as candles_1m_json for future strategy use).
+        candles = []
         chart_ctx = None
-        if any(r.cfg.use_chart_filter for r in self._runners):
+        needs_1m = any(r.cfg.use_chart_filter or r.cfg.save_chart_data for r in self._runners)
+        if needs_1m:
             candles = await self._birdeye.get_ohlcv(signal.mint_address, bars=OHLCV_BARS)
             chart_ctx = compute_chart_context(candles, entry_price)
             if chart_ctx:
@@ -110,13 +123,121 @@ class MultiStrategyEngine:
                     signal.symbol,
                 )
 
-        for runner in self._runners:
+        # ------------------------------------------------------------------
+        # ML candles — try Moralis (high-res) first, fall back to Birdeye.
+        # Any Moralis failure is caught silently; Birdeye is always the safety net.
+        # The interval/bars are controlled by MORALIS_OHLCV_INTERVAL /
+        # MORALIS_OHLCV_BARS in ml_scorer.py — change those constants to switch
+        # to any supported resolution (10s, 30s, 1min, etc.).
+        # ------------------------------------------------------------------
+        ml_candles = []
+        ml_source  = "none"
+        if self._ml_scorer:
+            if self._moralis:
+                try:
+                    ml_candles = await self._moralis.get_ohlcv(
+                        signal.mint_address,
+                        bars=MORALIS_OHLCV_BARS,
+                        interval=MORALIS_OHLCV_INTERVAL,
+                    )
+                    if ml_candles:
+                        ml_source = f"moralis/{MORALIS_OHLCV_INTERVAL}"
+                except Exception:
+                    logger.debug("[ML] Moralis OHLCV failed for %s — falling back", signal.symbol)
+
+            if not ml_candles:
+                try:
+                    ml_candles = await self._birdeye.get_ohlcv(
+                        signal.mint_address,
+                        bars=ML_OHLCV_BARS,
+                        interval=ML_OHLCV_INTERVAL,
+                    )
+                    if ml_candles:
+                        ml_source = f"birdeye/{ML_OHLCV_INTERVAL}"
+                except Exception:
+                    logger.debug("[ML] Birdeye OHLCV failed for %s", signal.symbol)
+
+        # Moralis pair stats — completely optional, never blocks scoring.
+        pair_stats = None
+        if self._moralis:
             try:
-                runner.enter_position(signal, entry_price, chart_ctx)
+                pair_stats = await self._moralis.get_pair_stats(signal.mint_address)
             except Exception:
-                logger.exception(
-                    "[ERROR] %s: enter_position failed for %s", runner.name, signal.symbol
+                logger.debug("[ML] Moralis pair stats failed for %s — skipping", signal.symbol)
+
+        # ML confidence score
+        ml_score: float | None = None
+        if self._ml_scorer and ml_candles:
+            ml_score = self._ml_scorer.score(ml_candles, chart_ctx=chart_ctx, pair_stats=pair_stats)
+            if ml_score is not None:
+                logger.info(
+                    "[ML] %s | confidence=%.1f/10 | src=%s | pair_stats=%s",
+                    signal.symbol, ml_score, ml_source, "yes" if pair_stats else "no",
                 )
+
+        for runner in self._runners:
+            # ML filter — skip if score is below threshold.
+            # If score is None (not enough training data yet), always allow through.
+            ml_blocked = (
+                runner.cfg.use_ml_filter
+                and ml_score is not None
+                and ml_score < runner.cfg.ml_min_score
+            )
+            if ml_blocked:
+                logger.info(
+                    "[ML_SKIP] [%-12s] %s | score=%.1f < threshold=%.1f",
+                    runner.name, signal.symbol, ml_score, runner.cfg.ml_min_score,
+                )
+                signal_log.info(
+                    "ML_SKIP    | %-10s | %-44s | score=%.1f",
+                    signal.symbol, signal.mint_address, ml_score,
+                )
+
+            # Scale up buy size on high-confidence signals (max tier checked first).
+            buy_size_override = None
+            if runner.cfg.use_ml_filter and ml_score is not None:
+                if ml_score >= runner.cfg.ml_max_score_threshold:
+                    buy_size_override = runner.cfg.buy_size_usd * runner.cfg.ml_max_size_multiplier
+                    logger.info(
+                        "[ML_SIZE] [%-12s] %s | score=%.1f >= %.1f — max size $%.2f → $%.2f (%.1fx)",
+                        runner.name, signal.symbol, ml_score, runner.cfg.ml_max_score_threshold,
+                        runner.cfg.buy_size_usd, buy_size_override, runner.cfg.ml_max_size_multiplier,
+                    )
+                elif ml_score >= runner.cfg.ml_high_score_threshold:
+                    buy_size_override = runner.cfg.buy_size_usd * runner.cfg.ml_size_multiplier
+                    logger.info(
+                        "[ML_SIZE] [%-12s] %s | score=%.1f >= %.1f — sizing up $%.2f → $%.2f (%.1fx)",
+                        runner.name, signal.symbol, ml_score, runner.cfg.ml_high_score_threshold,
+                        runner.cfg.buy_size_usd, buy_size_override, runner.cfg.ml_size_multiplier,
+                    )
+
+            position = None
+            if not ml_blocked:
+                try:
+                    position = runner.enter_position(signal, entry_price, chart_ctx, buy_size_override)
+                except Exception:
+                    logger.exception(
+                        "[ERROR] %s: enter_position failed for %s", runner.name, signal.symbol
+                    )
+                    continue
+
+            # Save snapshot for ML-filter runners even when blocked — these become
+            # labeled training examples (entered=False) once their outcome is known.
+            if runner.cfg.save_chart_data and ml_candles and self._db:
+                snapshot_id = self._db.save_chart_snapshot(
+                    strategy=runner.name,
+                    symbol=signal.symbol,
+                    mint=signal.mint_address,
+                    entry_price=entry_price,
+                    candles=ml_candles,
+                    chart_ctx=chart_ctx,
+                    entered=position is not None,
+                    ml_score=ml_score,
+                    pair_stats=pair_stats,
+                    candles_1m=candles if candles else None,
+                )
+                if position is not None:
+                    runner.set_chart_snapshot_id(signal.mint_address, snapshot_id)
 
         # Schedule reanalysis if chart filter skipped this signal, at least one
         # runner has reanalysis enabled, and this mint isn't already pending.

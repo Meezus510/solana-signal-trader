@@ -16,6 +16,7 @@ seen_msg_ids  — set of processed Telegram message IDs (prevents re-entry on re
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from datetime import datetime, timezone
@@ -97,6 +98,29 @@ CREATE TABLE IF NOT EXISTS seen_msg_ids (
 )
 """
 
+_CREATE_CHART_SNAPSHOTS = """
+CREATE TABLE IF NOT EXISTS chart_snapshots (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                   TEXT NOT NULL,       -- UTC ISO timestamp of signal
+    strategy             TEXT NOT NULL,       -- e.g. "quick_pop_chart"
+    symbol               TEXT NOT NULL,
+    mint                 TEXT NOT NULL,
+    entry_price          REAL NOT NULL,
+    pump_ratio           REAL,                -- current_price / recent_low
+    vol_trend            TEXT,                -- "RISING" | "FLAT" | "DYING"
+    candle_count         INTEGER,
+    candles_json         TEXT NOT NULL,       -- JSON array of OHLCV dicts
+    entered              INTEGER NOT NULL DEFAULT 0,  -- 1 if position was opened
+    ml_score             REAL,               -- KNN confidence score 0-10 at signal time
+    -- outcome fields — filled in when the position closes
+    outcome_pnl_pct      REAL,               -- realized_pnl / usd_size * 100
+    outcome_sell_reason  TEXT,               -- STOP_LOSS | TP1 | TRAILING_STOP | …
+    outcome_hold_secs    REAL,               -- seconds from entry to close
+    outcome_max_gain_pct REAL,               -- (highest_price / entry_price - 1) * 100
+    closed               INTEGER NOT NULL DEFAULT 0   -- 1 once outcome is written
+)
+"""
+
 
 class TradeDatabase:
     """
@@ -125,6 +149,7 @@ class TradeDatabase:
         c.execute(_CREATE_SIGNALS)
         c.execute(_CREATE_PORTFOLIO)
         c.execute(_CREATE_SEEN)
+        c.execute(_CREATE_CHART_SNAPSHOTS)
         self._migrate(c)
         c.commit()
 
@@ -137,6 +162,18 @@ class TradeDatabase:
             try:
                 c.execute(f"ALTER TABLE positions ADD COLUMN {col} {definition}")
                 logger.info("[DB] Migrated: added column %s to positions", col)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+        # chart_snapshots columns added after initial release
+        for col, definition in [
+            ("ml_score",        "REAL"),
+            ("pair_stats_json", "TEXT"),
+            ("candles_1m_json", "TEXT"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE chart_snapshots ADD COLUMN {col} {definition}")
+                logger.info("[DB] Migrated: added column %s to chart_snapshots", col)
             except sqlite3.OperationalError:
                 pass  # column already exists
 
@@ -326,6 +363,115 @@ class TradeDatabase:
     def add_seen_msg_id(self, msg_id: int) -> None:
         self._conn.execute(
             "INSERT OR IGNORE INTO seen_msg_ids (msg_id) VALUES (?)", (msg_id,)
+        )
+        self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # Chart snapshots (ML training data)
+    # ------------------------------------------------------------------
+
+    def save_chart_snapshot(
+        self,
+        strategy: str,
+        symbol: str,
+        mint: str,
+        entry_price: float,
+        candles: list,
+        chart_ctx,                    # ChartContext | None
+        entered: bool,
+        ml_score: Optional[float] = None,
+        pair_stats: Optional[dict] = None,
+        candles_1m: Optional[list] = None,
+    ) -> int:
+        """
+        Persist OHLCV candles + signal metadata at entry time.
+
+        candles      — high-res candles used for ML (e.g. 10s × 100 bars)
+        candles_1m   — standard 1m Birdeye candles, saved for future strategy use
+
+        Returns the new row id so the runner can later fill in outcome fields.
+        """
+        def _serialise(bars: list) -> str:
+            return json.dumps([
+                {"t": c.unix_time, "o": c.open, "h": c.high,
+                 "l": c.low, "c": c.close, "v": c.volume}
+                for c in bars
+            ])
+
+        candles_json    = _serialise(candles)
+        candles_1m_json = _serialise(candles_1m) if candles_1m else None
+
+        cursor = self._conn.execute(
+            """
+            INSERT INTO chart_snapshots
+                (ts, strategy, symbol, mint, entry_price,
+                 pump_ratio, vol_trend, candle_count, candles_json,
+                 entered, ml_score, pair_stats_json, candles_1m_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                strategy,
+                symbol,
+                mint,
+                entry_price,
+                chart_ctx.pump_ratio if chart_ctx else None,
+                chart_ctx.vol_trend if chart_ctx else None,
+                chart_ctx.candle_count if chart_ctx else len(candles),
+                candles_json,
+                int(entered),
+                ml_score,
+                json.dumps(pair_stats) if pair_stats else None,
+                candles_1m_json,
+            ),
+        )
+        self._conn.commit()
+        return cursor.lastrowid
+
+    def load_chart_snapshots(self, strategy: str) -> list[dict]:
+        """
+        Return all closed snapshots for a strategy as a list of dicts.
+        Used by ChartMLScorer to build the training set.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT ts, candles_json, outcome_pnl_pct, pump_ratio, vol_trend,
+                   pair_stats_json
+              FROM chart_snapshots
+             WHERE strategy = ? AND closed = 1 AND outcome_pnl_pct IS NOT NULL
+             ORDER BY ts ASC
+            """,
+            (strategy,),
+        ).fetchall()
+        return [
+            {
+                "ts":              r[0],
+                "candles_json":    r[1],
+                "outcome_pnl_pct": r[2],
+                "pump_ratio":      r[3],
+                "vol_trend":       r[4],
+                "pair_stats_json": r[5],   # None for snapshots before this feature
+            }
+            for r in rows
+        ]
+
+    def update_chart_snapshot_outcome(
+        self,
+        snapshot_id: int,
+        pnl_pct: float,
+        sell_reason: str,
+        hold_secs: float,
+        max_gain_pct: float,
+    ) -> None:
+        """Fill in outcome fields once the position closes."""
+        self._conn.execute(
+            """
+            UPDATE chart_snapshots
+               SET outcome_pnl_pct=?, outcome_sell_reason=?,
+                   outcome_hold_secs=?, outcome_max_gain_pct=?, closed=1
+             WHERE id=?
+            """,
+            (pnl_pct, sell_reason, hold_secs, max_gain_pct, snapshot_id),
         )
         self._conn.commit()
 

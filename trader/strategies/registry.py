@@ -18,7 +18,7 @@ Group A — no chart filter (enters every signal unconditionally):
     quick_pop, trend_rider, infinite_moonbag
 
 Group B — chart filter enabled (skips late pumps and dying volume):
-    quick_pop_chart, trend_rider_chart (+ reanalyze), infinite_moonbag_chart
+    quick_pop_chart_ml (+ ML filter), trend_rider_chart_reanalyze (+ reanalyze), infinite_moonbag_chart
 """
 
 from __future__ import annotations
@@ -36,16 +36,18 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
     """
     Instantiate and return all active strategy runners.
 
-    quick_pop / quick_pop_chart
+    quick_pop / quick_pop_chart_ml
         Fast scalp: TP1 at 1.5× (sell 60%) → TP2 at 2.0× (sell 40%) — fully exits.
         Trail at 22% below high after TP1.
         Exit after 45 min if TP1 not yet hit (price still < 1.49×).
+        quick_pop_chart_ml also applies chart filter + ML confidence gating (score < 5
+        skips, score ≥ 8 doubles size, score ≥ 9.5 triples size).
 
-    trend_rider / trend_rider_chart
+    trend_rider / trend_rider_chart_reanalyze
         Momentum hold: TP1 at 1.8× (sell 50% of original).
         Trail at 30% below high after TP1.
         Exit after 90 min if price < entry × 1.15. Max hold: 4 hours.
-        trend_rider_chart also re-checks skipped signals after a delay.
+        trend_rider_chart_reanalyze also re-checks skipped signals after a delay.
 
     infinite_moonbag / infinite_moonbag_chart (v2)
         Grace period 90s: −30% floor. After grace: −22% floor.
@@ -103,7 +105,7 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
     # ------------------------------------------------------------------
 
     quick_pop_chart_cfg = StrategyConfig(
-        name="quick_pop_chart",
+        name="quick_pop_chart_ml",
         buy_size_usd=30.0,
         stop_loss_pct=0.20,
         take_profit_levels=(
@@ -115,10 +117,12 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         timeout_minutes=45.0,
         timeout_min_gain_pct=0.49,
         use_chart_filter=True,
+        save_chart_data=True,
+        use_ml_filter=True,
     )
 
     trend_rider_chart_cfg = StrategyConfig(
-        name="trend_rider_chart",
+        name="trend_rider_chart_reanalyze",
         buy_size_usd=cfg.buy_size_usd,
         stop_loss_pct=0.30,
         take_profit_levels=(

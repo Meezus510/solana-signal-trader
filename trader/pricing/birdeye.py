@@ -238,6 +238,16 @@ class BirdeyePriceClient:
 
         return {m: None for m in mint_addresses}
 
+    # Seconds per bar for each supported interval type.
+    # Birdeye's OHLCV endpoint minimum granularity is 1m — sub-minute
+    # intervals (1s, 5s, 15s, 30s) return 400 "type invalid format".
+    _INTERVAL_SECONDS: dict[str, int] = {
+        "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+        "1h": 3600, "2h": 7200, "4h": 14400,
+        "6h": 21600, "8h": 28800, "12h": 43200,
+        "1d": 86400,
+    }
+
     async def get_ohlcv(
         self,
         mint_address: str,
@@ -246,7 +256,7 @@ class BirdeyePriceClient:
         time_to: Optional[int] = None,
     ) -> list[OHLCVCandle]:
         """
-        Fetch the last `bars` OHLCV candles for a token at 1-minute resolution.
+        Fetch the last `bars` OHLCV candles for a token at the given interval.
 
         Returns an empty list on any error so callers can safely fall back to
         entering without chart data rather than blocking the signal.
@@ -255,12 +265,13 @@ class BirdeyePriceClient:
                    Pass a historical timestamp to fetch candles as they looked
                    at a specific point in time (used for backtesting).
 
-        Endpoint: GET /defi/ohlcv?address=<mint>&type=1m&time_from=<ts>&time_to=<ts>
+        Endpoint: GET /defi/ohlcv?address=<mint>&type=<interval>&time_from=<ts>&time_to=<ts>
         """
         if time_to is None:
             time_to = int(time.time())
+        secs = self._INTERVAL_SECONDS.get(interval, 60)
         # fetch a slightly wider window to guarantee we have `bars` full candles
-        time_from = time_to - (bars + 5) * 60
+        time_from = time_to - (bars + 5) * secs
         url = f"{self._cfg.birdeye_base_url}/defi/ohlcv"
         params = {
             "address": mint_address,
