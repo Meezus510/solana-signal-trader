@@ -80,6 +80,14 @@ class StrategyConfig:
     timeout_min_gain_pct: Optional[float] = None
     max_hold_minutes: Optional[float] = None
 
+    # Chart-based entry filter (optional — set True for chart-enabled strategies)
+    use_chart_filter: bool = False
+
+    # Reanalysis after a chart SKIP (only meaningful when use_chart_filter=True).
+    # When True, a skipped signal is re-checked after a calculated delay and
+    # entered if the chart has improved.  When False, a SKIP is final.
+    use_reanalyze: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Base runner
@@ -156,11 +164,36 @@ class StrategyRunner:
     # Entry
     # ------------------------------------------------------------------
 
-    def enter_position(self, signal: TokenSignal, entry_price: float) -> Optional[Position]:
+    def enter_position(self, signal: TokenSignal, entry_price: float, chart_ctx=None) -> Optional[Position]:
         """
         Open a paper position at the pre-fetched price.
-        Returns None if skipped (duplicate mint or insufficient cash).
+        Returns None if skipped (duplicate mint, insufficient cash, or chart filter).
+
+        chart_ctx — ChartContext from trader.analysis.chart, or None.
+            Ignored when use_chart_filter=False (non-chart strategies always enter).
+            When use_chart_filter=True and chart_ctx.should_enter is False, the
+            signal is skipped and logged as CHART_SKIP.
+            When use_chart_filter=True but chart_ctx is None (OHLCV fetch failed),
+            the position is entered anyway — no data means no filter.
         """
+        # Chart filter (only for chart-enabled strategies)
+        if self._cfg.use_chart_filter and chart_ctx is not None and not chart_ctx.should_enter:
+            logger.info(
+                "[%s] [CHART_SKIP] %s — %s",
+                self.name, signal.symbol, chart_ctx.reason,
+            )
+            signal_log.info(
+                "CHART_SKIP | %-10s | %-44s | ch=%-20s | %s | strategy=%s",
+                signal.symbol, signal.mint_address, signal.source_channel,
+                chart_ctx.reason, self.name,
+            )
+            if self._db:
+                self._db.log_signal(
+                    "CHART_SKIP", symbol=signal.symbol,
+                    mint=signal.mint_address, strategy=self.name,
+                )
+            return None
+
         if self._portfolio.has_open_position(signal.mint_address):
             logger.info(
                 "[%s] [SKIP] Already holding %s — duplicate signal ignored",
