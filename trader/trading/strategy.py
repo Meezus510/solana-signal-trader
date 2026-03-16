@@ -101,6 +101,17 @@ class StrategyConfig:
     use_ml_filter: bool = False
     ml_min_score: float = 5.0
 
+    # High-confidence size multiplier — when score >= ml_high_score_threshold,
+    # buy size is scaled by ml_size_multiplier (e.g. 2× the normal position).
+    # Only applied when use_ml_filter=True.
+    ml_high_score_threshold: float = 8.0
+    ml_size_multiplier: float = 2.0
+
+    # Maximum-confidence size multiplier — when score >= ml_max_score_threshold,
+    # buy size is scaled by ml_max_size_multiplier instead (e.g. 3× the normal).
+    ml_max_score_threshold: float = 9.5
+    ml_max_size_multiplier: float = 3.0
+
 
 # ---------------------------------------------------------------------------
 # Base runner
@@ -183,7 +194,13 @@ class StrategyRunner:
     # Entry
     # ------------------------------------------------------------------
 
-    def enter_position(self, signal: TokenSignal, entry_price: float, chart_ctx=None) -> Optional[Position]:
+    def enter_position(
+        self,
+        signal: TokenSignal,
+        entry_price: float,
+        chart_ctx=None,
+        buy_size_override: Optional[float] = None,
+    ) -> Optional[Position]:
         """
         Open a paper position at the pre-fetched price.
         Returns None if skipped (duplicate mint, insufficient cash, or chart filter).
@@ -194,6 +211,9 @@ class StrategyRunner:
             signal is skipped and logged as CHART_SKIP.
             When use_chart_filter=True but chart_ctx is None (OHLCV fetch failed),
             the position is entered anyway — no data means no filter.
+
+        buy_size_override — if provided, overrides cfg.buy_size_usd for this entry
+            (used by the engine to scale up on high ML confidence scores).
         """
         # Chart filter (only for chart-enabled strategies)
         if self._cfg.use_chart_filter and chart_ctx is not None and not chart_ctx.should_enter:
@@ -229,7 +249,8 @@ class StrategyRunner:
                 )
             return None
 
-        position = self._exchange.buy(signal, entry_price, self._cfg.buy_size_usd)
+        buy_size = buy_size_override if buy_size_override is not None else self._cfg.buy_size_usd
+        position = self._exchange.buy(signal, entry_price, buy_size)
         if position is None:
             signal_log.info(
                 "NO_CASH    | %-10s | %-44s | ch=%-20s | strategy=%s",

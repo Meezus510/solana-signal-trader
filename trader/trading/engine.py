@@ -193,10 +193,28 @@ class MultiStrategyEngine:
                     signal.symbol, signal.mint_address, ml_score,
                 )
 
+            # Scale up buy size on high-confidence signals (max tier checked first).
+            buy_size_override = None
+            if runner.cfg.use_ml_filter and ml_score is not None:
+                if ml_score >= runner.cfg.ml_max_score_threshold:
+                    buy_size_override = runner.cfg.buy_size_usd * runner.cfg.ml_max_size_multiplier
+                    logger.info(
+                        "[ML_SIZE] [%-12s] %s | score=%.1f >= %.1f — max size $%.2f → $%.2f (%.1fx)",
+                        runner.name, signal.symbol, ml_score, runner.cfg.ml_max_score_threshold,
+                        runner.cfg.buy_size_usd, buy_size_override, runner.cfg.ml_max_size_multiplier,
+                    )
+                elif ml_score >= runner.cfg.ml_high_score_threshold:
+                    buy_size_override = runner.cfg.buy_size_usd * runner.cfg.ml_size_multiplier
+                    logger.info(
+                        "[ML_SIZE] [%-12s] %s | score=%.1f >= %.1f — sizing up $%.2f → $%.2f (%.1fx)",
+                        runner.name, signal.symbol, ml_score, runner.cfg.ml_high_score_threshold,
+                        runner.cfg.buy_size_usd, buy_size_override, runner.cfg.ml_size_multiplier,
+                    )
+
             position = None
             if not ml_blocked:
                 try:
-                    position = runner.enter_position(signal, entry_price, chart_ctx)
+                    position = runner.enter_position(signal, entry_price, chart_ctx, buy_size_override)
                 except Exception:
                     logger.exception(
                         "[ERROR] %s: enter_position failed for %s", runner.name, signal.symbol
