@@ -130,6 +130,9 @@ def main() -> None:
 
     db = TradeDatabase(path=db_path)
 
+    _here = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, _here)
+    sys.path.insert(0, os.path.dirname(_here))
     from run import build_runners
 
     runners = build_runners(cfg, db=db)
