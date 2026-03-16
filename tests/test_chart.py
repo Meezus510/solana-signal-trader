@@ -394,6 +394,61 @@ class TestReanalysis:
 
         assert signal.mint_address not in engine._pending_reanalysis
 
+    async def test_handle_new_signal_schedules_reanalyze_when_flag_on(self):
+        """handle_new_signal() creates a reanalysis task when use_reanalyze=True
+        and the chart filter skips the signal."""
+        engine, runners, birdeye = _make_engine(use_reanalyze=True)
+        signal = _signal(mint="sched_on")
+
+        birdeye.get_price = AsyncMock(return_value=0.001)
+        birdeye.get_ohlcv = AsyncMock(return_value=_candles(20))
+
+        with patch("asyncio.create_task") as mock_create_task:
+            with patch(
+                "trader.trading.engine.compute_chart_context",
+                return_value=self._skip_ctx(),
+            ):
+                await engine.handle_new_signal(signal)
+
+        mock_create_task.assert_called_once()
+        assert signal.mint_address in engine._pending_reanalysis
+
+    async def test_handle_new_signal_does_not_schedule_when_flag_off(self):
+        """handle_new_signal() must NOT create a reanalysis task when every
+        runner has use_reanalyze=False, even if chart filter skips."""
+        engine, runners, birdeye = _make_engine(use_reanalyze=False)
+        signal = _signal(mint="sched_off")
+
+        birdeye.get_price = AsyncMock(return_value=0.001)
+        birdeye.get_ohlcv = AsyncMock(return_value=_candles(20))
+
+        with patch("asyncio.create_task") as mock_create_task:
+            with patch(
+                "trader.trading.engine.compute_chart_context",
+                return_value=self._skip_ctx(),
+            ):
+                await engine.handle_new_signal(signal)
+
+        mock_create_task.assert_not_called()
+        assert signal.mint_address not in engine._pending_reanalysis
+
+    async def test_handle_new_signal_does_not_schedule_when_chart_says_buy(self):
+        """No reanalysis task when chart filter approves the entry — nothing to re-check."""
+        engine, runners, birdeye = _make_engine(use_reanalyze=True)
+        signal = _signal(mint="sched_buy")
+
+        birdeye.get_price = AsyncMock(return_value=0.001)
+        birdeye.get_ohlcv = AsyncMock(return_value=_candles(20))
+
+        with patch("asyncio.create_task") as mock_create_task:
+            with patch(
+                "trader.trading.engine.compute_chart_context",
+                return_value=self._ok_ctx(),
+            ):
+                await engine.handle_new_signal(signal)
+
+        mock_create_task.assert_not_called()
+
     def test_reanalyze_not_scheduled_when_flag_off(self):
         """use_reanalyze=False — runner with chart filter but no reanalyze
         should never trigger a reanalysis task."""
