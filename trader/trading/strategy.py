@@ -133,6 +133,12 @@ class StrategyConfig:
     # e.g. quick_pop_chart_ml → "quick_pop"
     ml_training_strategy: Optional[str] = None
 
+    # When True, the KNN scorer uses Moralis 10s candles (if available) instead
+    # of Birdeye 1m.  Enable only for fast-scalp strategies (quick_pop) where
+    # short-term pump shape matters most.  Trend/moonbag strategies should leave
+    # this False — their longer horizon is better captured by 1m candles.
+    ml_prefer_moralis: bool = False
+
     # KNN algorithm hyperparameters — tunable by the strategy agent.
     # ml_k: number of nearest neighbours (higher = smoother, slower to adapt)
     # ml_halflife_days: recency weight half-life (lower = recent trades matter more)

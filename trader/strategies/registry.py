@@ -167,6 +167,7 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         use_ml_filter=True,          # always on for quick_pop_chart_ml — not agent-controlled
         use_policy_agent=True,
         ml_training_strategy="quick_pop",  # train on unfiltered base outcomes
+        ml_prefer_moralis=True,      # use 10s candles for KNN — fast-scalp pump shape
         ml_min_score=_qp_chart.get("ml_min_score", 5.0),
         ml_high_score_threshold=_qp_chart.get("ml_high_score_threshold", 8.0),
         ml_max_score_threshold=_qp_chart.get("ml_max_score_threshold", 9.5),

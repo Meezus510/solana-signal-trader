@@ -71,6 +71,9 @@ class MultiStrategyEngine:
         # One ML scorer per unique training strategy, keyed by training strategy name.
         # Chart variants point to their base strategy so they train on unbiased data.
         self._ml_scorers: dict[str, ChartMLScorer] = {}
+        # Strategies that prefer Moralis 10s candles for KNN scoring (fast-scalp only).
+        # All others fall back to Birdeye 1m so features match their longer-horizon data.
+        self._ml_prefer_moralis: set[str] = set()
         if db:
             for r in runners:
                 if r.cfg.use_ml_filter:
@@ -83,6 +86,14 @@ class MultiStrategyEngine:
                             score_low_pct=r.cfg.ml_score_low_pct,
                             score_high_pct=r.cfg.ml_score_high_pct,
                         )
+                    if r.cfg.ml_prefer_moralis:
+                        self._ml_prefer_moralis.add(training)
+        logger.info(
+            "[engine] Initialized — %d runner(s) | ml_scorers: %s | moralis_knn: %s",
+            len(self._runners),
+            list(self._ml_scorers.keys()) or "none",
+            list(self._ml_prefer_moralis) or "none",
+        )
         # Track strategy_config.json mtime for hot-reload
         self._config_mtime: float = self._get_config_mtime()
 
@@ -138,6 +149,7 @@ class MultiStrategyEngine:
 
         # Rebuild ML scorers to reflect any use_ml_filter or hyperparameter changes
         self._ml_scorers = {}
+        self._ml_prefer_moralis = set()
         if self._db:
             for r in self._runners:
                 if r.cfg.use_ml_filter:
@@ -150,6 +162,8 @@ class MultiStrategyEngine:
                             score_low_pct=r.cfg.ml_score_low_pct,
                             score_high_pct=r.cfg.ml_score_high_pct,
                         )
+                    if r.cfg.ml_prefer_moralis:
+                        self._ml_prefer_moralis.add(training)
 
         logger.info(
             "[engine] Hot-reload complete — %d runner(s) active | ml_scorers: %s",
@@ -259,15 +273,24 @@ class MultiStrategyEngine:
 
         # ML confidence score — one score per unique training strategy.
         # Chart variants train on their base strategy's unfiltered outcomes.
+        #
+        # Candle source is per-strategy:
+        #   ml_prefer_moralis=True  (quick_pop) → Moralis 10s when available, else Birdeye 1m.
+        #                                          10s resolution captures pump shape for fast scalps.
+        #   ml_prefer_moralis=False (trend/moonbag) → always Birdeye 1m.
+        #                                             Longer horizon; 10s adds noise, not signal.
         ml_scores: dict[str, float | None] = {}
         if self._ml_scorers and ml_candles:
             for training_strategy, scorer in self._ml_scorers.items():
-                score = scorer.score(ml_candles, chart_ctx=chart_ctx, pair_stats=pair_stats)
+                use_moralis = training_strategy in self._ml_prefer_moralis
+                score_candles = ml_candles if use_moralis else (candles or ml_candles)
+                score = scorer.score(score_candles, chart_ctx=chart_ctx, pair_stats=pair_stats)
                 ml_scores[training_strategy] = score
                 if score is not None:
+                    knn_src = ml_source if use_moralis else "birdeye/1m"
                     logger.info(
-                        "[ML] %s | confidence=%.1f/10 | src=%s | pair_stats=%s | training=%s",
-                        signal.symbol, score, ml_source, "yes" if pair_stats else "no",
+                        "[ML] %s | confidence=%.1f/10 | knn_src=%s | pair_stats=%s | training=%s",
+                        signal.symbol, score, knn_src, "yes" if pair_stats else "no",
                         training_strategy,
                     )
 
