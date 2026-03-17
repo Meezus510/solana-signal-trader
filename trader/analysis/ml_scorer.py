@@ -264,11 +264,15 @@ class ChartMLScorer:
         strategy: str = "quick_pop_chart",
         k: int = K,
         recency_halflife_days: float = HALFLIFE_DAYS,
+        score_low_pct: float = _SCORE_LOW_PCT,
+        score_high_pct: float = _SCORE_HIGH_PCT,
     ) -> None:
         self._db = db
         self._strategy = strategy
         self._k = k
         self._halflife = recency_halflife_days
+        self._score_low_pct = score_low_pct
+        self._score_high_pct = score_high_pct
 
     def score(self, candles: list, chart_ctx=None, pair_stats=None) -> Optional[float]:
         """
@@ -364,9 +368,9 @@ class ChartMLScorer:
 
         avg_pnl = weighted_pnl / total_w
 
-        # Map to [0, 10]
-        pnl_range = _SCORE_HIGH_PCT - _SCORE_LOW_PCT
-        raw_score = (avg_pnl - _SCORE_LOW_PCT) / pnl_range * 10.0
+        # Map to [0, 10] using per-instance score range (defaults to global constants)
+        pnl_range = self._score_high_pct - self._score_low_pct
+        raw_score = (avg_pnl - self._score_low_pct) / pnl_range * 10.0
         final_score = max(0.0, min(10.0, raw_score))
 
         logger.info(

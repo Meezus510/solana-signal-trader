@@ -121,6 +121,39 @@ CREATE TABLE IF NOT EXISTS chart_snapshots (
 )
 """
 
+_CREATE_SIGNAL_CHARTS = """
+CREATE TABLE IF NOT EXISTS signal_charts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    mint            TEXT NOT NULL,
+    entry_price     REAL NOT NULL,
+    pump_ratio      REAL,
+    vol_trend       TEXT,
+    candle_count    INTEGER,
+    candles_json    TEXT NOT NULL,
+    candles_1m_json TEXT,
+    pair_stats_json TEXT,
+    ml_score        REAL
+)
+"""
+
+_CREATE_STRATEGY_OUTCOMES = """
+CREATE TABLE IF NOT EXISTS strategy_outcomes (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_chart_id      INTEGER NOT NULL REFERENCES signal_charts(id),
+    strategy             TEXT NOT NULL,
+    entered              INTEGER NOT NULL DEFAULT 0,
+    outcome_pnl_pct      REAL,
+    outcome_pnl_usd      REAL,
+    outcome_sell_reason  TEXT,
+    outcome_hold_secs    REAL,
+    outcome_max_gain_pct REAL,
+    closed               INTEGER NOT NULL DEFAULT 0,
+    is_live              INTEGER NOT NULL DEFAULT 0
+)
+"""
+
 
 class TradeDatabase:
     """
@@ -150,6 +183,8 @@ class TradeDatabase:
         c.execute(_CREATE_PORTFOLIO)
         c.execute(_CREATE_SEEN)
         c.execute(_CREATE_CHART_SNAPSHOTS)
+        c.execute(_CREATE_SIGNAL_CHARTS)
+        c.execute(_CREATE_STRATEGY_OUTCOMES)
         self._migrate(c)
         c.commit()
 
@@ -165,6 +200,17 @@ class TradeDatabase:
             except sqlite3.OperationalError:
                 pass  # column already exists
 
+        # strategy_outcomes columns added after initial release
+        for col, definition in [
+            ("outcome_pnl_usd", "REAL"),
+            ("is_live",         "INTEGER NOT NULL DEFAULT 0"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE strategy_outcomes ADD COLUMN {col} {definition}")
+                logger.info("[DB] Migrated: added column %s to strategy_outcomes", col)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
         # chart_snapshots columns added after initial release
         for col, definition in [
             ("ml_score",        "REAL"),
@@ -176,6 +222,94 @@ class TradeDatabase:
                 logger.info("[DB] Migrated: added column %s to chart_snapshots", col)
             except sqlite3.OperationalError:
                 pass  # column already exists
+
+        # Migrate existing chart_snapshots rows into signal_charts + strategy_outcomes.
+        # Deduplicates signal_charts by (mint, ts rounded to nearest 10s).
+        # Safe to re-run: skips mints/ts pairs already present in signal_charts.
+        try:
+            count = c.execute("SELECT COUNT(*) FROM chart_snapshots").fetchone()[0]
+        except sqlite3.OperationalError:
+            count = 0
+
+        if count == 0:
+            return
+
+        rows = c.execute(
+            """
+            SELECT id, ts, strategy, symbol, mint, entry_price,
+                   pump_ratio, vol_trend, candle_count, candles_json,
+                   entered, ml_score, outcome_pnl_pct, outcome_sell_reason,
+                   outcome_hold_secs, outcome_max_gain_pct, closed,
+                   pair_stats_json, candles_1m_json
+              FROM chart_snapshots
+             ORDER BY ts ASC
+            """
+        ).fetchall()
+
+        # mint → rounded_ts_bucket → signal_chart_id
+        sc_index: dict[tuple[str, int], int] = {}
+
+        # Pre-load already migrated signal_charts to avoid duplicates on re-run
+        existing = c.execute("SELECT id, mint, ts FROM signal_charts").fetchall()
+        for sc_id, sc_mint, sc_ts_str in existing:
+            try:
+                sc_ts = datetime.fromisoformat(sc_ts_str)
+                bucket = round(sc_ts.timestamp() / 10) * 10
+                sc_index[(sc_mint, bucket)] = sc_id
+            except Exception:
+                pass
+
+        migrated_sc = migrated_so = 0
+        for row in rows:
+            (
+                _id, ts, strategy, symbol, mint, entry_price,
+                pump_ratio, vol_trend, candle_count, candles_json,
+                entered, ml_score, outcome_pnl_pct, outcome_sell_reason,
+                outcome_hold_secs, outcome_max_gain_pct, closed,
+                pair_stats_json, candles_1m_json,
+            ) = row
+
+            try:
+                ts_dt = datetime.fromisoformat(ts)
+            except Exception:
+                continue
+            bucket = round(ts_dt.timestamp() / 10) * 10
+            key = (mint, bucket)
+
+            if key not in sc_index:
+                cur = c.execute(
+                    """
+                    INSERT INTO signal_charts
+                        (ts, symbol, mint, entry_price, pump_ratio, vol_trend,
+                         candle_count, candles_json, candles_1m_json, pair_stats_json, ml_score)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (ts, symbol, mint, entry_price, pump_ratio, vol_trend,
+                     candle_count, candles_json, candles_1m_json, pair_stats_json, ml_score),
+                )
+                sc_index[key] = cur.lastrowid
+                migrated_sc += 1
+
+            sc_id = sc_index[key]
+            c.execute(
+                """
+                INSERT INTO strategy_outcomes
+                    (signal_chart_id, strategy, entered,
+                     outcome_pnl_pct, outcome_sell_reason,
+                     outcome_hold_secs, outcome_max_gain_pct, closed)
+                VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (sc_id, strategy, int(entered or 0),
+                 outcome_pnl_pct, outcome_sell_reason,
+                 outcome_hold_secs, outcome_max_gain_pct, int(closed or 0)),
+            )
+            migrated_so += 1
+
+        if migrated_sc or migrated_so:
+            logger.info(
+                "[DB] Migrated chart_snapshots: %d signal_charts, %d strategy_outcomes",
+                migrated_sc, migrated_so,
+            )
 
     # ------------------------------------------------------------------
     # Positions
@@ -367,29 +501,27 @@ class TradeDatabase:
         self._conn.commit()
 
     # ------------------------------------------------------------------
-    # Chart snapshots (ML training data)
+    # Normalised chart data (signal_charts + strategy_outcomes)
     # ------------------------------------------------------------------
 
-    def save_chart_snapshot(
+    def save_signal_chart(
         self,
-        strategy: str,
         symbol: str,
         mint: str,
         entry_price: float,
         candles: list,
         chart_ctx,                    # ChartContext | None
-        entered: bool,
         ml_score: Optional[float] = None,
         pair_stats: Optional[dict] = None,
         candles_1m: Optional[list] = None,
     ) -> int:
         """
-        Persist OHLCV candles + signal metadata at entry time.
+        Persist OHLCV candles + signal metadata once per signal into signal_charts.
 
         candles      — high-res candles used for ML (e.g. 10s × 100 bars)
         candles_1m   — standard 1m Birdeye candles, saved for future strategy use
 
-        Returns the new row id so the runner can later fill in outcome fields.
+        Returns the new signal_charts row id so callers can link strategy_outcomes to it.
         """
         def _serialise(bars: list) -> str:
             return json.dumps([
@@ -403,15 +535,14 @@ class TradeDatabase:
 
         cursor = self._conn.execute(
             """
-            INSERT INTO chart_snapshots
-                (ts, strategy, symbol, mint, entry_price,
+            INSERT INTO signal_charts
+                (ts, symbol, mint, entry_price,
                  pump_ratio, vol_trend, candle_count, candles_json,
-                 entered, ml_score, pair_stats_json, candles_1m_json)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 candles_1m_json, pair_stats_json, ml_score)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 datetime.now(timezone.utc).isoformat(),
-                strategy,
                 symbol,
                 mint,
                 entry_price,
@@ -419,27 +550,56 @@ class TradeDatabase:
                 chart_ctx.vol_trend if chart_ctx else None,
                 chart_ctx.candle_count if chart_ctx else len(candles),
                 candles_json,
-                int(entered),
-                ml_score,
-                json.dumps(pair_stats) if pair_stats else None,
                 candles_1m_json,
+                json.dumps(pair_stats) if pair_stats else None,
+                ml_score,
             ),
+        )
+        self._conn.commit()
+        return cursor.lastrowid
+
+    def save_strategy_outcome(
+        self,
+        signal_chart_id: int,
+        strategy: str,
+        entered: bool,
+        is_live: bool = False,
+    ) -> int:
+        """
+        Insert a strategy_outcomes row linked to an existing signal_charts row.
+
+        is_live — when True this trade counts against the AI balance. Set based on
+                  whether live_trading was enabled for this runner at entry time.
+
+        Returns the new strategy_outcomes row id so the runner can later fill in
+        outcome fields when the position closes.
+        """
+        cursor = self._conn.execute(
+            """
+            INSERT INTO strategy_outcomes (signal_chart_id, strategy, entered, is_live)
+            VALUES (?,?,?,?)
+            """,
+            (signal_chart_id, strategy, int(entered), int(is_live)),
         )
         self._conn.commit()
         return cursor.lastrowid
 
     def load_chart_snapshots(self, strategy: str) -> list[dict]:
         """
-        Return all closed snapshots for a strategy as a list of dicts.
-        Used by ChartMLScorer to build the training set.
+        Return all closed outcomes for a strategy as a list of dicts.
+        JOINs signal_charts + strategy_outcomes; returns the same dict shape as
+        the legacy chart_snapshots query for backward compatibility with ChartMLScorer.
         """
         rows = self._conn.execute(
             """
-            SELECT ts, candles_json, outcome_pnl_pct, pump_ratio, vol_trend,
-                   pair_stats_json
-              FROM chart_snapshots
-             WHERE strategy = ? AND closed = 1 AND outcome_pnl_pct IS NOT NULL
-             ORDER BY ts ASC
+            SELECT sc.ts, sc.candles_json, so.outcome_pnl_pct,
+                   sc.pump_ratio, sc.vol_trend, sc.pair_stats_json
+              FROM strategy_outcomes so
+              JOIN signal_charts sc ON so.signal_chart_id = sc.id
+             WHERE so.strategy = ?
+               AND so.closed = 1
+               AND so.outcome_pnl_pct IS NOT NULL
+             ORDER BY sc.ts ASC
             """,
             (strategy,),
         ).fetchall()
@@ -450,30 +610,51 @@ class TradeDatabase:
                 "outcome_pnl_pct": r[2],
                 "pump_ratio":      r[3],
                 "vol_trend":       r[4],
-                "pair_stats_json": r[5],   # None for snapshots before this feature
+                "pair_stats_json": r[5],
             }
             for r in rows
         ]
 
-    def update_chart_snapshot_outcome(
+    def update_strategy_outcome(
         self,
-        snapshot_id: int,
+        outcome_id: int,
         pnl_pct: float,
         sell_reason: str,
         hold_secs: float,
         max_gain_pct: float,
+        pnl_usd: Optional[float] = None,
     ) -> None:
-        """Fill in outcome fields once the position closes."""
+        """Fill in outcome fields on a strategy_outcomes row once the position closes."""
         self._conn.execute(
             """
-            UPDATE chart_snapshots
-               SET outcome_pnl_pct=?, outcome_sell_reason=?,
+            UPDATE strategy_outcomes
+               SET outcome_pnl_pct=?, outcome_pnl_usd=?, outcome_sell_reason=?,
                    outcome_hold_secs=?, outcome_max_gain_pct=?, closed=1
              WHERE id=?
             """,
-            (pnl_pct, sell_reason, hold_secs, max_gain_pct, snapshot_id),
+            (pnl_pct, pnl_usd, sell_reason, hold_secs, max_gain_pct, outcome_id),
         )
         self._conn.commit()
+
+    def get_ai_balance(self, start_usd: float = 1000.0) -> float:
+        """
+        Compute current AI balance as starting capital plus sum of all closed
+        live-trade PnL (outcome_pnl_usd WHERE is_live=1).
+
+        Returns start_usd when no live trades have closed yet.
+        """
+        row = self._conn.execute(
+            """
+            SELECT COALESCE(SUM(outcome_pnl_usd), 0.0)
+              FROM strategy_outcomes
+             WHERE is_live = 1
+               AND closed  = 1
+               AND entered = 1
+               AND outcome_pnl_usd IS NOT NULL
+            """,
+        ).fetchone()
+        cumulative_pnl = row[0] if row else 0.0
+        return start_usd + cumulative_pnl
 
     # ------------------------------------------------------------------
     # Lifecycle
