@@ -194,7 +194,9 @@ async def backfill_strategy(
             if chart_candles else None
         )
 
-        # Save candles once, then outcome under base strategy name
+        # Save candles once, then outcome under base strategy name.
+        # Pass the original entry timestamp so KNN recency weighting reflects
+        # the true age of the trade rather than the backfill run time.
         signal_chart_id = db.save_signal_chart(
             symbol=symbol,
             mint=mint,
@@ -204,6 +206,7 @@ async def backfill_strategy(
             ml_score=None,
             pair_stats=None,
             candles_1m=chart_candles if chart_candles else None,
+            ts=pos["entry_ts"].isoformat(),
         )
 
         outcome_id = db.save_strategy_outcome(

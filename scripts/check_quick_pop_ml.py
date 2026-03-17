@@ -182,6 +182,54 @@ def main() -> None:
     print(f"  Moralis-10s     : {tr_moralis}  (backfill is birdeye-1m; grows as live trades close)")
     if tr_first:
         print(f"  Date range      : {str(tr_first)[:16]} → {str(tr_last)[:16]}")
+        ts_span = (tr_last or "")[:16]
+        ts_start = (tr_first or "")[:16]
+        if ts_start[:10] == ts_span[:10]:
+            print(f"  ⚠ All training rows have the same date — likely backfill timestamp bug.")
+            print(f"    Fix: re-run  python scripts/backfill_snapshots.py --force")
+            print(f"    (needs --force flag to overwrite existing rows with correct ts)")
+
+    # ------------------------------------------------------------------
+    # 5. Training PnL distribution — shows why scores are high/low
+    # ------------------------------------------------------------------
+    pnl_dist = conn.execute(
+        """
+        SELECT
+          COUNT(*)                                                          AS total,
+          SUM(CASE WHEN so.outcome_pnl_pct > 0  THEN 1 ELSE 0 END)       AS wins,
+          SUM(CASE WHEN so.outcome_pnl_pct <= 0 THEN 1 ELSE 0 END)       AS losses,
+          ROUND(AVG(so.outcome_pnl_pct), 1)                               AS avg_pnl,
+          ROUND(MIN(so.outcome_pnl_pct), 1)                               AS worst,
+          ROUND(MAX(so.outcome_pnl_pct), 1)                               AS best,
+          SUM(CASE WHEN so.outcome_pnl_pct > 20  THEN 1 ELSE 0 END)      AS big_wins,
+          SUM(CASE WHEN so.outcome_pnl_pct < -15 THEN 1 ELSE 0 END)      AS big_losses
+        FROM strategy_outcomes so
+        WHERE so.strategy = 'quick_pop'
+          AND so.closed = 1
+          AND so.outcome_pnl_pct IS NOT NULL
+        """
+    ).fetchone()
+
+    total_tr, wins_tr, losses_tr, avg_pnl, worst, best, big_wins, big_losses = pnl_dist
+
+    if total_tr:
+        win_rate = wins_tr / total_tr * 100
+        # Score at avg_pnl using default quick_pop range (-35 to 100)
+        score_at_avg = max(0.0, min(10.0, (avg_pnl + 35) / 135 * 10)) if avg_pnl else 0.0
+        print(f"\n{SEP}")
+        print("  TRAINING PnL DISTRIBUTION (explains why scores are where they are)")
+        print(SEP)
+        print(f"  Win rate        : {win_rate:.1f}%  ({wins_tr} wins / {losses_tr} losses)")
+        print(f"  Avg PnL         : {avg_pnl:+.1f}%  → KNN avg score ≈ {score_at_avg:.1f}/10")
+        print(f"  Range           : {worst:+.1f}% to {best:+.1f}%")
+        print(f"  Big wins (>20%) : {big_wins}")
+        print(f"  Big losses(<-15%): {big_losses}")
+        if avg_pnl < 0:
+            print(f"\n  ⚠ Training data is net-negative — KNN predicts losses for most signals.")
+            print(f"    Scores will cluster below 5.0 until the underlying strategy improves")
+            print(f"    or the training set accumulates more winning trades.")
+            threshold_pnl = -35 + (5.0 / 10) * 135  # pnl that maps to score=5
+            print(f"    Score ≥ 5.0 requires signals resembling training rows with PnL ≥ {threshold_pnl:+.1f}%")
 
     conn.close()
     print()

@@ -515,12 +515,16 @@ class TradeDatabase:
         ml_score: Optional[float] = None,
         pair_stats: Optional[dict] = None,
         candles_1m: Optional[list] = None,
+        ts: Optional[str] = None,
     ) -> int:
         """
         Persist OHLCV candles + signal metadata once per signal into signal_charts.
 
         candles      — high-res candles used for ML (e.g. 10s × 100 bars)
         candles_1m   — standard 1m Birdeye candles, saved for future strategy use
+        ts           — ISO timestamp for the signal; defaults to now. Pass the
+                       original entry time when backfilling so recency weighting
+                       in the KNN reflects the true age of the trade.
 
         Returns the new signal_charts row id so callers can link strategy_outcomes to it.
         """
@@ -533,6 +537,7 @@ class TradeDatabase:
 
         candles_json    = _serialise(candles)
         candles_1m_json = _serialise(candles_1m) if candles_1m else None
+        row_ts = ts if ts else datetime.now(timezone.utc).isoformat()
 
         cursor = self._conn.execute(
             """
@@ -543,7 +548,7 @@ class TradeDatabase:
             VALUES (?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
-                datetime.now(timezone.utc).isoformat(),
+                row_ts,
                 symbol,
                 mint,
                 entry_price,
