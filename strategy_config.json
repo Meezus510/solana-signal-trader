@@ -1,12 +1,12 @@
 {
   "_meta": {
-    "last_tuned_at": null,
+    "last_tuned_at": "2026-03-17T09:48:39.519460+00:00",
     "trades_at_last_tune": {
-      "trend_rider": 0,
+      "trend_rider": 37,
       "trend_rider_chart_reanalyze": 0,
-      "infinite_moonbag": 0,
+      "infinite_moonbag": 35,
       "infinite_moonbag_chart": 0,
-      "quick_pop_chart_ml": 0
+      "quick_pop_chart_ml": 118
     },
     "version": 1,
     "ai_balance_start_usd": 1000.0,
@@ -16,10 +16,10 @@
   "trend_rider": {
     "live_trading": false,
     "stop_loss_pct": 0.35,
-    "trailing_stop_pct": 0.25,
+    "trailing_stop_pct": 0.28,
     "tp_levels": [
       [
-        2.2,
+        2.5,
         0.5
       ]
     ],
@@ -60,19 +60,19 @@
   "infinite_moonbag": {
     "live_trading": false,
     "stop_loss_pct": 0.35,
-    "trailing_stop_pct": 0.35,
+    "trailing_stop_pct": 0.38,
     "tp_levels": [
       [
         1.5,
-        0.15
+        0.1
       ],
       [
         2.5,
-        0.12
+        0.1
       ],
       [
         4.0,
-        0.12
+        0.1
       ],
       [
         6.0,
@@ -85,12 +85,12 @@
     "ml_min_score": 2.5,
     "ml_high_score_threshold": 8.0,
     "ml_max_score_threshold": 9.5,
-    "ml_size_multiplier": 2.0,
-    "ml_max_size_multiplier": 3.0,
+    "ml_size_multiplier": 1.5,
+    "ml_max_size_multiplier": 2.0,
     "ml_k": 5,
-    "ml_halflife_days": 7.0,
-    "ml_score_low_pct": -35.0,
-    "ml_score_high_pct": 100.0
+    "ml_halflife_days": 5.0,
+    "ml_score_low_pct": -40.0,
+    "ml_score_high_pct": 120.0
   },
   "infinite_moonbag_chart": {
     "live_trading": false,
