@@ -54,7 +54,7 @@ class TestPermissionTiers:
         assert "trend_rider" not in ML_ONLY_STRATEGIES
 
     def test_ml_only_allowed_keys_contains_ml_params(self):
-        for key in ("use_ml_filter", "ml_min_score", "ml_k", "ml_halflife_days",
+        for key in ("ml_min_score", "ml_k", "ml_halflife_days",
                     "ml_score_low_pct", "ml_score_high_pct",
                     "ml_high_score_threshold", "ml_max_score_threshold",
                     "ml_size_multiplier", "ml_max_size_multiplier"):
@@ -62,6 +62,7 @@ class TestPermissionTiers:
 
     def test_ml_only_allowed_keys_excludes_trade_params(self):
         for key in ("stop_loss_pct", "trailing_stop_pct", "tp_levels",
+                    "use_ml_filter",   # permanently ON — not agent-controlled
                     "use_chart_filter", "use_reanalyze", "pump_ratio_max"):
             assert key not in _ML_ONLY_ALLOWED_KEYS
 
@@ -97,9 +98,10 @@ class TestValidateDeltaMLOnly:
         result = _validate_strategy_delta("quick_pop_chart_ml", {"pump_ratio_max": 4.0, "reason": "x"})
         assert "pump_ratio_max" not in result
 
-    def test_keeps_use_ml_filter(self):
-        result = _validate_strategy_delta("quick_pop_chart_ml", {"use_ml_filter": True, "reason": "x"})
-        assert result.get("use_ml_filter") is True
+    def test_strips_use_ml_filter(self):
+        # use_ml_filter is permanently ON for quick_pop_chart_ml — agent cannot toggle it
+        result = _validate_strategy_delta("quick_pop_chart_ml", {"use_ml_filter": False, "reason": "x"})
+        assert "use_ml_filter" not in result
 
     def test_keeps_ml_min_score(self):
         result = _validate_strategy_delta("quick_pop_chart_ml", {"ml_min_score": 6.0, "reason": "x"})

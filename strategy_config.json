@@ -57,7 +57,6 @@
     ]
   },
   "quick_pop_chart_ml": {
-    "use_ml_filter": false,
     "ml_min_score": 5.0,
     "ml_high_score_threshold": 8.0,
     "ml_max_score_threshold": 9.5,

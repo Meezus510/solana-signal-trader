@@ -146,9 +146,10 @@ _FORBIDDEN_KEYS = frozenset([
     "use_policy_agent", "timeout_min_gain_pct",
 ])
 
-# Keys allowed for ML_ONLY strategies (quick_pop_chart_ml)
+# Keys allowed for ML_ONLY strategies (quick_pop_chart_ml).
+# use_ml_filter is intentionally excluded — it is permanently ON for quick_pop_chart_ml
+# and the agent cannot toggle it.
 _ML_ONLY_ALLOWED_KEYS = frozenset([
-    "use_ml_filter",
     "ml_min_score", "ml_high_score_threshold", "ml_max_score_threshold",
     "ml_size_multiplier", "ml_max_size_multiplier",
     "ml_k", "ml_halflife_days", "ml_score_low_pct", "ml_score_high_pct",
@@ -523,9 +524,9 @@ FIXED PARAMETERS (read-only — these cannot be changed):
   trailing_stop:    {current_params.get('trailing_stop_pct', 0.22)}  (fixed)
   timeout_minutes:  45.0  (fixed)
   chart_filter:     always enabled  (fixed)
+  use_ml_filter:    always enabled  (fixed — cannot be toggled)
 
 CURRENT ML CONFIGURATION:
-  use_ml_filter:            {current_params.get('use_ml_filter', False)}
   ml_min_score:             {current_params.get('ml_min_score', 5.0)}
   ml_high_score_threshold:  {current_params.get('ml_high_score_threshold', 8.0)}
   ml_max_score_threshold:   {current_params.get('ml_max_score_threshold', 9.5)}
@@ -575,15 +576,14 @@ You may ONLY adjust ML filter parameters. Analyze score bucket data and recent t
    falls outside the current mapping (e.g., best trades rarely hit 85%).
 
 IMPORTANT: You cannot change tp_levels, stop_loss_pct, trailing_stop_pct, timeout_minutes,
-use_chart_filter, pump_ratio_max, or any reanalysis parameters.
+use_ml_filter, use_chart_filter, pump_ratio_max, or any reanalysis parameters.
 
-Return ONLY a JSON object with the ML keys you want to change and a "reason" string.
-use_ml_filter must be a boolean (true or false).
+Return ONLY a JSON object with the ML tuning keys you want to change and a "reason" string.
 ml_k will be rounded to the nearest integer.
 Do not include keys you are not changing.
 
 Example:
-{{"use_ml_filter": true, "ml_min_score": 5.5, "ml_k": 7, "reason": "Score bucket 0-4 shows -12% avg PnL — raising min_score to filter losers. K increased for stability."}}
+{{"ml_min_score": 5.5, "ml_k": 7, "ml_halflife_days": 7.0, "reason": "Score bucket 0-4 shows -12% avg PnL — raising min_score to filter losers. K increased for stability."}}
 
 Respond with valid JSON only. No markdown, no explanation outside the JSON."""
 
