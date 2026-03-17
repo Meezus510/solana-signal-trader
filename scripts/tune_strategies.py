@@ -2,18 +2,22 @@
 """
 scripts/tune_strategies.py — Strategy parameter tuner feedback loop.
 
-Monitors closed trade counts per strategy. When N new trades have accumulated
-since the last tune, fires Agent E (strategy_tuner) to analyze performance and
-propose + apply parameter adjustments to strategy_config.json.
+Monitors total buy signals received per strategy. When N new signals have
+accumulated since the last tune, fires Agent E (strategy_tuner) to analyze
+performance and propose + apply parameter adjustments to strategy_config.json.
 
-Changes take effect the next time the bot restarts (registry.py loads the JSON
-at startup).
+"Signal" means any row in strategy_outcomes for the strategy — including
+skipped signals (entered=0). This lets the tuner fire even when chart/ML
+filters are blocking most entries.
+
+Changes take effect on the next hot-reload cycle (strategy_config.json mtime
+is watched by the engine) or bot restart.
 
 Usage
 -----
-    python scripts/tune_strategies.py                          # tune all 4 now
+    python scripts/tune_strategies.py                          # tune all 5 now
     python scripts/tune_strategies.py --strategy trend_rider   # tune one strategy
-    python scripts/tune_strategies.py --every 5                # trigger after 5 new trades
+    python scripts/tune_strategies.py --every 15               # trigger after 15 new signals
     python scripts/tune_strategies.py --loop                   # poll every 60s
     python scripts/tune_strategies.py --dry-run                # preview, no writes
 
@@ -56,7 +60,7 @@ from trader.agents.strategy_tuner import (
 DB_PATH = os.getenv("DB_PATH", "trader.db")
 POLL_INTERVAL_SECONDS = 60
 MIN_EVERY = 5
-MAX_EVERY = 10
+MAX_EVERY = 50
 SEP = "=" * 60
 
 CONTROLLED_LIST = sorted(CONTROLLED_STRATEGIES)
@@ -66,13 +70,17 @@ CONTROLLED_LIST = sorted(CONTROLLED_STRATEGIES)
 # DB helpers
 # ---------------------------------------------------------------------------
 
-def _get_closed_count(db_path: str, strategy: str) -> int:
-    """Count closed, entered trades for a strategy from strategy_outcomes."""
+def _get_signal_count(db_path: str, strategy: str) -> int:
+    """
+    Count total buy signals received for a strategy (entered OR skipped).
+
+    Uses COUNT(*) on all strategy_outcomes rows — including skipped signals
+    (entered=0) — so the tuner fires even when filters block most entries.
+    """
     try:
         conn = sqlite3.connect(db_path)
         row = conn.execute(
-            "SELECT COUNT(*) FROM strategy_outcomes "
-            "WHERE strategy=? AND closed=1 AND entered=1",
+            "SELECT COUNT(*) FROM strategy_outcomes WHERE strategy=?",
             (strategy,),
         ).fetchone()
         conn.close()
@@ -95,7 +103,7 @@ def _should_tune(
     Returns (should_tune, current_count).
     Fires when current_count - baseline >= every.
     """
-    current = _get_closed_count(db_path, strategy)
+    current = _get_signal_count(db_path, strategy)
     baseline = meta.get("trades_at_last_tune", {}).get(strategy, 0)
     return (current - baseline) >= every, current
 
@@ -133,12 +141,12 @@ def run_once(
         print(f"\n{SEP}")
         print(f"Strategy: {strategy}")
         baseline = meta.get("trades_at_last_tune", {}).get(strategy, 0)
-        new_trades = current_count - baseline
-        print(f"  Closed trades since last tune: {new_trades} / {every} needed")
+        new_signals = current_count - baseline
+        print(f"  Signals since last tune: {new_signals} / {every} needed")
         print(SEP)
 
         if not should:
-            print(f"  Skipping — not enough new trades yet ({new_trades}/{every})")
+            print(f"  Skipping — not enough new signals yet ({new_signals}/{every})")
             continue
 
         print(f"  Threshold reached — running tuner...")
@@ -184,7 +192,7 @@ def run_loop(
 ) -> None:
     """Poll every POLL_INTERVAL_SECONDS and fire the tuner when thresholds are met."""
     print(f"[loop] Watching {len(strategies)} strategy(s). Polling every {POLL_INTERVAL_SECONDS}s.")
-    print(f"[loop] Will tune when {every} new closed trades accumulate. Press Ctrl+C to stop.\n")
+    print(f"[loop] Will tune when {every} new buy signals accumulate. Press Ctrl+C to stop.\n")
     try:
         while True:
             run_once(strategies, db_path, every, dry_run)
@@ -210,9 +218,9 @@ def main() -> None:
     parser.add_argument(
         "--every",
         type=int,
-        default=5,
+        default=10,
         metavar="N",
-        help=f"Tune after N new closed trades (default: 5, range {MIN_EVERY}-{MAX_EVERY})",
+        help=f"Tune after N new buy signals (entered+skipped, default: 10, range {MIN_EVERY}-{MAX_EVERY})",
     )
     parser.add_argument(
         "--loop",

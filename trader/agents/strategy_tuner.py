@@ -46,6 +46,7 @@ from trader.agents.base import (
     query_exit_stats,
     query_recent_trades,
     query_score_buckets,
+    query_skipped_stats,
     summarise_guardrails,
     validate_delta,
 )
@@ -98,6 +99,14 @@ _CHART_VARIANTS = frozenset([
     "infinite_moonbag_chart",
     "quick_pop_chart_ml",
 ])
+
+# Maps each chart variant to the base strategy whose outcomes proxy "phantom PnL"
+# for signals the chart variant filtered out.
+_BASE_STRATEGY: dict[str, str] = {
+    "quick_pop_chart_ml":         "quick_pop",
+    "trend_rider_chart_reanalyze": "trend_rider",
+    "infinite_moonbag_chart":      "infinite_moonbag",
+}
 
 _MOONBAG_STRATEGIES = frozenset([
     "infinite_moonbag",
@@ -266,6 +275,12 @@ def run(
     if strategy in _CHART_VARIANTS:
         score_buckets = query_score_buckets(db_path, strategy)
 
+    # Skipped signal phantom PnL — chart variants only (base strategy must save_chart_data)
+    skipped_stats: dict | None = None
+    if strategy in _BASE_STRATEGY:
+        base_strat = _BASE_STRATEGY[strategy]
+        skipped_stats = query_skipped_stats(db_path, strategy, base_strat)
+
     # Fetch AI balance from DB for urgency context
     ai_balance = _AI_START_BALANCE
     try:
@@ -285,9 +300,9 @@ def run(
 
     # Build prompt and call Claude (tier-appropriate prompt)
     if strategy in ML_ONLY_STRATEGIES:
-        prompt = _build_prompt_ml_only(strategy, current_params, exit_stats, recent_trades, score_buckets, total_trades, ai_balance, live_trading_on)
+        prompt = _build_prompt_ml_only(strategy, current_params, exit_stats, recent_trades, score_buckets, total_trades, ai_balance, live_trading_on, skipped_stats)
     elif strategy in _CHART_VARIANTS:
-        prompt = _build_prompt_chart(strategy, current_params, exit_stats, recent_trades, score_buckets, total_trades, ai_balance, live_trading_on)
+        prompt = _build_prompt_chart(strategy, current_params, exit_stats, recent_trades, score_buckets, total_trades, ai_balance, live_trading_on, skipped_stats)
     else:
         prompt = _build_prompt_base(strategy, current_params, exit_stats, recent_trades, total_trades, ai_balance, live_trading_on)
 
@@ -512,6 +527,32 @@ Example: {{"stop_loss_pct": 0.27, "live_trading": false, "reason": "STOP_LOSS ex
 Respond with valid JSON only. No markdown, no explanation outside the JSON."""
 
 
+def _format_skipped_section(skipped_stats: dict, base_strategy: str) -> str:
+    total = skipped_stats["total_skipped"]
+    entered = skipped_stats["base_entered"]
+    if entered == 0:
+        return (
+            f"\nSKIPPED SIGNAL ANALYSIS (signals this strategy filtered out):\n"
+            f"  Total skipped: {total}  |  Base strategy ({base_strategy}) entered: 0\n"
+            f"  (No closed outcomes yet for skipped signals — cannot evaluate filter quality.)\n"
+        )
+    return (
+        f"\nSKIPPED SIGNAL ANALYSIS (signals this strategy filtered out):\n"
+        f"  Total skipped:          {total}\n"
+        f"  Base ({base_strategy}) entered+closed: {entered}\n"
+        f"  Would have been profitable: {skipped_stats['profitable_pct']}%\n"
+        f"  Avg phantom PnL:        {skipped_stats['avg_phantom_pnl']:+.2f}%\n"
+        f"  Avg peak gain:          {skipped_stats['avg_max_gain']:+.2f}%\n"
+        f"\nRecent skipped signals (what {base_strategy} made on them):\n"
+        f"{json.dumps(skipped_stats['sample_outcomes'], indent=2)}\n"
+        f"\nInterpretation:\n"
+        f"  If profitable% and avg_phantom_pnl are BOTH high and positive, your filter is\n"
+        f"  blocking good trades — consider loosening it (lower pump_ratio_max, relax ML floor).\n"
+        f"  If avg_phantom_pnl is negative or near zero, your filter is correctly blocking\n"
+        f"  low-quality signals.\n"
+    )
+
+
 def _build_prompt_chart(
     strategy: str,
     current_params: dict,
@@ -521,11 +562,18 @@ def _build_prompt_chart(
     total_trades: int,
     ai_balance: float = _AI_START_BALANCE,
     live_trading_on: bool = False,
+    skipped_stats: dict | None = None,
 ) -> str:
     base = _build_prompt_base(strategy, current_params, exit_stats, recent_trades, total_trades, ai_balance, live_trading_on)
     tp_count = 4 if strategy in _MOONBAG_STRATEGIES else 1
 
-    ml_section = f"""
+    skipped_section = ""
+    if skipped_stats is not None:
+        base_strategy = _BASE_STRATEGY.get(strategy, "")
+        skipped_section = _format_skipped_section(skipped_stats, base_strategy)
+
+    ml_section = f"""{skipped_section}
+
 SCORE-BUCKET PERFORMANCE (ml_score buckets, chart-filtered trades only):
 {json.dumps(score_buckets, indent=2) if score_buckets else "  No score bucket data yet (use_ml_filter may be disabled)."}
 
@@ -581,6 +629,7 @@ def _build_prompt_ml_only(
     total_trades: int,
     ai_balance: float = _AI_START_BALANCE,
     live_trading_on: bool = False,
+    skipped_stats: dict | None = None,
 ) -> str:
     """
     Prompt for ML_ONLY strategies (quick_pop_chart_ml).
@@ -625,7 +674,7 @@ LAST 10 TRADES (most recent first):
 
 SCORE-BUCKET PERFORMANCE (ml_score buckets, chart-filtered trades only):
 {json.dumps(score_buckets, indent=2) if score_buckets else "  No score bucket data yet (use_ml_filter may be disabled or not enough trades)."}
-
+{_format_skipped_section(skipped_stats, _BASE_STRATEGY.get(strategy, "")) if skipped_stats is not None else ""}
 ML GUARDRAILS (you must stay within these bounds):
   ml_min_score:            [0.0, 9.0]
   ml_high_score_threshold: [5.0, 9.5]

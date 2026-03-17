@@ -220,3 +220,76 @@ def summarise_guardrails() -> str:
     for param, (lo, hi) in GUARDRAILS.items():
         lines.append(f"{param:<28} | {lo:<6} | {hi}")
     return "\n".join(lines)
+
+
+def query_skipped_stats(db_path: str, strategy: str, base_strategy: str) -> dict:
+    """
+    For chart-filtered strategies, compute the outcome of signals they SKIPPED
+    by looking at what the base strategy made on those same signal_chart_ids.
+
+    Returns a dict with:
+        total_skipped   — how many signals this strategy did not enter
+        base_entered    — of those, how many the base strategy entered and closed
+        profitable_pct  — % of those that would have been profitable (or None)
+        avg_phantom_pnl — avg PnL% the base strategy made on them (or None)
+        avg_max_gain    — avg peak gain% the base strategy saw (or None)
+        sample_outcomes — last 10 phantom trades [{symbol, pnl_pct, max_gain_pct, sell_reason, ml_score}]
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        total_skipped = conn.execute(
+            "SELECT COUNT(*) FROM strategy_outcomes WHERE strategy=? AND entered=0",
+            (strategy,),
+        ).fetchone()[0]
+
+        rows = conn.execute(
+            """
+            SELECT base.outcome_pnl_pct, base.outcome_max_gain_pct,
+                   base.outcome_sell_reason, sc.symbol, sc.ml_score
+              FROM strategy_outcomes skipped
+              JOIN signal_charts sc   ON skipped.signal_chart_id = sc.id
+              JOIN strategy_outcomes base ON base.signal_chart_id = skipped.signal_chart_id
+             WHERE skipped.strategy = ?
+               AND skipped.entered = 0
+               AND base.strategy = ?
+               AND base.entered = 1
+               AND base.closed = 1
+               AND base.outcome_pnl_pct IS NOT NULL
+             ORDER BY sc.ts DESC
+            """,
+            (strategy, base_strategy),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return {
+            "total_skipped": total_skipped,
+            "base_entered": 0,
+            "profitable_pct": None,
+            "avg_phantom_pnl": None,
+            "avg_max_gain": None,
+            "sample_outcomes": [],
+        }
+
+    pnl_pcts  = [r[0] for r in rows]
+    max_gains = [r[1] for r in rows if r[1] is not None]
+    profitable = sum(1 for p in pnl_pcts if p > 0)
+
+    return {
+        "total_skipped":   total_skipped,
+        "base_entered":    len(rows),
+        "profitable_pct":  round(profitable / len(rows) * 100, 1),
+        "avg_phantom_pnl": round(sum(pnl_pcts) / len(pnl_pcts), 2),
+        "avg_max_gain":    round(sum(max_gains) / len(max_gains), 2) if max_gains else None,
+        "sample_outcomes": [
+            {
+                "symbol":       r[3],
+                "pnl_pct":      round(r[0], 2),
+                "max_gain_pct": round(r[1], 2) if r[1] is not None else None,
+                "sell_reason":  r[2],
+                "ml_score":     r[4],
+            }
+            for r in rows[:10]
+        ],
+    }
