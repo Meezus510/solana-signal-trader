@@ -39,7 +39,7 @@ logging.basicConfig(
 
 # Current live config for quick_pop_chart_ml — update these when you change registry.py
 CURRENT_CONFIG = {
-    "ml_min_score":            5.0,
+    "ml_min_score":            2.5,
     "ml_high_score_threshold": 8.0,
     "ml_max_score_threshold":  9.5,
     "ml_size_multiplier":      2.0,

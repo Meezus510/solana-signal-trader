@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 GUARDRAILS: dict[str, tuple[float, float]] = {
     # ML score thresholds
-    "ml_min_score":             (3.0, 7.0),   # floor for taking any trade
+    "ml_min_score":             (2.0, 7.0),   # floor for taking any trade
     "ml_high_score_threshold":  (6.0, 9.0),   # score at which size doubles
     "ml_max_score_threshold":   (8.0, 9.9),   # score at which size triples
 
