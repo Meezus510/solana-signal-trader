@@ -113,6 +113,49 @@ def print_closed_positions(db_path: str) -> None:
     print()
 
 
+def print_ai_balance(db_path: str) -> None:
+    """Print AI balance, live-trading strategies, and progress toward the $300 target."""
+    conn = sqlite3.connect(db_path)
+
+    pnl_row = conn.execute(
+        """
+        SELECT COALESCE(SUM(outcome_pnl_usd), 0.0)
+          FROM strategy_outcomes
+         WHERE is_live = 1 AND closed = 1 AND entered = 1
+           AND outcome_pnl_usd IS NOT NULL
+        """
+    ).fetchone()
+
+    live_strategies = conn.execute(
+        """
+        SELECT DISTINCT strategy FROM strategy_outcomes
+         WHERE is_live = 1 AND entered = 1
+        """
+    ).fetchall()
+
+    conn.close()
+
+    start    = 1000.0
+    target   = 300.0
+    deadline = "2026-04-10"
+    pnl      = pnl_row[0] if pnl_row else 0.0
+    balance  = start + pnl
+    needed   = max(0.0, target - pnl)
+    pct      = (pnl / target * 100) if target else 0.0
+    live     = [r[0] for r in live_strategies] if live_strategies else []
+
+    print(SEP)
+    print("  AI BALANCE")
+    print(SEP)
+    print(f"  Balance:          ${balance:.2f}  (started at ${start:.2f})")
+    print(f"  Profit so far:    ${pnl:+.2f}")
+    print(f"  Target:           ${target:.2f} by {deadline}")
+    print(f"  Still needed:     ${needed:.2f}  ({pct:.1f}% of target reached)")
+    print(f"  Live strategies:  {', '.join(live) if live else 'none (all paper trading)'}")
+    print(SEP)
+    print()
+
+
 def main() -> None:
     try:
         cfg = Config.load()
@@ -126,6 +169,7 @@ def main() -> None:
         sys.exit(1)
 
     # Print closed-position PnL first (direct DB query — no runner needed)
+    print_ai_balance(db_path)
     print_closed_positions(db_path)
 
     db = TradeDatabase(path=db_path)

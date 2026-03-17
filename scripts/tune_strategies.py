@@ -174,7 +174,7 @@ def run_once(
             _update_meta(strategy, current_count, config)
             save_config(config)
             print(f"\n  Applied. strategy_config.json updated.")
-            print(f"  Restart the bot to activate new parameters.")
+            print(f"  Changes take effect on the next incoming signal (hot-reload).")
         else:
             print(f"\n  [DRY RUN] No changes written.")
 
