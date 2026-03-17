@@ -1,0 +1,93 @@
+{
+  "_meta": {
+    "last_tuned_at": null,
+    "trades_at_last_tune": {
+      "trend_rider": 37,
+      "trend_rider_chart_reanalyze": 0,
+      "infinite_moonbag": 35,
+      "infinite_moonbag_chart": 0,
+      "quick_pop_chart_ml": 0
+    },
+    "version": 1
+  },
+  "trend_rider": {
+    "stop_loss_pct": 0.35,
+    "trailing_stop_pct": 0.25,
+    "tp_levels": [
+      [2.2, 0.5]
+    ],
+    "timeout_minutes": 90.0,
+    "timeout_min_gain_pct": 0.15,
+    "max_hold_minutes": 240.0
+  },
+  "trend_rider_chart_reanalyze": {
+    "stop_loss_pct": 0.35,
+    "trailing_stop_pct": 0.25,
+    "tp_levels": [
+      [2.2, 0.5]
+    ],
+    "timeout_minutes": 90.0,
+    "timeout_min_gain_pct": 0.15,
+    "max_hold_minutes": 240.0,
+    "use_chart_filter": true,
+    "pump_ratio_max": 3.5,
+    "use_reanalyze": true,
+    "reanalyze_pump_delay": 480.0,
+    "reanalyze_vol_delay": 240.0,
+    "reanalyze_both_delay": 600.0,
+    "use_ml_filter": false,
+    "ml_min_score": 5.0,
+    "ml_high_score_threshold": 8.0,
+    "ml_max_score_threshold": 9.5,
+    "ml_size_multiplier": 2.0,
+    "ml_max_size_multiplier": 3.0,
+    "ml_k": 5,
+    "ml_halflife_days": 14.0,
+    "ml_score_low_pct": -35.0,
+    "ml_score_high_pct": 85.0
+  },
+  "infinite_moonbag": {
+    "stop_loss_pct": 0.35,
+    "trailing_stop_pct": 0.35,
+    "tp_levels": [
+      [1.5, 0.15],
+      [2.5, 0.12],
+      [4.0, 0.12],
+      [6.0, 0.08]
+    ]
+  },
+  "quick_pop_chart_ml": {
+    "use_ml_filter": false,
+    "ml_min_score": 5.0,
+    "ml_high_score_threshold": 8.0,
+    "ml_max_score_threshold": 9.5,
+    "ml_size_multiplier": 2.0,
+    "ml_max_size_multiplier": 3.0,
+    "ml_k": 5,
+    "ml_halflife_days": 14.0,
+    "ml_score_low_pct": -35.0,
+    "ml_score_high_pct": 85.0
+  },
+  "infinite_moonbag_chart": {
+    "stop_loss_pct": 0.35,
+    "trailing_stop_pct": 0.35,
+    "tp_levels": [
+      [1.5, 0.15],
+      [2.5, 0.12],
+      [4.0, 0.12],
+      [6.0, 0.08]
+    ],
+    "use_chart_filter": true,
+    "pump_ratio_max": 3.5,
+    "use_ml_filter": false,
+    "ml_min_score": 5.0,
+    "ml_high_score_threshold": 8.0,
+    "ml_max_score_threshold": 9.5,
+    "ml_size_multiplier": 2.0,
+    "ml_max_size_multiplier": 3.0,
+    "ml_k": 5,
+    "ml_halflife_days": 14.0,
+    "ml_score_low_pct": -35.0,
+    "ml_score_high_pct": 85.0
+  }
+}

@@ -83,10 +83,24 @@ class StrategyConfig:
     # Chart-based entry filter (optional — set True for chart-enabled strategies)
     use_chart_filter: bool = False
 
+    # Per-runner pump ratio threshold for the chart filter.
+    # Overrides the global PUMP_RATIO_MAX in chart.py so each strategy can
+    # have its own sensitivity. Ignored when use_chart_filter=False.
+    pump_ratio_max: float = 3.5
+
     # Reanalysis after a chart SKIP (only meaningful when use_chart_filter=True).
     # When True, a skipped signal is re-checked after a calculated delay and
     # entered if the chart has improved.  When False, a SKIP is final.
     use_reanalyze: bool = False
+
+    # How long to wait (seconds) before re-checking a skipped signal.
+    # Three separate delays depending on why the signal was skipped:
+    #   reanalyze_pump_delay  — token already pumped too hard (pump_ratio >= max)
+    #   reanalyze_vol_delay   — volume dying only
+    #   reanalyze_both_delay  — both pump AND dying volume (worst case)
+    reanalyze_pump_delay: float = 480.0   # 8 minutes
+    reanalyze_vol_delay:  float = 240.0   # 4 minutes
+    reanalyze_both_delay: float = 600.0   # 10 minutes
 
     # Save chart snapshots for ML training (optional).
     # When True, every incoming signal's OHLCV candles + outcome metrics are
@@ -111,6 +125,30 @@ class StrategyConfig:
     # buy size is scaled by ml_max_size_multiplier instead (e.g. 3× the normal).
     ml_max_score_threshold: float = 9.5
     ml_max_size_multiplier: float = 3.0
+
+    # Which strategy's closed outcomes to train the ML scorer on.
+    # Defaults to this strategy's own name when None.
+    # Chart/ML variants should point to their base strategy so the scorer
+    # trains on unbiased, unfiltered outcomes.
+    # e.g. quick_pop_chart_ml → "quick_pop"
+    ml_training_strategy: Optional[str] = None
+
+    # KNN algorithm hyperparameters — tunable by the strategy agent.
+    # ml_k: number of nearest neighbours (higher = smoother, slower to adapt)
+    # ml_halflife_days: recency weight half-life (lower = recent trades matter more)
+    # ml_score_low_pct / ml_score_high_pct: PnL% range mapped to scores 0 and 10
+    ml_k: int = 5
+    ml_halflife_days: float = 14.0
+    ml_score_low_pct: float = -35.0
+    ml_score_high_pct: float = 85.0
+
+    # Per-signal policy agent (optional — requires ANTHROPIC_API_KEY at runtime).
+    # When True, Agent A is called before entering each signal and can:
+    #   • block the trade entirely (allow_trade=False)
+    #   • scale buy size up or down (buy_size_multiplier)
+    #   • apply a downward score adjustment for degraded data quality
+    # Only meaningful for chart/ML strategies where data quality varies.
+    use_policy_agent: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -140,8 +178,8 @@ class StrategyRunner:
         )
         self._exchange = PaperExchange(portfolio=portfolio, cfg=cfg)
         self._portfolio = PortfolioManager()
-        # mint → chart_snapshot row id (populated by engine when save_chart_data=True)
-        self._chart_snapshot_ids: dict[str, int] = {}
+        # mint → strategy_outcomes row id (populated by engine when save_chart_data=True)
+        self._outcome_ids: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Properties
@@ -163,9 +201,9 @@ class StrategyRunner:
     # State restoration (called on startup from DB)
     # ------------------------------------------------------------------
 
-    def set_chart_snapshot_id(self, mint: str, snapshot_id: int) -> None:
-        """Called by the engine after saving a chart snapshot for an entered position."""
-        self._chart_snapshot_ids[mint] = snapshot_id
+    def set_outcome_id(self, mint: str, outcome_id: int) -> None:
+        """Called by the engine after saving a strategy_outcomes row for an entered position."""
+        self._outcome_ids[mint] = outcome_id
 
     def restore_cash(self, available_cash: float, starting_cash: float) -> None:
         self._exchange.portfolio.available_cash_usd = available_cash
@@ -215,23 +253,35 @@ class StrategyRunner:
         buy_size_override — if provided, overrides cfg.buy_size_usd for this entry
             (used by the engine to scale up on high ML confidence scores).
         """
-        # Chart filter (only for chart-enabled strategies)
-        if self._cfg.use_chart_filter and chart_ctx is not None and not chart_ctx.should_enter:
-            logger.info(
-                "[%s] [CHART_SKIP] %s — %s",
-                self.name, signal.symbol, chart_ctx.reason,
-            )
-            signal_log.info(
-                "CHART_SKIP | %-10s | %-44s | ch=%-20s | %s | strategy=%s",
-                signal.symbol, signal.mint_address, signal.source_channel,
-                chart_ctx.reason, self.name,
-            )
-            if self._db:
-                self._db.log_signal(
-                    "CHART_SKIP", symbol=signal.symbol,
-                    mint=signal.mint_address, strategy=self.name,
+        # Chart filter (only for chart-enabled strategies).
+        # Re-evaluated per-runner using this runner's own pump_ratio_max threshold
+        # so each strategy can have independent chart filter sensitivity.
+        if self._cfg.use_chart_filter and chart_ctx is not None:
+            pumped = chart_ctx.pump_ratio >= self._cfg.pump_ratio_max
+            vol_dead = chart_ctx.vol_trend == "DYING"
+            if pumped or vol_dead:
+                if pumped and vol_dead:
+                    skip_reason = (
+                        f"pump={chart_ctx.pump_ratio:.1f}x >= {self._cfg.pump_ratio_max}x + vol dying"
+                    )
+                elif pumped:
+                    skip_reason = (
+                        f"pump={chart_ctx.pump_ratio:.1f}x >= {self._cfg.pump_ratio_max}x"
+                    )
+                else:
+                    skip_reason = f"vol={chart_ctx.vol_trend}"
+                logger.info("[%s] [CHART_SKIP] %s — %s", self.name, signal.symbol, skip_reason)
+                signal_log.info(
+                    "CHART_SKIP | %-10s | %-44s | ch=%-20s | %s | strategy=%s",
+                    signal.symbol, signal.mint_address, signal.source_channel,
+                    skip_reason, self.name,
                 )
-            return None
+                if self._db:
+                    self._db.log_signal(
+                        "CHART_SKIP", symbol=signal.symbol,
+                        mint=signal.mint_address, strategy=self.name,
+                    )
+                return None
 
         if self._portfolio.has_open_position(signal.mint_address):
             logger.info(
@@ -444,7 +494,7 @@ class StrategyRunner:
             self._db.upsert_position(position)
             self._db.save_portfolio(self._exchange.portfolio, self.name)
             self._db.log_trade(reason, position, price, qty, pnl)
-            self._flush_chart_snapshot(position, reason)
+            self._flush_outcome(position, reason)
 
     def _force_close(self, position: Position, reason: str, now: datetime) -> None:
         """Mark a position closed when remaining_quantity hits zero after partial sells."""
@@ -454,14 +504,14 @@ class StrategyRunner:
         self._portfolio.close_position(position.mint_address)
         if self._db:
             self._db.upsert_position(position)
-            self._flush_chart_snapshot(position, reason)
+            self._flush_outcome(position, reason)
 
-    def _flush_chart_snapshot(self, position: Position, reason: str) -> None:
-        """Update chart snapshot outcome metrics when a position closes."""
+    def _flush_outcome(self, position: Position, reason: str) -> None:
+        """Update strategy_outcomes row with outcome metrics when a position closes."""
         if not self._cfg.save_chart_data or not self._db:
             return
-        snapshot_id = self._chart_snapshot_ids.pop(position.mint_address, None)
-        if snapshot_id is None:
+        outcome_id = self._outcome_ids.pop(position.mint_address, None)
+        if outcome_id is None:
             return
         opened_at = position.opened_at
         if opened_at.tzinfo is None:
@@ -472,7 +522,7 @@ class StrategyRunner:
         hold_secs = (closed_at - opened_at).total_seconds()
         max_gain_pct = (position.highest_price / position.entry_price - 1.0) * 100.0
         pnl_pct = (position.realized_pnl_usd / position.usd_size * 100.0) if position.usd_size else 0.0
-        self._db.update_chart_snapshot_outcome(snapshot_id, pnl_pct, reason, hold_secs, max_gain_pct)
+        self._db.update_strategy_outcome(outcome_id, pnl_pct, reason, hold_secs, max_gain_pct)
 
     # ------------------------------------------------------------------
     # Reporting

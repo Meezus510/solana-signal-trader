@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import Optional
 
 from trader.analysis.chart import OHLCV_BARS, compute_chart_context
@@ -29,6 +30,8 @@ from trader.pricing.birdeye import BirdeyePriceClient
 from trader.pricing.moralis import MoralisOHLCVClient
 from trader.trading.models import TokenSignal
 from trader.trading.strategy import StrategyRunner
+
+_STRATEGY_CONFIG_PATH = Path(__file__).parent.parent.parent / "strategy_config.json"
 
 logger = logging.getLogger(__name__)
 signal_log = logging.getLogger("signals")
@@ -65,9 +68,93 @@ class MultiStrategyEngine:
         self._db = db
         # Mints currently awaiting reanalysis — prevents duplicate scheduling
         self._pending_reanalysis: set[str] = set()
-        # ML scorer — only instantiated when at least one runner saves chart data
-        self._ml_scorer: ChartMLScorer | None = (
-            ChartMLScorer(db) if db and any(r.cfg.save_chart_data for r in runners) else None
+        # One ML scorer per unique training strategy, keyed by training strategy name.
+        # Chart variants point to their base strategy so they train on unbiased data.
+        self._ml_scorers: dict[str, ChartMLScorer] = {}
+        if db:
+            for r in runners:
+                if r.cfg.use_ml_filter:
+                    training = r.cfg.ml_training_strategy or r.cfg.name
+                    if training not in self._ml_scorers:
+                        self._ml_scorers[training] = ChartMLScorer(
+                            db, strategy=training,
+                            k=r.cfg.ml_k,
+                            recency_halflife_days=r.cfg.ml_halflife_days,
+                            score_low_pct=r.cfg.ml_score_low_pct,
+                            score_high_pct=r.cfg.ml_score_high_pct,
+                        )
+        # Track strategy_config.json mtime for hot-reload
+        self._config_mtime: float = self._get_config_mtime()
+
+    # ------------------------------------------------------------------
+    # Hot-reload
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_config_mtime() -> float:
+        try:
+            return _STRATEGY_CONFIG_PATH.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    def _check_config_reload(self) -> None:
+        """
+        Reload runners if strategy_config.json has been modified since last check.
+
+        Open positions and cash balances are migrated to the new runners so
+        in-flight trades are unaffected. New parameters apply to the next signal.
+        """
+        mtime = self._get_config_mtime()
+        if mtime <= self._config_mtime:
+            return
+
+        logger.info("[engine] strategy_config.json changed — hot-reloading runners")
+        self._config_mtime = mtime
+
+        try:
+            from trader.strategies.registry import build_runners
+            new_runners = build_runners(self._cfg, self._db)
+        except Exception:
+            logger.exception("[engine] Hot-reload failed — keeping existing runners")
+            return
+
+        # Migrate state from old runners to new runners by name
+        old_by_name = {r.name: r for r in self._runners}
+        for new_runner in new_runners:
+            old = old_by_name.get(new_runner.name)
+            if old is None:
+                continue
+            # Restore cash balance
+            ps = old.portfolio_state
+            new_runner.restore_cash(ps.available_cash_usd, ps.starting_cash_usd)
+            # Restore open positions (they keep their original entry/stop/TP prices)
+            open_positions = old.get_open_positions()
+            if open_positions:
+                new_runner.restore_positions(open_positions)
+            # Restore pending outcome IDs for open positions
+            new_runner._outcome_ids = dict(old._outcome_ids)
+
+        self._runners = new_runners
+
+        # Rebuild ML scorers to reflect any use_ml_filter or hyperparameter changes
+        self._ml_scorers = {}
+        if self._db:
+            for r in self._runners:
+                if r.cfg.use_ml_filter:
+                    training = r.cfg.ml_training_strategy or r.cfg.name
+                    if training not in self._ml_scorers:
+                        self._ml_scorers[training] = ChartMLScorer(
+                            self._db, strategy=training,
+                            k=r.cfg.ml_k,
+                            recency_halflife_days=r.cfg.ml_halflife_days,
+                            score_low_pct=r.cfg.ml_score_low_pct,
+                            score_high_pct=r.cfg.ml_score_high_pct,
+                        )
+
+        logger.info(
+            "[engine] Hot-reload complete — %d runner(s) active | ml_scorers: %s",
+            len(self._runners),
+            list(self._ml_scorers.keys()) or "none",
         )
 
     # ------------------------------------------------------------------
@@ -81,6 +168,8 @@ class MultiStrategyEngine:
         Entry price is fetched once and shared — N strategies entering
         the same token costs 1 Birdeye call, not N calls.
         """
+        self._check_config_reload()
+
         logger.info("[SIGNAL] %s | mint=%s | channel=%s", signal.symbol, signal.mint_address, signal.source_channel)
         signal_log.info("SIGNAL     | %-10s | %-44s | ch=%-20s", signal.symbol, signal.mint_address, signal.source_channel)
         if self._db:
@@ -130,9 +219,12 @@ class MultiStrategyEngine:
         # MORALIS_OHLCV_BARS in ml_scorer.py — change those constants to switch
         # to any supported resolution (10s, 30s, 1min, etc.).
         # ------------------------------------------------------------------
+        # Fetch ML candles for any runner that scores OR saves chart data.
+        # save_chart_data runners need candles stored even without a scorer.
+        needs_ml_candles = self._ml_scorers or any(r.cfg.save_chart_data for r in self._runners)
         ml_candles = []
         ml_source  = "none"
-        if self._ml_scorer:
+        if needs_ml_candles:
             if self._moralis:
                 try:
                     ml_candles = await self._moralis.get_ohlcv(
@@ -159,23 +251,48 @@ class MultiStrategyEngine:
 
         # Moralis pair stats — completely optional, never blocks scoring.
         pair_stats = None
-        if self._moralis:
+        if needs_ml_candles and self._moralis:
             try:
                 pair_stats = await self._moralis.get_pair_stats(signal.mint_address)
             except Exception:
                 logger.debug("[ML] Moralis pair stats failed for %s — skipping", signal.symbol)
 
-        # ML confidence score
-        ml_score: float | None = None
-        if self._ml_scorer and ml_candles:
-            ml_score = self._ml_scorer.score(ml_candles, chart_ctx=chart_ctx, pair_stats=pair_stats)
-            if ml_score is not None:
-                logger.info(
-                    "[ML] %s | confidence=%.1f/10 | src=%s | pair_stats=%s",
-                    signal.symbol, ml_score, ml_source, "yes" if pair_stats else "no",
-                )
+        # ML confidence score — one score per unique training strategy.
+        # Chart variants train on their base strategy's unfiltered outcomes.
+        ml_scores: dict[str, float | None] = {}
+        if self._ml_scorers and ml_candles:
+            for training_strategy, scorer in self._ml_scorers.items():
+                score = scorer.score(ml_candles, chart_ctx=chart_ctx, pair_stats=pair_stats)
+                ml_scores[training_strategy] = score
+                if score is not None:
+                    logger.info(
+                        "[ML] %s | confidence=%.1f/10 | src=%s | pair_stats=%s | training=%s",
+                        signal.symbol, score, ml_source, "yes" if pair_stats else "no",
+                        training_strategy,
+                    )
+
+        # Save signal_chart once (shared across all runners that save chart data).
+        signal_chart_id: int | None = None
+        needs_chart_save = any(r.cfg.save_chart_data for r in self._runners)
+        if needs_chart_save and ml_candles and self._db:
+            # Use the first available ML score as the chart-level label (informational).
+            chart_ml_score = next(iter(ml_scores.values()), None) if ml_scores else None
+            signal_chart_id = self._db.save_signal_chart(
+                symbol=signal.symbol,
+                mint=signal.mint_address,
+                entry_price=entry_price,
+                candles=ml_candles,
+                chart_ctx=chart_ctx,
+                ml_score=chart_ml_score,
+                pair_stats=pair_stats,
+                candles_1m=candles if candles else None,
+            )
 
         for runner in self._runners:
+            # Resolve this runner's ML score from its designated training strategy.
+            training_strategy = runner.cfg.ml_training_strategy or runner.cfg.name
+            ml_score = ml_scores.get(training_strategy)
+
             # ML filter — skip if score is below threshold.
             # If score is None (not enough training data yet), always allow through.
             ml_blocked = (
@@ -185,8 +302,9 @@ class MultiStrategyEngine:
             )
             if ml_blocked:
                 logger.info(
-                    "[ML_SKIP] [%-12s] %s | score=%.1f < threshold=%.1f",
+                    "[ML_SKIP] [%-12s] %s | score=%.1f < threshold=%.1f | training=%s",
                     runner.name, signal.symbol, ml_score, runner.cfg.ml_min_score,
+                    training_strategy,
                 )
                 signal_log.info(
                     "ML_SKIP    | %-10s | %-44s | score=%.1f",
@@ -211,8 +329,77 @@ class MultiStrategyEngine:
                         runner.cfg.buy_size_usd, buy_size_override, runner.cfg.ml_size_multiplier,
                     )
 
+            # ------------------------------------------------------------------
+            # Per-signal policy agent (Agent A) — runs when use_policy_agent=True.
+            # Evaluates data quality, liquidity, and signal context to apply
+            # per-trade overrides: block trade, scale size, or adjust ML score.
+            # Any API failure falls back to allowing the trade with no changes.
+            # ------------------------------------------------------------------
+            policy_blocked = False
+            if runner.cfg.use_policy_agent and not ml_blocked:
+                signal_context = {
+                    "ml_score":              ml_score,
+                    "used_moralis_10s":      ml_source.startswith("moralis"),
+                    "used_birdeye_fallback": ml_source.startswith("birdeye"),
+                    "pair_stats_available":  pair_stats is not None,
+                    # liquidity_usd / slippage_bps not yet in pair_stats — pass None
+                    # so the policy agent skips hard-floor checks for unknown values.
+                    "liquidity_usd":         pair_stats.get("liquidity_usd") if pair_stats else None,
+                    "slippage_bps":          0,
+                }
+                try:
+                    from trader.agents.policy import propose_policy_decision
+                    policy_decision = propose_policy_decision(
+                        signal_context=signal_context,
+                        strategy=runner.cfg.name,
+                    )
+                    logger.info(
+                        "[POLICY] [%-12s] %s | allow=%s | size_mult=%.2f | score_adj=%.2f | codes=%s",
+                        runner.name, signal.symbol,
+                        policy_decision["allow_trade"],
+                        policy_decision["buy_size_multiplier"],
+                        policy_decision["effective_score_adjustment"],
+                        policy_decision["reason_codes"],
+                    )
+
+                    if not policy_decision["allow_trade"]:
+                        policy_blocked = True
+                        signal_log.info(
+                            "POLICY_BLK | %-10s | %-44s | codes=%s",
+                            signal.symbol, signal.mint_address,
+                            policy_decision["reason_codes"],
+                        )
+                    else:
+                        # Apply buy size multiplier from policy agent.
+                        policy_mult = policy_decision["buy_size_multiplier"]
+                        if policy_mult != 1.0:
+                            base = buy_size_override if buy_size_override is not None else runner.cfg.buy_size_usd
+                            buy_size_override = base * policy_mult
+                            logger.info(
+                                "[POLICY_SIZE] [%-12s] %s | mult=%.2f → $%.2f",
+                                runner.name, signal.symbol, policy_mult, buy_size_override,
+                            )
+                        # Effective score adjustment — re-check ML floor.
+                        score_adj = policy_decision["effective_score_adjustment"]
+                        if score_adj != 0.0 and ml_score is not None and runner.cfg.use_ml_filter:
+                            adjusted = ml_score + score_adj
+                            if adjusted < runner.cfg.ml_min_score:
+                                policy_blocked = True
+                                logger.info(
+                                    "[POLICY_BLK] [%-12s] %s | adj_score=%.1f (%.1f%+.1f) < floor=%.1f",
+                                    runner.name, signal.symbol,
+                                    adjusted, ml_score, score_adj, runner.cfg.ml_min_score,
+                                )
+
+                except Exception:
+                    logger.exception(
+                        "[POLICY] Agent A call failed for %s — proceeding with defaults", signal.symbol,
+                    )
+
+            effective_blocked = ml_blocked or policy_blocked
+
             position = None
-            if not ml_blocked:
+            if not effective_blocked:
                 try:
                     position = runner.enter_position(signal, entry_price, chart_ctx, buy_size_override)
                 except Exception:
@@ -221,35 +408,43 @@ class MultiStrategyEngine:
                     )
                     continue
 
-            # Save snapshot for ML-filter runners even when blocked — these become
-            # labeled training examples (entered=False) once their outcome is known.
-            if runner.cfg.save_chart_data and ml_candles and self._db:
-                snapshot_id = self._db.save_chart_snapshot(
+            # Save strategy_outcome for runners that track chart data — even when
+            # blocked (ml or policy), these become labeled training examples.
+            if runner.cfg.save_chart_data and signal_chart_id is not None:
+                outcome_id = self._db.save_strategy_outcome(
+                    signal_chart_id=signal_chart_id,
                     strategy=runner.name,
-                    symbol=signal.symbol,
-                    mint=signal.mint_address,
-                    entry_price=entry_price,
-                    candles=ml_candles,
-                    chart_ctx=chart_ctx,
                     entered=position is not None,
-                    ml_score=ml_score,
-                    pair_stats=pair_stats,
-                    candles_1m=candles if candles else None,
                 )
                 if position is not None:
-                    runner.set_chart_snapshot_id(signal.mint_address, snapshot_id)
+                    runner.set_outcome_id(signal.mint_address, outcome_id)
 
         # Schedule reanalysis if chart filter skipped this signal, at least one
         # runner has reanalysis enabled, and this mint isn't already pending.
+        # Delay is computed from runner configs (not the shared chart_ctx constant)
+        # so each strategy can tune its own reanalysis timing.
+        reanalyze_runners = [
+            r for r in self._runners
+            if r.cfg.use_chart_filter and r.cfg.use_reanalyze
+        ]
         if (
             chart_ctx is not None
             and not chart_ctx.should_enter
-            and chart_ctx.reanalyze_in_secs is not None
             and signal.mint_address not in self._pending_reanalysis
-            and any(r.cfg.use_chart_filter and r.cfg.use_reanalyze for r in self._runners)
+            and reanalyze_runners
         ):
+            # Determine skip reason from chart metrics
+            pumped   = any(chart_ctx.pump_ratio >= r.cfg.pump_ratio_max for r in reanalyze_runners)
+            vol_dead = chart_ctx.vol_trend == "DYING"
+
+            if pumped and vol_dead:
+                delay = min(r.cfg.reanalyze_both_delay for r in reanalyze_runners)
+            elif pumped:
+                delay = min(r.cfg.reanalyze_pump_delay for r in reanalyze_runners)
+            else:
+                delay = min(r.cfg.reanalyze_vol_delay for r in reanalyze_runners)
+
             self._pending_reanalysis.add(signal.mint_address)
-            delay = chart_ctx.reanalyze_in_secs
             logger.info(
                 "[REANALYZE] %s — scheduled in %.0fs (%.1f min) | reason: %s",
                 signal.symbol, delay, delay / 60, chart_ctx.reason,

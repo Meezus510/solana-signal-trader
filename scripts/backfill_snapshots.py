@@ -1,16 +1,20 @@
 """
-scripts/backfill_snapshots.py — Seed ML training data from historical quick_pop trades.
+scripts/backfill_snapshots.py — Seed ML training data from historical base strategy trades.
 
-For each completed quick_pop position in trader.db, fetches the OHLCV candles
-as they looked at entry time (using Birdeye's time_to param) and saves them as
-chart_snapshots so ChartMLScorer has training data immediately instead of
-waiting for live quick_pop_chart trades to accumulate.
+For each completed position in trader.db, fetches the OHLCV candles as they
+looked at entry time (using Birdeye's time_to param) and saves them as
+signal_charts + strategy_outcomes so ChartMLScorer has training data
+immediately instead of waiting for live chart-filtered trades to accumulate.
+
+Outcomes are saved under the base strategy name (e.g. "quick_pop") because
+chart variants (e.g. "quick_pop_chart_ml") are configured to train on their
+base strategy's unfiltered outcomes — avoiding selection bias.
 
 How it works
 ------------
-1. Load all CLOSED quick_pop positions from trader.db.
-2. For each, fetch 40 × 15s candles + 20 × 1m candles at the entry timestamp.
-3. Save a chart_snapshot with strategy='quick_pop_chart' and the known outcome:
+1. Load all CLOSED positions for the source strategy from trader.db.
+2. For each, fetch ML candles + 1m candles at the entry timestamp.
+3. Save a signal_chart + strategy_outcome with the known outcome:
      - pnl_pct       realized_pnl / usd_size × 100
      - sell_reason   why the position closed (STOP_LOSS, TP1, TRAILING_STOP …)
      - hold_secs     seconds from entry to close
@@ -19,9 +23,10 @@ How it works
 Usage
 -----
     source venv/bin/activate
-    python scripts/backfill_snapshots.py            # backfill all
-    python scripts/backfill_snapshots.py --dry-run  # preview without saving
-    python scripts/backfill_snapshots.py --delay 1.5  # slower, avoid rate limits
+    python scripts/backfill_snapshots.py                        # backfill all 3 base strategies
+    python scripts/backfill_snapshots.py --strategy quick_pop   # one strategy only
+    python scripts/backfill_snapshots.py --dry-run              # preview without saving
+    python scripts/backfill_snapshots.py --delay 1.5            # slower, avoid rate limits
 """
 
 from __future__ import annotations
@@ -49,18 +54,17 @@ from trader.pricing.birdeye import BirdeyePriceClient
 DB_PATH  = os.getenv("DB_PATH", "trader.db")
 SEP = "-" * 72
 
-# Strategy whose closed positions we read from
-SOURCE_STRATEGY = "quick_pop"
-# Strategy we save snapshots under (what the ML scorer queries)
-TARGET_STRATEGY = "quick_pop_chart_ml"
+# Base strategies to backfill. Outcomes are saved under the base strategy name
+# so chart variants (which set ml_training_strategy to the base) can find them.
+BACKFILL_STRATEGIES = ["quick_pop", "trend_rider", "infinite_moonbag"]
 
 
 # ---------------------------------------------------------------------------
 # Load completed positions from DB
 # ---------------------------------------------------------------------------
 
-def load_closed_positions(db_path: str) -> list[dict]:
-    """Return all CLOSED quick_pop positions with enough data to backfill."""
+def load_closed_positions(db_path: str, strategy: str) -> list[dict]:
+    """Return all CLOSED positions for strategy with enough data to backfill."""
     conn = sqlite3.connect(db_path)
     rows = conn.execute(
         """
@@ -75,7 +79,7 @@ def load_closed_positions(db_path: str) -> list[dict]:
            AND closed_at LIKE '20%'
          ORDER BY opened_at ASC
         """,
-        (SOURCE_STRATEGY,),
+        (strategy,),
     ).fetchall()
     conn.close()
 
@@ -108,17 +112,19 @@ def load_closed_positions(db_path: str) -> list[dict]:
     return positions
 
 
-def already_backfilled(db_path: str, mint: str, entry_unix: int) -> bool:
-    """True if a snapshot for this exact (mint, entry time ±60s) already exists."""
+def already_backfilled(db_path: str, strategy: str, mint: str, entry_unix: int) -> bool:
+    """True if a strategy_outcomes row for this (strategy, mint, entry time ±60s) already exists."""
     conn = sqlite3.connect(db_path)
     row = conn.execute(
         """
-        SELECT id FROM chart_snapshots
-         WHERE strategy = ? AND mint = ?
-           AND ABS(CAST(strftime('%s', ts) AS INTEGER) - ?) <= 60
+        SELECT so.id
+          FROM strategy_outcomes so
+          JOIN signal_charts sc ON so.signal_chart_id = sc.id
+         WHERE so.strategy = ? AND sc.mint = ?
+           AND ABS(CAST(strftime('%s', sc.ts) AS INTEGER) - ?) <= 60
          LIMIT 1
         """,
-        (TARGET_STRATEGY, mint, entry_unix),
+        (strategy, mint, entry_unix),
     ).fetchone()
     conn.close()
     return row is not None
@@ -128,105 +134,131 @@ def already_backfilled(db_path: str, mint: str, entry_unix: int) -> bool:
 # Main async backfill loop
 # ---------------------------------------------------------------------------
 
-async def run(args: argparse.Namespace, cfg: Config) -> None:
-    positions = load_closed_positions(DB_PATH)
+async def backfill_strategy(
+    strategy: str,
+    args: argparse.Namespace,
+    cfg: Config,
+    db,
+    session: aiohttp.ClientSession,
+) -> tuple[int, int, int]:
+    """Backfill one base strategy. Returns (saved, skipped_exists, skipped_no_data)."""
+    positions = load_closed_positions(DB_PATH, strategy)
     if not positions:
-        print(f"[WARN] No closed {SOURCE_STRATEGY} positions found in {DB_PATH}")
-        return
+        print(f"[WARN] No closed {strategy} positions found in {DB_PATH}")
+        return 0, 0, 0
 
-    print(f"Found {len(positions)} closed {SOURCE_STRATEGY} position(s) to process.")
+    print(f"\n{SEP}")
+    print(f"  Strategy : {strategy}  ({len(positions)} closed position(s))")
+    print(SEP)
+
+    birdeye = BirdeyePriceClient(cfg, session)
+    saved = skipped_no_data = skipped_exists = 0
+
+    for pos in positions:
+        symbol     = pos["symbol"]
+        mint       = pos["mint"]
+        entry_unix = pos["entry_unix"]
+        pnl_pct    = pos["realized_pnl"] / pos["usd_size"] * 100.0
+
+        print(
+            f"  {symbol:<12} {pos['entry_ts'].strftime('%Y-%m-%d %H:%M')} "
+            f"| pnl={pnl_pct:+6.1f}% | {pos['sell_reason']}"
+        )
+
+        if args.dry_run:
+            continue
+
+        if already_backfilled(DB_PATH, strategy, mint, entry_unix):
+            print(f"    [SKIP] already exists")
+            skipped_exists += 1
+            continue
+
+        # Fetch ML candles at entry time
+        ml_candles = await birdeye.get_ohlcv(
+            mint, bars=ML_OHLCV_BARS, interval=ML_OHLCV_INTERVAL, time_to=entry_unix,
+        )
+
+        # Fetch 1m chart-filter candles at entry time
+        chart_candles = await birdeye.get_ohlcv(
+            mint, bars=OHLCV_BARS, interval="1m", time_to=entry_unix,
+        )
+
+        if not ml_candles:
+            print(f"    [SKIP] no candle data (token may be delisted)")
+            skipped_no_data += 1
+            await asyncio.sleep(args.delay)
+            continue
+
+        chart_ctx = (
+            compute_chart_context(chart_candles, pos["entry_price"])
+            if chart_candles else None
+        )
+
+        # Save candles once, then outcome under base strategy name
+        signal_chart_id = db.save_signal_chart(
+            symbol=symbol,
+            mint=mint,
+            entry_price=pos["entry_price"],
+            candles=ml_candles,
+            chart_ctx=chart_ctx,
+            ml_score=None,
+            pair_stats=None,
+            candles_1m=chart_candles if chart_candles else None,
+        )
+
+        outcome_id = db.save_strategy_outcome(
+            signal_chart_id=signal_chart_id,
+            strategy=strategy,   # save under base strategy name for unbiased training
+            entered=True,
+        )
+
+        db.update_strategy_outcome(
+            outcome_id,
+            pnl_pct=pnl_pct,
+            sell_reason=pos["sell_reason"],
+            hold_secs=pos["hold_secs"],
+            max_gain_pct=pos["max_gain_pct"],
+        )
+
+        print(f"    [SAVED] chart_id={signal_chart_id} outcome_id={outcome_id}"
+              f" | ml_bars={len(ml_candles)}"
+              + (f" | 1m_bars={len(chart_candles)}" if chart_candles else ""))
+        saved += 1
+
+        await asyncio.sleep(args.delay)
+
+    return saved, skipped_exists, skipped_no_data
+
+
+async def run(args: argparse.Namespace, cfg: Config) -> None:
+    strategies = (
+        [args.strategy] if args.strategy else BACKFILL_STRATEGIES
+    )
+
     if args.dry_run:
-        print("[DRY RUN] No data will be saved.\n")
+        print("[DRY RUN] No data will be saved.")
 
     db = TradeDatabase(path=DB_PATH) if not args.dry_run else None
 
-    saved = skipped_no_data = skipped_exists = 0
+    total_saved = total_exists = total_no_data = 0
 
     async with aiohttp.ClientSession() as session:
-        birdeye = BirdeyePriceClient(cfg, session)
-
-        for pos in positions:
-            symbol     = pos["symbol"]
-            mint       = pos["mint"]
-            entry_unix = pos["entry_unix"]
-            pnl_pct    = pos["realized_pnl"] / pos["usd_size"] * 100.0
-
-            print(
-                f"  {symbol:<12} {pos['entry_ts'].strftime('%Y-%m-%d %H:%M')} "
-                f"| pnl={pnl_pct:+6.1f}% | {pos['sell_reason']}"
+        for strategy in strategies:
+            saved, exists, no_data = await backfill_strategy(
+                strategy, args, cfg, db, session,
             )
+            total_saved   += saved
+            total_exists  += exists
+            total_no_data += no_data
 
-            if args.dry_run:
-                continue
-
-            # Skip if already backfilled
-            if already_backfilled(DB_PATH, mint, entry_unix):
-                print(f"    [SKIP] snapshot already exists")
-                skipped_exists += 1
-                continue
-
-            # --- Fetch 15s ML candles at entry time ---
-            ml_candles = await birdeye.get_ohlcv(
-                mint,
-                bars=ML_OHLCV_BARS,
-                interval=ML_OHLCV_INTERVAL,
-                time_to=entry_unix,
-            )
-
-            # --- Fetch 1m chart-filter candles at entry time ---
-            chart_candles = await birdeye.get_ohlcv(
-                mint,
-                bars=OHLCV_BARS,
-                interval="1m",
-                time_to=entry_unix,
-            )
-
-            if not ml_candles:
-                print(f"    [SKIP] no 15s candle data (token may be delisted)")
-                skipped_no_data += 1
-                await asyncio.sleep(args.delay)
-                continue
-
-            chart_ctx = (
-                compute_chart_context(chart_candles, pos["entry_price"])
-                if chart_candles else None
-            )
-
-            snapshot_id = db.save_chart_snapshot(
-                strategy=TARGET_STRATEGY,
-                symbol=symbol,
-                mint=mint,
-                entry_price=pos["entry_price"],
-                candles=ml_candles,
-                chart_ctx=chart_ctx,
-                entered=True,
-                ml_score=None,
-            )
-
-            db.update_chart_snapshot_outcome(
-                snapshot_id,
-                pnl_pct=pnl_pct,
-                sell_reason=pos["sell_reason"],
-                hold_secs=pos["hold_secs"],
-                max_gain_pct=pos["max_gain_pct"],
-            )
-
-            print(f"    [SAVED] id={snapshot_id} | 15s_bars={len(ml_candles)}"
-                  + (f" | 1m_bars={len(chart_candles)}" if chart_candles else ""))
-            saved += 1
-
-            await asyncio.sleep(args.delay)
-
-    print()
-    print(SEP)
+    print(f"\n{SEP}")
     if args.dry_run:
-        print(f"  DRY RUN complete — {len(positions)} position(s) previewed, nothing saved")
+        print("  DRY RUN complete — nothing saved")
     else:
-        print(f"  Saved   : {saved}")
-        print(f"  Skipped (already exists) : {skipped_exists}")
-        print(f"  Skipped (no candle data) : {skipped_no_data}")
-        total_snapshots = saved + skipped_exists
-        print(f"  Total chart_snapshots for {TARGET_STRATEGY}: {total_snapshots}")
+        print(f"  Strategies processed     : {', '.join(strategies)}")
+        print(f"  Saved                    : {total_saved}")
+        print(f"  Skipped (already exists) : {total_exists}")
+        print(f"  Skipped (no candle data) : {total_no_data}")
     print(SEP)
 
     if db:
@@ -239,7 +271,13 @@ async def run(args: argparse.Namespace, cfg: Config) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Backfill ML training snapshots from historical quick_pop trades."
+        description="Backfill ML training snapshots from historical base strategy trades."
+    )
+    parser.add_argument(
+        "--strategy",
+        choices=BACKFILL_STRATEGIES,
+        default=None,
+        help="Backfill one strategy only (default: all three base strategies)",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
