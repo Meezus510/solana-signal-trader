@@ -15,10 +15,50 @@ allowed to change. Tighten or widen them here — never in a prompt.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Agent action log — append-only audit trail of every config change.
+# ---------------------------------------------------------------------------
+
+_LOG_PATH = Path(os.getenv("AGENT_LOG_PATH", "logs/agent_actions.log"))
+
+
+def log_agent_action(
+    agent: str,
+    strategy: str,
+    delta: dict[str, Any],
+    before: dict[str, Any],
+) -> None:
+    """
+    Append one line per changed key to logs/agent_actions.log.
+
+    Format:
+        2026-03-17T22:01:05Z | strategy_tuner | quick_pop_chart_ml | ml_min_score: 5.0 → 6.0 | reason: ...
+    """
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    reason = delta.get("reason", "")
+    changes = [
+        f"{k}: {before.get(k, '?')} → {v}"
+        for k, v in delta.items()
+        if k != "reason"
+    ]
+    if not changes:
+        return
+
+    try:
+        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _LOG_PATH.open("a") as f:
+            for change in changes:
+                f.write(f"{ts} | {agent} | {strategy} | {change} | reason: {reason}\n")
+    except OSError as exc:
+        logger.warning("[agent] Could not write agent action log: %s", exc)
 
 # ---------------------------------------------------------------------------
 # Guardrail bands — (min_allowed, max_allowed) for each tunable parameter.

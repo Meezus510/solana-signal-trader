@@ -43,6 +43,7 @@ from datetime import date
 
 from trader.agents.base import (
     GUARDRAILS,
+    log_agent_action,
     query_exit_stats,
     query_recent_trades,
     query_score_buckets,
@@ -335,9 +336,11 @@ def run(
         return {}
 
     if not dry_run:
+        before = {k: config.get(strategy, {}).get(k) for k in validated if k != "reason"}
         _apply_delta(strategy, validated, config)
         save_config(config)
         logger.info("[strategy_tuner] Applied delta for %s: %s", strategy, validated)
+        log_agent_action("strategy_tuner", strategy, validated, before)
     else:
         logger.info("[strategy_tuner] Dry run — proposed delta for %s: %s", strategy, validated)
 
