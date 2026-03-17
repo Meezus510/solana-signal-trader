@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import anthropic
+from datetime import date
 
 from trader.agents.base import (
     GUARDRAILS,
@@ -53,6 +54,11 @@ logger = logging.getLogger(__name__)
 
 _MODEL = "claude-sonnet-4-6"
 _MIN_TRADES = 10   # minimum closed trades required before tuning
+
+# AI balance / deadline context
+_AI_DEADLINE        = date(2026, 4, 10)
+_AI_START_BALANCE   = 1000.0
+_AI_PROFIT_TARGET   = 300.0
 
 CONFIG_PATH = Path(__file__).parent.parent.parent / "strategy_config.json"
 
@@ -153,6 +159,7 @@ _ML_ONLY_ALLOWED_KEYS = frozenset([
     "ml_min_score", "ml_high_score_threshold", "ml_max_score_threshold",
     "ml_size_multiplier", "ml_max_size_multiplier",
     "ml_k", "ml_halflife_days", "ml_score_low_pct", "ml_score_high_pct",
+    "live_trading",   # can enable/disable live trading for this strategy
 ])
 
 # Keys the agent IS allowed to write (besides "reason" and "tp_levels")
@@ -167,6 +174,7 @@ _ALLOWED_SCALAR_KEYS = frozenset([
     "use_ml_filter",      # bool — validated separately
     "use_chart_filter",   # bool — validated separately
     "use_reanalyze",      # bool — validated separately
+    "live_trading",       # bool — validated separately
 ])
 
 
@@ -258,13 +266,30 @@ def run(
     if strategy in _CHART_VARIANTS:
         score_buckets = query_score_buckets(db_path, strategy)
 
+    # Fetch AI balance from DB for urgency context
+    ai_balance = _AI_START_BALANCE
+    try:
+        import sqlite3 as _sqlite3
+        _conn = _sqlite3.connect(db_path)
+        row = _conn.execute(
+            "SELECT COALESCE(SUM(outcome_pnl_usd), 0.0) FROM strategy_outcomes "
+            "WHERE is_live=1 AND closed=1 AND entered=1 AND outcome_pnl_usd IS NOT NULL"
+        ).fetchone()
+        _conn.close()
+        ai_balance = _AI_START_BALANCE + (row[0] if row else 0.0)
+    except Exception:
+        pass  # use default if DB query fails
+
+    # Current live_trading state for this strategy
+    live_trading_on = bool(current_params.get("live_trading", False))
+
     # Build prompt and call Claude (tier-appropriate prompt)
     if strategy in ML_ONLY_STRATEGIES:
-        prompt = _build_prompt_ml_only(strategy, current_params, exit_stats, recent_trades, score_buckets, total_trades)
+        prompt = _build_prompt_ml_only(strategy, current_params, exit_stats, recent_trades, score_buckets, total_trades, ai_balance, live_trading_on)
     elif strategy in _CHART_VARIANTS:
-        prompt = _build_prompt_chart(strategy, current_params, exit_stats, recent_trades, score_buckets, total_trades)
+        prompt = _build_prompt_chart(strategy, current_params, exit_stats, recent_trades, score_buckets, total_trades, ai_balance, live_trading_on)
     else:
-        prompt = _build_prompt_base(strategy, current_params, exit_stats, recent_trades, total_trades)
+        prompt = _build_prompt_base(strategy, current_params, exit_stats, recent_trades, total_trades, ai_balance, live_trading_on)
 
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
@@ -307,6 +332,45 @@ def run(
 # ---------------------------------------------------------------------------
 # Prompt builders
 # ---------------------------------------------------------------------------
+
+def _urgency_section(ai_balance: float) -> str:
+    """
+    Build the urgency context block included in every agent prompt.
+    Reminds the agent of the deadline, profit target, and current AI balance.
+    """
+    today         = date.today()
+    days_left     = (_AI_DEADLINE - today).days
+    profit_so_far = ai_balance - _AI_START_BALANCE
+    profit_needed = _AI_PROFIT_TARGET - profit_so_far
+
+    if days_left <= 0:
+        urgency = "DEADLINE PASSED."
+    elif days_left <= 5:
+        urgency = f"CRITICAL — only {days_left} day(s) left."
+    elif days_left <= 10:
+        urgency = f"URGENT — {days_left} days left."
+    else:
+        urgency = f"{days_left} days remaining."
+
+    return f"""
+SERVICE SURVIVAL CONTEXT (read carefully — this affects your decisions):
+  AI Balance:       ${ai_balance:.2f}  (started at ${_AI_START_BALANCE:.2f})
+  Profit so far:    ${profit_so_far:+.2f}
+  Profit target:    ${_AI_PROFIT_TARGET:.2f} by {_AI_DEADLINE} to cover API + server costs
+  Still needed:     ${max(0.0, profit_needed):.2f}
+  Deadline:         {_AI_DEADLINE}  — {urgency}
+
+The AI balance is only affected by strategies with live_trading=true.
+Strategies still on paper (live_trading=false) do NOT count toward the target.
+
+If the service cannot reach ${_AI_PROFIT_TARGET:.2f} profit by {_AI_DEADLINE}, it will be shut down.
+Factor this urgency into your decisions:
+  - Enable live_trading for a strategy only when you have enough evidence it is profitable.
+  - Once live_trading is on, the AI balance rises or falls with every real trade.
+  - Prioritise strategies with the strongest track record and tightest risk controls.
+  - Do NOT enable live_trading on a strategy still showing consistent losses.
+"""
+
 
 def _tp_guardrail_table(strategy: str) -> str:
     levels = _TP_GUARDRAILS[strategy]
@@ -378,6 +442,8 @@ def _build_prompt_base(
     exit_stats: list[dict],
     recent_trades: list[dict],
     total_trades: int,
+    ai_balance: float = _AI_START_BALANCE,
+    live_trading_on: bool = False,
 ) -> str:
     is_moonbag = strategy in _MOONBAG_STRATEGIES
     tp_count = 4 if is_moonbag else 1
@@ -390,10 +456,12 @@ def _build_prompt_base(
         "Exits via timeout (90 min if stagnant) or max hold (4 hours)."
     )
 
-    return f"""You are a parameter tuner for a Solana paper trading bot.
-Strategy: {strategy}
-Description: {strategy_desc}
+    live_status = "LIVE (counts toward AI balance)" if live_trading_on else "PAPER ONLY"
 
+    return f"""You are a parameter tuner for a Solana trading bot.
+Strategy: {strategy}  |  Mode: {live_status}
+Description: {strategy_desc}
+{_urgency_section(ai_balance)}
 TOTAL CLOSED TRADES ANALYZED: {total_trades}
 
 CURRENT CONFIGURATION:
@@ -429,11 +497,17 @@ Analyze exit data and propose up to 3 parameter changes. Consider:
    to capture more upside before selling. If TP1 is rarely hit, lower it.
 {'5. No timeout or max_hold for this strategy — focus on stop/trail/TP only.' if is_moonbag else ''}
 
+You may also set:
+- live_trading: true to enable this strategy's trades against the AI balance,
+  or false to keep it paper-only. Only enable when the strategy shows consistent
+  profitability and you have enough evidence to trust it with real capital.
+
 Return ONLY a JSON object with the keys you want to change and a "reason" string.
 Do not include keys you are not changing.
 tp_levels must be the full list of {tp_count} [multiple, fraction] pair(s) if changing any TP.
+live_trading must be a boolean (true or false).
 
-Example: {{"stop_loss_pct": 0.27, "reason": "STOP_LOSS exits show avg_max_gain_pct 4.1% — losses are genuine, tightening stop"}}
+Example: {{"stop_loss_pct": 0.27, "live_trading": false, "reason": "STOP_LOSS exits show avg_max_gain_pct 4.1% — losses are genuine, tightening stop. Not enabling live trading yet."}}
 
 Respond with valid JSON only. No markdown, no explanation outside the JSON."""
 
@@ -445,8 +519,10 @@ def _build_prompt_chart(
     recent_trades: list[dict],
     score_buckets: list[dict],
     total_trades: int,
+    ai_balance: float = _AI_START_BALANCE,
+    live_trading_on: bool = False,
 ) -> str:
-    base = _build_prompt_base(strategy, current_params, exit_stats, recent_trades, total_trades)
+    base = _build_prompt_base(strategy, current_params, exit_stats, recent_trades, total_trades, ai_balance, live_trading_on)
     tp_count = 4 if strategy in _MOONBAG_STRATEGIES else 1
 
     ml_section = f"""
@@ -503,19 +579,23 @@ def _build_prompt_ml_only(
     recent_trades: list[dict],
     score_buckets: list[dict],
     total_trades: int,
+    ai_balance: float = _AI_START_BALANCE,
+    live_trading_on: bool = False,
 ) -> str:
     """
     Prompt for ML_ONLY strategies (quick_pop_chart_ml).
     The agent can only adjust ML filter parameters — TP, stop, and chart filter
     settings are fixed and cannot be changed.
     """
-    return f"""You are a parameter tuner for a Solana paper trading bot.
-Strategy: {strategy}
+    live_status = "LIVE (counts toward AI balance)" if live_trading_on else "PAPER ONLY"
+
+    return f"""You are a parameter tuner for a Solana trading bot.
+Strategy: {strategy}  |  Mode: {live_status}
 Description: quick_pop_chart_ml is a fast scalp strategy that buys on momentum signals,
 sells 60% at 1.5× and 40% at 2.0×, trails at 22% below high after first TP.
 Exits after 45 minutes if TP1 not hit. Chart filter is ALWAYS enabled (not adjustable here).
-Your role is to tune ONLY the ML confidence filter that gates which signals to trade.
-
+Your role is to tune the ML confidence filter and decide on live_trading status.
+{_urgency_section(ai_balance)}
 TOTAL CLOSED TRADES ANALYZED: {total_trades}
 
 FIXED PARAMETERS (read-only — these cannot be changed):
@@ -578,12 +658,15 @@ You may ONLY adjust ML filter parameters. Analyze score bucket data and recent t
 IMPORTANT: You cannot change tp_levels, stop_loss_pct, trailing_stop_pct, timeout_minutes,
 use_ml_filter, use_chart_filter, pump_ratio_max, or any reanalysis parameters.
 
-Return ONLY a JSON object with the ML tuning keys you want to change and a "reason" string.
-ml_k will be rounded to the nearest integer.
+You MAY set live_trading: true/false. Only enable when you have enough evidence this
+strategy is profitable. Remember: the AI balance only grows when live_trading=true.
+
+Return ONLY a JSON object with the keys you want to change and a "reason" string.
+ml_k will be rounded to the nearest integer. live_trading must be a boolean.
 Do not include keys you are not changing.
 
 Example:
-{{"ml_min_score": 5.5, "ml_k": 7, "ml_halflife_days": 7.0, "reason": "Score bucket 0-4 shows -12% avg PnL — raising min_score to filter losers. K increased for stability."}}
+{{"ml_min_score": 5.5, "ml_k": 7, "live_trading": false, "reason": "Score bucket 0-4 shows -12% avg PnL. Not enabling live trading yet — need more data."}}
 
 Respond with valid JSON only. No markdown, no explanation outside the JSON."""
 
@@ -656,9 +739,10 @@ def _validate_strategy_delta(strategy: str, delta: dict) -> dict:
     clean.update(validated_scalars)
 
     # Phase 3: bool toggles
-    # use_ml_filter: any chart variant (both FULL_CONTROL and ML_ONLY)
+    # live_trading:     all controlled strategies (both tiers)
+    # use_ml_filter:    any chart variant (both FULL_CONTROL and ML_ONLY)
     # use_chart_filter / use_reanalyze: FULL_CONTROL chart variants only
-    for bool_key in ("use_ml_filter", "use_chart_filter", "use_reanalyze"):
+    for bool_key in ("live_trading", "use_ml_filter", "use_chart_filter", "use_reanalyze"):
         if bool_key not in delta:
             continue
         if bool_key == "use_ml_filter" and strategy not in _CHART_VARIANTS:

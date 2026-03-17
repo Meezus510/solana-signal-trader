@@ -142,6 +142,11 @@ class StrategyConfig:
     ml_score_low_pct: float = -35.0
     ml_score_high_pct: float = 85.0
 
+    # Live trading flag — when True, closed trades from this strategy affect the
+    # AI balance (tracked via is_live=1 in strategy_outcomes).
+    # The strategy tuner agent controls this toggle; it starts False (paper only).
+    live_trading: bool = False
+
     # Per-signal policy agent (optional — requires ANTHROPIC_API_KEY at runtime).
     # When True, Agent A is called before entering each signal and can:
     #   • block the trade entirely (allow_trade=False)
@@ -522,7 +527,10 @@ class StrategyRunner:
         hold_secs = (closed_at - opened_at).total_seconds()
         max_gain_pct = (position.highest_price / position.entry_price - 1.0) * 100.0
         pnl_pct = (position.realized_pnl_usd / position.usd_size * 100.0) if position.usd_size else 0.0
-        self._db.update_strategy_outcome(outcome_id, pnl_pct, reason, hold_secs, max_gain_pct)
+        self._db.update_strategy_outcome(
+            outcome_id, pnl_pct, reason, hold_secs, max_gain_pct,
+            pnl_usd=position.realized_pnl_usd,
+        )
 
     # ------------------------------------------------------------------
     # Reporting

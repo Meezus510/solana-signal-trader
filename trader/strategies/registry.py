@@ -126,6 +126,7 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         timeout_minutes=_o("trend_rider").get("timeout_minutes", 90.0),
         timeout_min_gain_pct=_o("trend_rider").get("timeout_min_gain_pct", 0.15),
         max_hold_minutes=_o("trend_rider").get("max_hold_minutes", 240.0),
+        live_trading=_o("trend_rider").get("live_trading", False),
         save_chart_data=True,
     )
 
@@ -141,6 +142,7 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         ]),
         trailing_stop_pct=_o("infinite_moonbag").get("trailing_stop_pct", 0.30),
         starting_cash_usd=cfg.starting_cash_usd,
+        live_trading=_o("infinite_moonbag").get("live_trading", False),
     )
 
     # ------------------------------------------------------------------
@@ -174,6 +176,7 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         ml_halflife_days=_qp_chart.get("ml_halflife_days", 14.0),
         ml_score_low_pct=_qp_chart.get("ml_score_low_pct", -35.0),
         ml_score_high_pct=_qp_chart.get("ml_score_high_pct", 85.0),
+        live_trading=_qp_chart.get("live_trading", False),
     )
 
     _tr_chart = _o("trend_rider_chart_reanalyze")
@@ -206,6 +209,7 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         ml_halflife_days=_tr_chart.get("ml_halflife_days", 14.0),
         ml_score_low_pct=_tr_chart.get("ml_score_low_pct", -35.0),
         ml_score_high_pct=_tr_chart.get("ml_score_high_pct", 85.0),
+        live_trading=_tr_chart.get("live_trading", False),
     )
 
     _mb_chart = _o("infinite_moonbag_chart")
@@ -234,6 +238,7 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         ml_halflife_days=_mb_chart.get("ml_halflife_days", 14.0),
         ml_score_low_pct=_mb_chart.get("ml_score_low_pct", -35.0),
         ml_score_high_pct=_mb_chart.get("ml_score_high_pct", 85.0),
+        live_trading=_mb_chart.get("live_trading", False),
     )
 
     return [

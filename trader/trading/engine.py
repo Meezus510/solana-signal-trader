@@ -415,6 +415,7 @@ class MultiStrategyEngine:
                     signal_chart_id=signal_chart_id,
                     strategy=runner.name,
                     entered=position is not None,
+                    is_live=runner.cfg.live_trading,
                 )
                 if position is not None:
                     runner.set_outcome_id(signal.mint_address, outcome_id)

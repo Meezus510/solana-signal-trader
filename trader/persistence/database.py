@@ -145,10 +145,12 @@ CREATE TABLE IF NOT EXISTS strategy_outcomes (
     strategy             TEXT NOT NULL,
     entered              INTEGER NOT NULL DEFAULT 0,
     outcome_pnl_pct      REAL,
+    outcome_pnl_usd      REAL,
     outcome_sell_reason  TEXT,
     outcome_hold_secs    REAL,
     outcome_max_gain_pct REAL,
-    closed               INTEGER NOT NULL DEFAULT 0
+    closed               INTEGER NOT NULL DEFAULT 0,
+    is_live              INTEGER NOT NULL DEFAULT 0
 )
 """
 
@@ -195,6 +197,17 @@ class TradeDatabase:
             try:
                 c.execute(f"ALTER TABLE positions ADD COLUMN {col} {definition}")
                 logger.info("[DB] Migrated: added column %s to positions", col)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+        # strategy_outcomes columns added after initial release
+        for col, definition in [
+            ("outcome_pnl_usd", "REAL"),
+            ("is_live",         "INTEGER NOT NULL DEFAULT 0"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE strategy_outcomes ADD COLUMN {col} {definition}")
+                logger.info("[DB] Migrated: added column %s to strategy_outcomes", col)
             except sqlite3.OperationalError:
                 pass  # column already exists
 
@@ -550,19 +563,23 @@ class TradeDatabase:
         signal_chart_id: int,
         strategy: str,
         entered: bool,
+        is_live: bool = False,
     ) -> int:
         """
         Insert a strategy_outcomes row linked to an existing signal_charts row.
+
+        is_live — when True this trade counts against the AI balance. Set based on
+                  whether live_trading was enabled for this runner at entry time.
 
         Returns the new strategy_outcomes row id so the runner can later fill in
         outcome fields when the position closes.
         """
         cursor = self._conn.execute(
             """
-            INSERT INTO strategy_outcomes (signal_chart_id, strategy, entered)
-            VALUES (?,?,?)
+            INSERT INTO strategy_outcomes (signal_chart_id, strategy, entered, is_live)
+            VALUES (?,?,?,?)
             """,
-            (signal_chart_id, strategy, int(entered)),
+            (signal_chart_id, strategy, int(entered), int(is_live)),
         )
         self._conn.commit()
         return cursor.lastrowid
@@ -605,18 +622,39 @@ class TradeDatabase:
         sell_reason: str,
         hold_secs: float,
         max_gain_pct: float,
+        pnl_usd: Optional[float] = None,
     ) -> None:
         """Fill in outcome fields on a strategy_outcomes row once the position closes."""
         self._conn.execute(
             """
             UPDATE strategy_outcomes
-               SET outcome_pnl_pct=?, outcome_sell_reason=?,
+               SET outcome_pnl_pct=?, outcome_pnl_usd=?, outcome_sell_reason=?,
                    outcome_hold_secs=?, outcome_max_gain_pct=?, closed=1
              WHERE id=?
             """,
-            (pnl_pct, sell_reason, hold_secs, max_gain_pct, outcome_id),
+            (pnl_pct, pnl_usd, sell_reason, hold_secs, max_gain_pct, outcome_id),
         )
         self._conn.commit()
+
+    def get_ai_balance(self, start_usd: float = 1000.0) -> float:
+        """
+        Compute current AI balance as starting capital plus sum of all closed
+        live-trade PnL (outcome_pnl_usd WHERE is_live=1).
+
+        Returns start_usd when no live trades have closed yet.
+        """
+        row = self._conn.execute(
+            """
+            SELECT COALESCE(SUM(outcome_pnl_usd), 0.0)
+              FROM strategy_outcomes
+             WHERE is_live = 1
+               AND closed  = 1
+               AND entered = 1
+               AND outcome_pnl_usd IS NOT NULL
+            """,
+        ).fetchone()
+        cumulative_pnl = row[0] if row else 0.0
+        return start_usd + cumulative_pnl
 
     # ------------------------------------------------------------------
     # Lifecycle
