@@ -172,7 +172,7 @@ def main() -> None:
     print_ai_balance(db_path)
     print_closed_positions(db_path)
 
-    db = TradeDatabase(path=db_path)
+    db = TradeDatabase(path=db_path, read_only=True)
 
     _here = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, _here)

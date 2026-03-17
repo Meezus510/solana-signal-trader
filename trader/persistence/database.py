@@ -163,13 +163,14 @@ class TradeDatabase:
     where coroutines may interleave DB access).
     """
 
-    def __init__(self, path: str = "trader.db") -> None:
+    def __init__(self, path: str = "trader.db", read_only: bool = False) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(path, check_same_thread=False)
+        self._conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
-        self._create_tables()
-        logger.info("[DB] Opened %s", path)
+        if not read_only:
+            self._create_tables()
+        logger.info("[DB] Opened %s%s", path, " (read-only)" if read_only else "")
 
     # ------------------------------------------------------------------
     # Schema
