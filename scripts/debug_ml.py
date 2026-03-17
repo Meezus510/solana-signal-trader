@@ -87,6 +87,56 @@ def check_db(db_path: str) -> None:
         print(f"  ✗ Only {usable} usable training rows — this is why scorer returns None")
         print(f"    Fix: python scripts/backfill_snapshots.py")
 
+    # Deep scorer simulation — mirrors exactly what ChartMLScorer.score() does:
+    # parse candles_json and run extract_features on each training row.
+    # This catches format mismatches that candle_count alone can't detect.
+    import json as _json
+    from trader.analysis.ml_scorer import extract_features as _ef, MIN_SAMPLES as _MIN
+
+    snap_rows = conn.execute(
+        """
+        SELECT sc.ts, sc.candles_json, so.outcome_pnl_pct,
+               sc.pump_ratio, sc.vol_trend, sc.pair_stats_json
+          FROM strategy_outcomes so
+          JOIN signal_charts sc ON so.signal_chart_id = sc.id
+         WHERE so.strategy = 'quick_pop'
+           AND so.closed = 1
+           AND so.outcome_pnl_pct IS NOT NULL
+         ORDER BY sc.ts ASC
+        """
+    ).fetchall()
+    feat_ok = feat_none = feat_err = 0
+    first_failure = None
+    for ts, cj, pnl, pump, vol, ps_json in snap_rows:
+        try:
+            candle_list = _json.loads(cj) if cj else []
+            feat = _ef(candle_list)
+            if feat is None:
+                feat_none += 1
+                if first_failure is None:
+                    first_failure = (ts, len(candle_list), "extract_features→None", str(candle_list[:1]))
+            else:
+                feat_ok += 1
+        except Exception as exc:
+            feat_err += 1
+            if first_failure is None:
+                first_failure = (ts, 0, f"exception: {exc}", repr(cj[:80] if cj else ""))
+    print(f"\n{SEP}")
+    print("  SCORER SIMULATION (extract_features on each training row)")
+    print(SEP)
+    print(f"  Training rows loaded        : {len(snap_rows)}")
+    print(f"  Valid feature vectors       : {feat_ok}  ← scorer uses these")
+    print(f"  extract_features→None       : {feat_none}  (len < 3 candles)")
+    print(f"  exceptions (bad format)     : {feat_err}")
+    if feat_ok >= _MIN:
+        print(f"  ✓ {feat_ok} valid vectors >= MIN_SAMPLES={_MIN} — scorer WILL produce scores")
+    else:
+        print(f"  ✗ Only {feat_ok} valid vectors < MIN_SAMPLES={_MIN} — scorer returns None")
+        if first_failure:
+            ts_f, nc, reason, sample = first_failure
+            print(f"    First failure: ts={ts_f[:16]}  n_candles={nc}  reason={reason}")
+            print(f"    Candle sample: {sample[:120]}")
+
     # signal_charts ml_score population
     sc_stats = conn.execute(
         """
