@@ -235,6 +235,7 @@ class TestPortfolioManager:
         assert pos in mgr.get_closed_positions()
 
     def test_counts(self):
+
         mgr = PortfolioManager()
         port = _portfolio()
         ex = PaperExchange(port, _cfg())
@@ -247,3 +248,84 @@ class TestPortfolioManager:
         assert mgr.total_count == 3
         assert mgr.open_count == 3
         assert mgr.closed_count == 0
+
+
+# ---------------------------------------------------------------------------
+# StrategyConfig — new fields added for AI agent control
+# ---------------------------------------------------------------------------
+
+class TestStrategyConfigNewFields:
+    """Verify new fields exist with correct defaults and can be overridden."""
+
+    def test_pump_ratio_max_default(self):
+        cfg = _cfg()
+        assert cfg.pump_ratio_max == 3.5
+
+    def test_pump_ratio_max_custom(self):
+        cfg = StrategyConfig(
+            name="test", buy_size_usd=10.0, stop_loss_pct=0.30,
+            take_profit_levels=(TakeProfitLevel(multiple=2.0, sell_fraction_original=0.5),),
+            trailing_stop_pct=0.25, starting_cash_usd=1000.0,
+            pump_ratio_max=5.0,
+        )
+        assert cfg.pump_ratio_max == 5.0
+
+    def test_reanalyze_delays_defaults(self):
+        cfg = _cfg()
+        assert cfg.reanalyze_pump_delay == 480.0
+        assert cfg.reanalyze_vol_delay == 240.0
+        assert cfg.reanalyze_both_delay == 600.0
+
+    def test_reanalyze_delays_custom(self):
+        cfg = StrategyConfig(
+            name="test", buy_size_usd=10.0, stop_loss_pct=0.30,
+            take_profit_levels=(TakeProfitLevel(multiple=2.0, sell_fraction_original=0.5),),
+            trailing_stop_pct=0.25, starting_cash_usd=1000.0,
+            reanalyze_pump_delay=300.0,
+            reanalyze_vol_delay=120.0,
+            reanalyze_both_delay=900.0,
+        )
+        assert cfg.reanalyze_pump_delay == 300.0
+        assert cfg.reanalyze_vol_delay == 120.0
+        assert cfg.reanalyze_both_delay == 900.0
+
+    def test_ml_k_default(self):
+        cfg = _cfg()
+        assert cfg.ml_k == 5
+
+    def test_ml_halflife_days_default(self):
+        cfg = _cfg()
+        assert cfg.ml_halflife_days == 14.0
+
+    def test_ml_score_range_defaults(self):
+        cfg = _cfg()
+        assert cfg.ml_score_low_pct == -35.0
+        assert cfg.ml_score_high_pct == 85.0
+
+    def test_ml_score_range_custom(self):
+        cfg = StrategyConfig(
+            name="test", buy_size_usd=10.0, stop_loss_pct=0.30,
+            take_profit_levels=(TakeProfitLevel(multiple=2.0, sell_fraction_original=0.5),),
+            trailing_stop_pct=0.25, starting_cash_usd=1000.0,
+            ml_score_low_pct=-50.0,
+            ml_score_high_pct=100.0,
+        )
+        assert cfg.ml_score_low_pct == -50.0
+        assert cfg.ml_score_high_pct == 100.0
+
+    def test_use_reanalyze_default_false(self):
+        cfg = _cfg()
+        assert cfg.use_reanalyze is False
+
+    def test_use_chart_filter_default_false(self):
+        cfg = _cfg()
+        assert cfg.use_chart_filter is False
+
+    def test_use_ml_filter_default_false(self):
+        cfg = _cfg()
+        assert cfg.use_ml_filter is False
+
+    def test_config_is_immutable(self):
+        cfg = _cfg()
+        with pytest.raises(Exception):
+            cfg.pump_ratio_max = 9.9  # frozen dataclass
