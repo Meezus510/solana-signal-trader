@@ -4,9 +4,10 @@ scripts/debug_ml.py — Diagnose why ML scoring is returning None.
 
 Checks:
   1. How many quick_pop training examples exist in the DB
-  2. Whether signal_charts rows have ml_score populated
-  3. Whether Moralis/Birdeye candle fetching works for a recent mint
-  4. Whether the scorer can produce a score given the current training data
+  2. Candle quality of those training rows (empty candles = scorer returns None)
+  3. Whether signal_charts rows have ml_score populated
+  4. Whether Moralis/Birdeye candle fetching works for a recent mint
+  5. Whether the scorer can produce a score given the current training data
 
 Usage:
     python scripts/debug_ml.py               # DB checks only (no API calls)
@@ -56,9 +57,35 @@ def check_db(db_path: str) -> None:
     print(f"  Rows with outcome_pnl_pct   : {with_pnl}")
     print(f"  MIN_SAMPLES required        : 5")
     if (with_pnl or 0) >= 5:
-        print(f"  ✓ Enough training data to score")
+        print(f"  ✓ Enough training data rows exist")
     else:
-        print(f"  ✗ NOT enough training data — scorer returns None until {5 - (with_pnl or 0)} more close")
+        print(f"  ✗ Not enough training data — need {5 - (with_pnl or 0)} more closed trades")
+
+    # Candle quality of the training rows — this is what actually causes None scores
+    training_rows = conn.execute(
+        """
+        SELECT sc.candle_count, LENGTH(sc.candles_json) as clen, sc.candles_json
+          FROM strategy_outcomes so
+          JOIN signal_charts sc ON so.signal_chart_id = sc.id
+         WHERE so.strategy = 'quick_pop'
+           AND so.closed = 1 AND so.entered = 1
+           AND so.outcome_pnl_pct IS NOT NULL
+        """
+    ).fetchall()
+    empty   = sum(1 for _, _, cj in training_rows if not cj or cj in ('[]', 'null', '') or len(cj) < 10)
+    usable  = sum(1 for cnt, _, _ in training_rows if (cnt or 0) >= 3)
+    print(f"\n{SEP}")
+    print("  TRAINING DATA CANDLE QUALITY (what scorer loads per signal)")
+    print(SEP)
+    print(f"  Total training rows         : {len(training_rows)}")
+    print(f"  Rows with empty candles_json: {empty}")
+    print(f"  Rows with >= 3 candles      : {usable}  ← scorer needs >= 5 of these")
+    if usable >= 5:
+        print(f"  ✓ Enough usable training rows — scorer should be producing scores")
+        print(f"    If scores are still None, run --live to test the candle fetch")
+    else:
+        print(f"  ✗ Only {usable} usable training rows — this is why scorer returns None")
+        print(f"    Fix: python scripts/backfill_snapshots.py")
 
     # signal_charts ml_score population
     sc_stats = conn.execute(
@@ -79,7 +106,7 @@ def check_db(db_path: str) -> None:
     if (with_score or 0) == 0:
         print(f"  ✗ No ml_scores stored — scorer is returning None for every signal")
     else:
-        print(f"  ✓ Some signals have been scored")
+        print(f"  ✓ Some signals have been scored ({with_score}/{total_sc})")
 
     # quick_pop_chart_ml strategy_outcomes
     qp_stats = conn.execute(
@@ -187,8 +214,8 @@ async def test_live_scoring(mint: str) -> None:
 
         if score is None:
             print("  ✗ Scorer returned None")
-            print("    Most likely cause: fewer than 5 closed quick_pop outcomes in DB")
-            print("    Run: python scripts/backfill_snapshots.py")
+            print("    Most likely cause: training rows have empty candles_json")
+            print("    Fix: python scripts/backfill_snapshots.py")
         else:
             print(f"  ✓ Score = {score:.2f} / 10")
 
