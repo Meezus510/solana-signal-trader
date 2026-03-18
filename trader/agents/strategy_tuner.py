@@ -742,10 +742,6 @@ EXIT REASON BREAKDOWN:
 LAST 10 TRADES (most recent first):
 {json.dumps(recent_trades[-10:], indent=2)}
 
-NOTE: Trades shown above are only those with a non-null ml_score (scored by the KNN pipeline).
-Older trades with null ml_score predate ML scoring and are excluded — they are NOT evidence
-of a broken pipeline. If no trades appear above, the ML filter is new and has no scored history yet.
-
 SCORE-BUCKET PERFORMANCE (ml_score buckets, chart-filtered trades only):
 {json.dumps(score_buckets, indent=2) if score_buckets else "  No score bucket data yet — ML filter is new. Do not raise ml_min_score without bucket evidence."}
 {_format_skipped_section(skipped_stats, _BASE_STRATEGY.get(strategy, "")) if skipped_stats is not None else ""}
