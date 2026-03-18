@@ -248,8 +248,16 @@ class MultiStrategyEngine:
                     )
                     if ml_candles:
                         ml_source = f"moralis/{MORALIS_OHLCV_INTERVAL}"
-                except Exception:
-                    logger.debug("[ML] Moralis OHLCV failed for %s — falling back", signal.symbol)
+                    else:
+                        logger.warning(
+                            "[ML] Moralis returned no candles for %s — falling back to Birdeye 1m",
+                            signal.symbol,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "[ML] Moralis OHLCV error for %s — falling back to Birdeye 1m: %s",
+                        signal.symbol, exc,
+                    )
 
             if not ml_candles:
                 try:
@@ -260,16 +268,20 @@ class MultiStrategyEngine:
                     )
                     if ml_candles:
                         ml_source = f"birdeye/{ML_OHLCV_INTERVAL}"
-                except Exception:
-                    logger.debug("[ML] Birdeye OHLCV failed for %s", signal.symbol)
+                    else:
+                        logger.warning("[ML] Birdeye also returned no candles for %s", signal.symbol)
+                except Exception as exc:
+                    logger.warning("[ML] Birdeye OHLCV error for %s: %s", signal.symbol, exc)
 
         # Moralis pair stats — completely optional, never blocks scoring.
         pair_stats = None
         if needs_ml_candles and self._moralis:
             try:
                 pair_stats = await self._moralis.get_pair_stats(signal.mint_address)
-            except Exception:
-                logger.debug("[ML] Moralis pair stats failed for %s — skipping", signal.symbol)
+                if pair_stats is None:
+                    logger.warning("[ML] Moralis pair stats returned nothing for %s", signal.symbol)
+            except Exception as exc:
+                logger.warning("[ML] Moralis pair stats error for %s: %s", signal.symbol, exc)
 
         # ML confidence score — one score per unique training strategy.
         # Chart variants train on their base strategy's unfiltered outcomes.
