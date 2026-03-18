@@ -175,7 +175,8 @@ CREATE TABLE IF NOT EXISTS strategy_outcomes (
     is_live              INTEGER NOT NULL DEFAULT 0,
     source_channel       TEXT NOT NULL DEFAULT '',
     ml_score             REAL,
-    is_ai_override       INTEGER NOT NULL DEFAULT 0
+    is_ai_override       INTEGER NOT NULL DEFAULT 0,
+    skip_reason          TEXT
 )
 """
 
@@ -265,6 +266,7 @@ class TradeDatabase:
             ("source_channel",  "TEXT NOT NULL DEFAULT ''"),
             ("ml_score",        "REAL"),
             ("is_ai_override",  "INTEGER NOT NULL DEFAULT 0"),
+            ("skip_reason",     "TEXT"),
         ]:
             try:
                 c.execute(f"ALTER TABLE strategy_outcomes ADD COLUMN {col} {definition}")
@@ -656,6 +658,7 @@ class TradeDatabase:
         source_channel: str = "",
         ml_score: float | None = None,
         is_ai_override: bool = False,
+        skip_reason: str | None = None,
     ) -> int:
         """
         Insert a strategy_outcomes row linked to an existing signal_charts row.
@@ -671,11 +674,11 @@ class TradeDatabase:
         cursor = self._conn.execute(
             """
             INSERT INTO strategy_outcomes
-                (signal_chart_id, strategy, entered, is_live, source_channel, ml_score, is_ai_override)
-            VALUES (?,?,?,?,?,?,?)
+                (signal_chart_id, strategy, entered, is_live, source_channel, ml_score, is_ai_override, skip_reason)
+            VALUES (?,?,?,?,?,?,?,?)
             """,
             (signal_chart_id, strategy, int(entered), int(is_live),
-             source_channel, ml_score, int(is_ai_override)),
+             source_channel, ml_score, int(is_ai_override), skip_reason),
         )
         self._conn.commit()
         return cursor.lastrowid
