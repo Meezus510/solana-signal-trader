@@ -182,11 +182,44 @@ def load_current_config() -> dict:
 # Prompt builder
 # ---------------------------------------------------------------------------
 
+AUTONOMOUS_CONTROL = """
+===== WHAT THE STRATEGY TUNER CONTROLS AUTONOMOUSLY =====
+The strategy_tuner agent runs on a schedule and writes directly to strategy_config.json.
+It does NOT need human approval. When you recommend changes, clearly distinguish:
+  - AUTONOMOUS: things the tuner will handle itself on its next run
+  - MANUAL: things that require a human to act (e.g. code changes, infrastructure)
+
+STRATEGY PERMISSIONS:
+  quick_pop, trend_rider, infinite_moonbag (BASE strategies)
+    → NOT autonomously controlled — changes require manual code/config edits by a human.
+      The tuner reads their trade outcomes as training data but does NOT tune them.
+
+  trend_rider_chart_reanalyze, infinite_moonbag_chart (CHART variants)
+    → FULL CONTROL: can change TP levels, stop_loss_pct, trailing_stop_pct,
+      timeout_minutes, pump_ratio_max, use_reanalyze delays, ML params, live_trading
+
+  quick_pop_chart_ml (ML variant)
+    → ML ONLY: can change ml_min_score, ml_high/max_score_threshold,
+      ml_size_multiplier, ml_max_size_multiplier, ml_k, ml_halflife_days,
+      ml_score_low_pct, ml_score_high_pct, live_trading
+    → CANNOT change: TP levels, stop_loss_pct, trailing_stop_pct, chart filter settings
+
+ALL CONTROLLED STRATEGIES: the tuner can set live_trading=true to enable real-money
+  trading autonomously. It will only do so when data justifies it. Currently all paper-only.
+
+GUARDRAIL BANDS (tuner is clamped to these ranges):
+  ml_min_score:          [2.0, 7.0]
+  stop_loss_pct:         [0.10, 0.35]
+  trailing_stop_pct:     [0.10, 0.40]
+  timeout_minutes:       [20.0, 120.0]
+"""
+
+
 def build_prompt(data: dict, question: str) -> str:
     return f"""You are the AI analyst for a live Solana memecoin trading bot.
 Below is a complete snapshot of the system state. Answer the user's question
 based only on this data — be specific, quantitative, and actionable.
-
+{AUTONOMOUS_CONTROL}
 ===== CURRENT CONFIG =====
 {json.dumps(data['config'], indent=2)}
 

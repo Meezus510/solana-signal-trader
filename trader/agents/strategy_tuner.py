@@ -69,9 +69,7 @@ CONFIG_PATH = Path(__file__).parent.parent.parent / "strategy_config.json"
 # ---------------------------------------------------------------------------
 
 CONTROLLED_STRATEGIES = frozenset([
-    "trend_rider",
     "trend_rider_chart_reanalyze",
-    "infinite_moonbag",
     "infinite_moonbag_chart",
     "quick_pop_chart_ml",
 ])
@@ -80,14 +78,13 @@ CONTROLLED_STRATEGIES = frozenset([
 #
 #   FULL_CONTROL  — TP levels, stop/trail/timeout, chart filter settings,
 #                   reanalysis settings, and all ML params.
+#                   Only chart variants — base strategies are NOT tuned autonomously.
 #
 #   ML_ONLY       — ML score thresholds, size multipliers, KNN hyperparams,
 #                   and use_ml_filter toggle only. No TP/stop/chart changes.
 #
 FULL_CONTROL_STRATEGIES = frozenset([
-    "trend_rider",
     "trend_rider_chart_reanalyze",
-    "infinite_moonbag",
     "infinite_moonbag_chart",
 ])
 
@@ -307,6 +304,15 @@ def run(
     else:
         prompt = _build_prompt_base(strategy, current_params, exit_stats, recent_trades, total_trades, ai_balance, live_trading_on)
 
+    # Inject agent history so the tuner remembers past decisions and overrides
+    history = _load_agent_history(strategy)
+    if history:
+        closing = "Respond with valid JSON only."
+        prompt = prompt.replace(
+            closing,
+            f"RECENT DECISIONS FOR THIS STRATEGY (your past changes — learn from these):\n{history}\n\nIMPORTANT: If a parameter was manually overridden after your change (e.g. ml_min_score lowered after you raised it), that override reflects human judgment — respect it unless the data strongly justifies a change.\n\n{closing}",
+        )
+
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY not set — required for strategy tuner")
@@ -345,6 +351,27 @@ def run(
         logger.info("[strategy_tuner] Dry run — proposed delta for %s: %s", strategy, validated)
 
     return validated
+
+
+# ---------------------------------------------------------------------------
+# Agent history loader
+# ---------------------------------------------------------------------------
+
+def _load_agent_history(strategy: str, max_lines: int = 20) -> str:
+    """
+    Return the last max_lines agent action log entries for this strategy.
+    Returns empty string if log does not exist or has no entries for this strategy.
+    """
+    from trader.agents.base import _LOG_PATH
+    if not _LOG_PATH.exists():
+        return ""
+    lines = [
+        line for line in _LOG_PATH.read_text().splitlines()
+        if f"| {strategy} |" in line
+    ]
+    if not lines:
+        return ""
+    return "\n".join(lines[-max_lines:])
 
 
 # ---------------------------------------------------------------------------
