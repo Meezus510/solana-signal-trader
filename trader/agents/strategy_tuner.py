@@ -428,8 +428,27 @@ TRADING MODE:
   quick_pop_chart_ml — LIVE (real money, counts toward AI balance)
   All other strategies — PAPER ONLY (no real money at risk, used for research and comparison)
 
-Your primary goal is to maximise PnL for quick_pop_chart_ml since it is the only live strategy.
-For paper strategies, optimise parameters so they are ready to go live if performance justifies it.
+IMPORTANT CONTEXT — read before interpreting PnL:
+  1. The AI balance shown above is the ONLY real money in this system. Every other strategy
+     is paper trading — no real money is at risk. Paper trading exists purely to collect
+     labelled trade data and test parameter configurations so that when a paper strategy
+     goes live, it has the best possible chance of being profitable from day one.
+  2. We are in the early calibration phase. The system only recently started live trading.
+     Early negative PnL in quick_pop_chart_ml likely includes pre-ML backfill trades
+     (low-confidence signals that the ML filter at score ≥ 2.5 now blocks). Those losses
+     are from BEFORE the filter was tuned — do not treat them as evidence the strategy is broken.
+     Judge current performance only on trades with a non-null ml_score.
+  3. Paper strategies (trend_rider_chart_reanalyze, infinite_moonbag_chart) have a dual goal:
+     (a) accumulate labelled trade history so their ML models can be trained, AND
+     (b) trend toward positive PnL so they are ready to go live when performance justifies it.
+     Paper PnL does not affect the AI balance, but positive paper PnL is the target direction —
+     a paper strategy losing money is not achieving its purpose.
+  4. If you see mostly negative PnL across the board, separate pre-ML trades (ml_score NULL)
+     from ML-scored trades (ml_score IS NOT NULL). Pre-ML trades are historical noise.
+     Your tuning decisions should be driven by ML-scored trades only.
+
+Your primary goal is to grow the AI balance by maximising PnL for quick_pop_chart_ml.
+All paper trading supports that goal — it is the research lab that feeds the live strategy.
 live_trading is set by the operator and cannot be changed here.
 """
 
