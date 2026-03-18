@@ -417,10 +417,13 @@ SERVICE SURVIVAL CONTEXT (read carefully — this affects your decisions):
   Still needed:     ${max(0.0, profit_needed):.2f}
   Deadline:         {_AI_DEADLINE}  — {urgency}
 
-The AI balance is only affected by strategies with live_trading=true.
-If the service cannot reach ${_AI_PROFIT_TARGET:.2f} profit by {_AI_DEADLINE}, it will be shut down.
-Factor this urgency into your decisions — prioritise parameter changes that improve win rate and PnL.
-Note: live_trading is set by the operator and cannot be changed here.
+TRADING MODE:
+  quick_pop_chart_ml — LIVE (real money, counts toward AI balance)
+  All other strategies — PAPER ONLY (no real money at risk, used for research and comparison)
+
+Your primary goal is to maximise PnL for quick_pop_chart_ml since it is the only live strategy.
+For paper strategies, optimise parameters so they are ready to go live if performance justifies it.
+live_trading is set by the operator and cannot be changed here.
 """
 
 
