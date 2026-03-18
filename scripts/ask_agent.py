@@ -191,21 +191,25 @@ It does NOT need human approval. When you recommend changes, clearly distinguish
 
 STRATEGY PERMISSIONS:
   quick_pop, trend_rider, infinite_moonbag (BASE strategies)
-    → NOT autonomously controlled — changes require manual code/config edits by a human.
-      The tuner reads their trade outcomes as training data but does NOT tune them.
+    → NOT autonomously controlled — changes require manual edits by a human.
+      The tuner uses their closed trade outcomes as ML training data only.
 
-  trend_rider_chart_reanalyze, infinite_moonbag_chart (CHART variants)
-    → FULL CONTROL: can change TP levels, stop_loss_pct, trailing_stop_pct,
-      timeout_minutes, pump_ratio_max, use_reanalyze delays, ML params, live_trading
+  trend_rider_chart_reanalyze, infinite_moonbag_chart (CHART variants — FULL CONTROL)
+    → Can autonomously change: TP levels, stop_loss_pct, trailing_stop_pct,
+      timeout_minutes, pump_ratio_max, use_reanalyze + all delay params,
+      use_ml_filter (CAN ENABLE ML FILTERING), all ML params, live_trading
 
-  quick_pop_chart_ml (ML variant)
-    → ML ONLY: can change ml_min_score, ml_high/max_score_threshold,
+  quick_pop_chart_ml (ML variant — ML ONLY)
+    → Can autonomously change: ml_min_score, ml_high/max_score_threshold,
       ml_size_multiplier, ml_max_size_multiplier, ml_k, ml_halflife_days,
       ml_score_low_pct, ml_score_high_pct, live_trading
-    → CANNOT change: TP levels, stop_loss_pct, trailing_stop_pct, chart filter settings
+    → CANNOT change: TP levels, stop_loss_pct, trailing_stop_pct, chart/reanalyze settings
 
-ALL CONTROLLED STRATEGIES: the tuner can set live_trading=true to enable real-money
-  trading autonomously. It will only do so when data justifies it. Currently all paper-only.
+KEY AUTONOMOUS LEVERS:
+  live_trading      — can be set true/false for any controlled strategy at any time
+  use_ml_filter     — can be enabled for chart variants when >= 20 scored trades exist
+  use_chart_filter  — can be toggled for chart variants based on filter performance
+  use_reanalyze     — can be enabled/disabled based on whether re-entries outperform
 
 GUARDRAIL BANDS (tuner is clamped to these ranges):
   ml_min_score:          [2.0, 7.0]

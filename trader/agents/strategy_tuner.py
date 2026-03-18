@@ -304,14 +304,24 @@ def run(
     else:
         prompt = _build_prompt_base(strategy, current_params, exit_stats, recent_trades, total_trades, ai_balance, live_trading_on)
 
-    # Inject agent history so the tuner remembers past decisions and overrides
+    # Inject agent history so the tuner remembers past decisions and overrides.
+    # Placed at the very end of the prompt so it is the last thing seen before responding.
     history = _load_agent_history(strategy)
-    if history:
-        closing = "Respond with valid JSON only."
-        prompt = prompt.replace(
-            closing,
-            f"RECENT DECISIONS FOR THIS STRATEGY (your past changes — learn from these):\n{history}\n\nIMPORTANT: If a parameter was manually overridden after your change (e.g. ml_min_score lowered after you raised it), that override reflects human judgment — respect it unless the data strongly justifies a change.\n\n{closing}",
-        )
+    history_block = (
+        f"\n\n{'='*60}\n"
+        f"YOUR PREVIOUS ACTIONS FOR {strategy.upper()} — READ THIS BEFORE RESPONDING\n"
+        f"{'='*60}\n"
+        f"{history}\n\n"
+        f"CRITICAL: Review every line above before proposing changes.\n"
+        f"- If you previously changed a value and it was manually overridden by a human,\n"
+        f"  that override reflects human judgment. Do NOT undo it without strong data.\n"
+        f"- If you keep repeating the same change, ask yourself: is the data actually\n"
+        f"  supporting this, or are you reacting to noise?\n"
+        f"{'='*60}\n"
+        if history else
+        f"\n\n(No previous actions recorded for {strategy} yet.)\n"
+    )
+    prompt = prompt + history_block
 
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
@@ -608,32 +618,41 @@ SCORE-BUCKET PERFORMANCE (ml_score buckets, chart-filtered trades only):
 {json.dumps(score_buckets, indent=2) if score_buckets else "  No score bucket data yet (use_ml_filter may be disabled)."}
 
 CHART FILTER TUNING:
-- use_chart_filter: toggle the 1-minute chart filter on (true) or off (false).
-  On = only enter if pump_ratio < pump_ratio_max AND volume not dying.
-  Off = enter all signals regardless of chart shape (ML filter still applies if enabled).
-- pump_ratio_max: how pumped a token can be before skipping. Lower = stricter.
-  Current value skips if price is already >{current_params.get('pump_ratio_max', 3.5)}x above recent low.
-  Raise this for moonbag/trend strategies where "pumped" tokens can still be early in a move.
+- use_chart_filter: YOU control this. Enable (true) to only enter signals where the
+  1-minute chart shows price < pump_ratio_max above recent low AND volume is not dying.
+  This is a strong quality gate — enable it if unfiltered signals are underperforming.
+  Disable only if the filter is blocking too many winners (check skipped signal analysis).
+- pump_ratio_max: how extended a token can be before skipping. Current={current_params.get('pump_ratio_max', 3.5)}x.
+  Lower = stricter entries. Raise for moonbag/trend strategies where early-pump entries
+  can still be profitable. Lower for scalp strategies where overextended = bad entry.
 
-REANALYSIS TUNING:
-- use_reanalyze: when true, a skipped signal is re-checked after a delay.
-  Useful when tokens briefly look pumped or have dying volume but may recover.
-  Disable if you see many late re-entries underperforming fresh signals.
-- reanalyze_pump_delay: seconds to wait before re-checking a pump-skipped signal.
-  Shorter = re-enter sooner (more risk, better price if it retraces). Longer = wait for retrace.
-- reanalyze_vol_delay: seconds to wait before re-checking a dying-volume skip.
-  Volume can flip quickly so shorter delays (60-300s) tend to work better here.
-- reanalyze_both_delay: seconds to wait when both pump AND dying volume triggered.
-  Worst-case scenario — longer delays give the token more time to recover.
+REANALYSIS FILTER TUNING:
+- use_reanalyze: YOU control this. When enabled, signals skipped by the chart filter are
+  re-evaluated after a delay — useful when tokens briefly look pumped but may retrace.
+  DISABLE if re-entered signals consistently underperform fresh signals (check exit data).
+  ENABLE if many good trades are being skipped and recovering after a short delay.
+- reanalyze_pump_delay: seconds before re-checking a pump-skipped signal (current={current_params.get('reanalyze_pump_delay', 480.0)}s).
+  Shorter = re-enter sooner. Longer = wait for a proper retrace.
+- reanalyze_vol_delay: seconds before re-checking a dying-volume skip (current={current_params.get('reanalyze_vol_delay', 240.0)}s).
+  Volume recovers fast — keep this shorter (60–300s).
+- reanalyze_both_delay: used when both pump AND dying volume triggered (current={current_params.get('reanalyze_both_delay', 600.0)}s).
+  Worst-case setup — longer delay gives more time to recover.
 
-ML PARAMETER TUNING (only if score bucket data is present):
+ML FILTER TUNING:
+- use_ml_filter: YOU ARE EXPECTED TO ENABLE THIS (set true) once >= 20 closed trades
+  exist with meaningful score bucket variance. This is a critical lever for profitability
+  — proactively enable it when data is ready. Do not leave it off indefinitely.
 - Buckets with consistently negative avg_pnl_pct → raise ml_min_score to exclude them.
 - High-win-rate bucket floor → set ml_high_score_threshold there.
-- use_ml_filter: set true to enable ML gating. Only enable if >= 20 score-bucketed trades.
 - ml_k: number of KNN neighbours. Lower = more reactive to recent patterns.
-- ml_halflife_days: recency decay. Lower = recent trades outweigh older data more.
-- ml_score_low_pct / ml_score_high_pct: PnL% range mapped to scores 0 and 10.
-  Recalibrate if your actual trade PnL range differs from the current mapping.
+- ml_halflife_days: recency decay. Lower = recent trades outweigh older ones more.
+- ml_score_low_pct / ml_score_high_pct: PnL% range mapped to scores 0–10.
+  Recalibrate if actual trade PnL range consistently falls outside the current mapping.
+
+LIVE TRADING:
+- You can set live_trading: true if this strategy shows consistent profitability.
+  Real capital counts toward the AI balance target ($300 by 2026-04-10).
+  You can also set it back to false if performance deteriorates significantly.
 
 Return ONLY a JSON object. Include any of these keys you want to change plus a "reason" string.
 tp_levels must be the full list of {tp_count} [multiple, fraction] pair(s) if changing any TP.
