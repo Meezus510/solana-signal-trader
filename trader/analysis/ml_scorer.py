@@ -96,6 +96,12 @@ _SCORE_HIGH_PCT: float =  85.0   # maps to score 10
 # Encoding for the 1-minute vol_trend label → numeric feature
 _VOL_TREND_ENC: dict[str, float] = {"RISING": 1.0, "FLAT": 0.5, "DYING": 0.0}
 
+# Encoding for source channel → numeric feature (0.0 = unknown/other)
+_CHANNEL_ENC: dict[str, float] = {
+    "WizzyTrades": 1.0,
+    "WizzyCasino": 2.0,
+}
+
 
 # ---------------------------------------------------------------------------
 # Feature extraction
@@ -106,14 +112,17 @@ def extract_features(
     pump_ratio_1m: Optional[float] = None,
     vol_trend_1m: Optional[str] = None,
     pair_stats: Optional[dict] = None,
+    source_channel: Optional[str] = None,
 ) -> Optional[list[float]]:
     """
-    Extract a 13-element feature vector from candle data + optional pair stats.
+    Extract a 14-element feature vector from candle data + optional pair stats.
 
     Features 1-6: OHLCV-derived (resolution-agnostic).
     Features 7-8: 1-minute chart filter context (fall back to neutral).
     Features 9-13: Moralis live pair stats (fall back to neutral when unavailable
                    — old snapshots without pair stats still produce valid vectors).
+    Feature 14: source channel encoded as float (0.0 = unknown/other).
+                Gracefully neutral until multi-channel data accumulates.
 
     pair_stats dict keys (all optional, each falls back independently):
         buys_5m, sells_5m, buy_volume_1h, total_volume_1h,
@@ -202,12 +211,16 @@ def extract_features(
     liq_1h = ps.get("liquidity_change_1h_pct", 0.0) or 0.0
     f_liquidity_change_1h = max(-1.0, min(1.0, liq_1h / 20.0))
 
+    # 14. Source channel: encoded as float; 0.0 = unknown/other
+    f_channel = _CHANNEL_ENC.get(source_channel or "", 0.0)
+
     return [
         pump_ratio, vol_momentum, price_slope, recent_momentum,
         volatility, candle_count_norm,
         f_pump_1m, f_vol_trend_1m,
         f_buy_ratio_5m, f_activity_5m, f_price_change_5m,
         f_buy_vol_ratio_1h, f_liquidity_change_1h,
+        f_channel,
     ]
 
 
@@ -274,7 +287,7 @@ class ChartMLScorer:
         self._score_low_pct = score_low_pct
         self._score_high_pct = score_high_pct
 
-    def score(self, candles: list, chart_ctx=None, pair_stats=None) -> Optional[float]:
+    def score(self, candles: list, chart_ctx=None, pair_stats=None, source_channel: str = "") -> Optional[float]:
         """
         Score incoming candles against historical closed snapshots.
 
@@ -313,6 +326,7 @@ class ChartMLScorer:
             pump_ratio_1m=chart_ctx.pump_ratio if chart_ctx else None,
             vol_trend_1m=chart_ctx.vol_trend if chart_ctx else None,
             pair_stats=pair_stats,
+            source_channel=source_channel,
         )
         if query_feat is None:
             return None
@@ -329,6 +343,7 @@ class ChartMLScorer:
                 pump_ratio_1m=snap.get("pump_ratio"),
                 vol_trend_1m=snap.get("vol_trend"),
                 pair_stats=snap_pair_stats,
+                source_channel=snap.get("source_channel", ""),
             )
             if feat is None:
                 continue

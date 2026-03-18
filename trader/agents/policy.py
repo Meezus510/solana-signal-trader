@@ -145,6 +145,7 @@ def _hard_preflight(ctx: dict) -> dict | None:
 
 def _build_prompt(ctx: dict, strategy: str) -> str:
     ml_score              = ctx.get("ml_score")
+    ml_min_score          = ctx.get("ml_min_score", 5.0)
     used_moralis_10s      = ctx.get("used_moralis_10s", False)
     used_birdeye_fallback = ctx.get("used_birdeye_fallback", False)
     pair_stats_available  = ctx.get("pair_stats_available", False)
@@ -169,7 +170,7 @@ def _build_prompt(ctx: dict, strategy: str) -> str:
 Strategy: {strategy}
 
 SIGNAL CONTEXT:
-  ml_score:              {ml_score}   (KNN confidence score, 0–10; bot requires ≥5.0 to enter)
+  ml_score:              {ml_score}   (KNN confidence score, 0–10; bot requires ≥{ml_min_score} to enter)
   liquidity_usd:         {"unknown" if liquidity_usd is None else f"${liquidity_usd:,.0f}"}
   slippage_bps:          {slippage_bps} bps{"  (unknown)" if slippage_bps == 0 else ""}
 
@@ -185,7 +186,7 @@ DECISION RULES TO APPLY:
 2. Missing pair stats → features 9-13 are neutral, not real → apply score_adjustment in [-0.3, 0.0]
 3. Slippage > 200 bps → reduce size (buy_size_multiplier ≤ 0.75)
 4. Liquidity < $20,000 → reduce size (buy_size_multiplier ≤ 0.5)
-5. Adjusted score (ml_score + effective_score_adjustment) < 5.0 → set allow_trade = false
+5. Adjusted score (ml_score + effective_score_adjustment) < {ml_min_score} → set allow_trade = false
 6. Otherwise allow_trade = true and size normally (buy_size_multiplier = 1.0)
 
 ALLOWED OUTPUT BANDS (Python will clamp to these regardless):

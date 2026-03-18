@@ -54,33 +54,36 @@ CREATE TABLE IF NOT EXISTS positions (
     last_price              REAL,
     opened_at               TEXT NOT NULL,
     closed_at               TEXT,
+    source_channel          TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (strategy, mint)
 )
 """
 
 _CREATE_TRADES = """
 CREATE TABLE IF NOT EXISTS trades (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts       TEXT NOT NULL,
-    strategy TEXT NOT NULL DEFAULT 'default',
-    event    TEXT NOT NULL,
-    symbol   TEXT NOT NULL,
-    mint     TEXT NOT NULL,
-    price    REAL NOT NULL,
-    quantity REAL NOT NULL,
-    pnl      REAL NOT NULL
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             TEXT NOT NULL,
+    strategy       TEXT NOT NULL DEFAULT 'default',
+    event          TEXT NOT NULL,
+    symbol         TEXT NOT NULL,
+    mint           TEXT NOT NULL,
+    price          REAL NOT NULL,
+    quantity       REAL NOT NULL,
+    pnl            REAL NOT NULL,
+    source_channel TEXT NOT NULL DEFAULT ''
 )
 """
 
 _CREATE_SIGNALS = """
 CREATE TABLE IF NOT EXISTS signals (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts       TEXT NOT NULL,
-    strategy TEXT,
-    msg_id   INTEGER,
-    outcome  TEXT NOT NULL,
-    symbol   TEXT,
-    mint     TEXT
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             TEXT NOT NULL,
+    strategy       TEXT,
+    msg_id         INTEGER,
+    outcome        TEXT NOT NULL,
+    symbol         TEXT,
+    mint           TEXT,
+    source_channel TEXT NOT NULL DEFAULT ''
 )
 """
 
@@ -134,7 +137,8 @@ CREATE TABLE IF NOT EXISTS signal_charts (
     candles_json    TEXT NOT NULL,
     candles_1m_json TEXT,
     pair_stats_json TEXT,
-    ml_score        REAL
+    ml_score        REAL,
+    source_channel  TEXT NOT NULL DEFAULT ''
 )
 """
 
@@ -150,7 +154,8 @@ CREATE TABLE IF NOT EXISTS strategy_outcomes (
     outcome_hold_secs    REAL,
     outcome_max_gain_pct REAL,
     closed               INTEGER NOT NULL DEFAULT 0,
-    is_live              INTEGER NOT NULL DEFAULT 0
+    is_live              INTEGER NOT NULL DEFAULT 0,
+    source_channel       TEXT NOT NULL DEFAULT ''
 )
 """
 
@@ -191,13 +196,43 @@ class TradeDatabase:
 
     def _migrate(self, c: sqlite3.Connection) -> None:
         """Add columns introduced after initial schema (safe to re-run)."""
+        _LEGACY_CHANNEL = "WizzyTrades"
+
         for col, definition in [
-            ("tp3_hit", "INTEGER NOT NULL DEFAULT 0"),
-            ("tp4_hit", "INTEGER NOT NULL DEFAULT 0"),
+            ("tp3_hit",        "INTEGER NOT NULL DEFAULT 0"),
+            ("tp4_hit",        "INTEGER NOT NULL DEFAULT 0"),
+            ("source_channel", "TEXT NOT NULL DEFAULT ''"),
         ]:
             try:
                 c.execute(f"ALTER TABLE positions ADD COLUMN {col} {definition}")
                 logger.info("[DB] Migrated: added column %s to positions", col)
+                if col == "source_channel":
+                    c.execute("UPDATE positions SET source_channel = ?", (_LEGACY_CHANNEL,))
+                    logger.info("[DB] Backfilled positions.source_channel = '%s'", _LEGACY_CHANNEL)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+        # trades columns added after initial release
+        for col, definition in [
+            ("source_channel", "TEXT NOT NULL DEFAULT ''"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE trades ADD COLUMN {col} {definition}")
+                logger.info("[DB] Migrated: added column %s to trades", col)
+                c.execute("UPDATE trades SET source_channel = ?", (_LEGACY_CHANNEL,))
+                logger.info("[DB] Backfilled trades.source_channel = '%s'", _LEGACY_CHANNEL)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+        # signals columns added after initial release
+        for col, definition in [
+            ("source_channel", "TEXT NOT NULL DEFAULT ''"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE signals ADD COLUMN {col} {definition}")
+                logger.info("[DB] Migrated: added column %s to signals", col)
+                c.execute("UPDATE signals SET source_channel = ?", (_LEGACY_CHANNEL,))
+                logger.info("[DB] Backfilled signals.source_channel = '%s'", _LEGACY_CHANNEL)
             except sqlite3.OperationalError:
                 pass  # column already exists
 
@@ -205,10 +240,14 @@ class TradeDatabase:
         for col, definition in [
             ("outcome_pnl_usd", "REAL"),
             ("is_live",         "INTEGER NOT NULL DEFAULT 0"),
+            ("source_channel",  "TEXT NOT NULL DEFAULT ''"),
         ]:
             try:
                 c.execute(f"ALTER TABLE strategy_outcomes ADD COLUMN {col} {definition}")
                 logger.info("[DB] Migrated: added column %s to strategy_outcomes", col)
+                if col == "source_channel":
+                    c.execute("UPDATE strategy_outcomes SET source_channel = ?", (_LEGACY_CHANNEL,))
+                    logger.info("[DB] Backfilled strategy_outcomes.source_channel = '%s'", _LEGACY_CHANNEL)
             except sqlite3.OperationalError:
                 pass  # column already exists
 
@@ -221,6 +260,18 @@ class TradeDatabase:
             try:
                 c.execute(f"ALTER TABLE chart_snapshots ADD COLUMN {col} {definition}")
                 logger.info("[DB] Migrated: added column %s to chart_snapshots", col)
+            except sqlite3.OperationalError:
+                pass  # column already exists
+
+        # signal_charts columns added after initial release
+        for col, definition in [
+            ("source_channel", "TEXT NOT NULL DEFAULT ''"),
+        ]:
+            try:
+                c.execute(f"ALTER TABLE signal_charts ADD COLUMN {col} {definition}")
+                logger.info("[DB] Migrated: added column %s to signal_charts", col)
+                c.execute("UPDATE signal_charts SET source_channel = ?", (_LEGACY_CHANNEL,))
+                logger.info("[DB] Backfilled signal_charts.source_channel = '%s'", _LEGACY_CHANNEL)
             except sqlite3.OperationalError:
                 pass  # column already exists
 
@@ -328,7 +379,7 @@ class TradeDatabase:
                 :realized_pnl_usd, :total_proceeds_usd, :total_fees_usd,
                 :partial_take_profit_hit, :tp2_hit, :tp3_hit, :tp4_hit,
                 :sell_reason, :last_price,
-                :opened_at, :closed_at
+                :opened_at, :closed_at, :source_channel
             )
             """,
             {
@@ -357,6 +408,7 @@ class TradeDatabase:
                 "last_price": position.last_price,
                 "opened_at": position.opened_at.isoformat(),
                 "closed_at": position.closed_at.isoformat() if position.closed_at else None,
+                "source_channel": position.source_channel,
             },
         )
         self._conn.commit()
@@ -371,7 +423,8 @@ class TradeDatabase:
                    trailing_active, trailing_stop_pct, trailing_stop_price,
                    realized_pnl_usd, total_proceeds_usd, total_fees_usd,
                    partial_take_profit_hit, tp2_hit, tp3_hit, tp4_hit,
-                   sell_reason, last_price, opened_at, closed_at
+                   sell_reason, last_price, opened_at, closed_at,
+                   COALESCE(source_channel, '')
             FROM positions WHERE status = 'OPEN' AND strategy = ?
             """,
             (strategy_name,),
@@ -390,7 +443,7 @@ class TradeDatabase:
             realized_pnl_usd, total_proceeds_usd, total_fees_usd,
             partial_take_profit_hit, tp2_hit, tp3_hit, tp4_hit,
             sell_reason, last_price,
-            opened_at, closed_at,
+            opened_at, closed_at, source_channel,
         ) = row
         return Position(
             strategy_name=strategy,
@@ -418,6 +471,7 @@ class TradeDatabase:
             last_price=last_price,
             opened_at=datetime.fromisoformat(opened_at),
             closed_at=datetime.fromisoformat(closed_at) if closed_at else None,
+            source_channel=source_channel or "",
         )
 
     # ------------------------------------------------------------------
@@ -452,8 +506,8 @@ class TradeDatabase:
         pnl: float,
     ) -> None:
         self._conn.execute(
-            "INSERT INTO trades (ts, strategy, event, symbol, mint, price, quantity, pnl) "
-            "VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO trades (ts, strategy, event, symbol, mint, price, quantity, pnl, source_channel) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
             (
                 datetime.now(timezone.utc).isoformat(),
                 position.strategy_name,
@@ -463,6 +517,7 @@ class TradeDatabase:
                 price,
                 quantity,
                 pnl,
+                position.source_channel,
             ),
         )
         self._conn.commit()
@@ -478,10 +533,12 @@ class TradeDatabase:
         symbol: Optional[str] = None,
         mint: Optional[str] = None,
         strategy: Optional[str] = None,
+        source_channel: str = "",
     ) -> None:
         self._conn.execute(
-            "INSERT INTO signals (ts, strategy, msg_id, outcome, symbol, mint) VALUES (?,?,?,?,?,?)",
-            (datetime.now(timezone.utc).isoformat(), strategy, msg_id, outcome, symbol, mint),
+            "INSERT INTO signals (ts, strategy, msg_id, outcome, symbol, mint, source_channel) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (datetime.now(timezone.utc).isoformat(), strategy, msg_id, outcome, symbol, mint, source_channel),
         )
         self._conn.commit()
 
@@ -516,6 +573,7 @@ class TradeDatabase:
         pair_stats: Optional[dict] = None,
         candles_1m: Optional[list] = None,
         ts: Optional[str] = None,
+        source_channel: str = "",
     ) -> int:
         """
         Persist OHLCV candles + signal metadata once per signal into signal_charts.
@@ -544,8 +602,8 @@ class TradeDatabase:
             INSERT INTO signal_charts
                 (ts, symbol, mint, entry_price,
                  pump_ratio, vol_trend, candle_count, candles_json,
-                 candles_1m_json, pair_stats_json, ml_score)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                 candles_1m_json, pair_stats_json, ml_score, source_channel)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 row_ts,
@@ -559,6 +617,7 @@ class TradeDatabase:
                 candles_1m_json,
                 json.dumps(pair_stats) if pair_stats else None,
                 ml_score,
+                source_channel,
             ),
         )
         self._conn.commit()
@@ -570,6 +629,7 @@ class TradeDatabase:
         strategy: str,
         entered: bool,
         is_live: bool = False,
+        source_channel: str = "",
     ) -> int:
         """
         Insert a strategy_outcomes row linked to an existing signal_charts row.
@@ -582,10 +642,10 @@ class TradeDatabase:
         """
         cursor = self._conn.execute(
             """
-            INSERT INTO strategy_outcomes (signal_chart_id, strategy, entered, is_live)
-            VALUES (?,?,?,?)
+            INSERT INTO strategy_outcomes (signal_chart_id, strategy, entered, is_live, source_channel)
+            VALUES (?,?,?,?,?)
             """,
-            (signal_chart_id, strategy, int(entered), int(is_live)),
+            (signal_chart_id, strategy, int(entered), int(is_live), source_channel),
         )
         self._conn.commit()
         return cursor.lastrowid
@@ -599,7 +659,8 @@ class TradeDatabase:
         rows = self._conn.execute(
             """
             SELECT sc.ts, sc.candles_json, so.outcome_pnl_pct,
-                   sc.pump_ratio, sc.vol_trend, sc.pair_stats_json
+                   sc.pump_ratio, sc.vol_trend, sc.pair_stats_json,
+                   COALESCE(so.source_channel, sc.source_channel, '')
               FROM strategy_outcomes so
               JOIN signal_charts sc ON so.signal_chart_id = sc.id
              WHERE so.strategy = ?
@@ -617,6 +678,7 @@ class TradeDatabase:
                 "pump_ratio":      r[3],
                 "vol_trend":       r[4],
                 "pair_stats_json": r[5],
+                "source_channel":  r[6],
             }
             for r in rows
         ]

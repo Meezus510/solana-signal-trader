@@ -6,11 +6,12 @@ signal quality, detect fake/inflated market cap claims, and assess whether
 the channel is worth adding to the trading bot's monitoring list.
 
 Usage:
-    python analyze_channel.py <channel_username> [--limit 25]
+    python analyze_channel.py <channel_username_or_invite_link> [--limit 25]
 
 Examples:
     python analyze_channel.py AlphaStrikeSol
     python analyze_channel.py WizzyTrades --limit 30
+    python analyze_channel.py "https://t.me/+JBXfpFUOHLM4NDk0" --limit 30
 
 Requires ANTHROPIC_API_KEY in your .env file.
 """
@@ -29,6 +30,7 @@ import anthropic
 from dotenv import load_dotenv
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.tl.functions.messages import ImportChatInviteRequest
 
 load_dotenv()
 
@@ -48,6 +50,17 @@ def _require(key: str) -> str:
 # Telegram fetch
 # ---------------------------------------------------------------------------
 
+def _parse_invite_hash(channel: str) -> Optional[str]:
+    """Return the invite hash if `channel` looks like a private invite link, else None."""
+    # Handles: https://t.me/+HASH  or  t.me/+HASH  or  just +HASH
+    for prefix in ("https://t.me/+", "http://t.me/+", "t.me/+"):
+        if channel.startswith(prefix):
+            return channel[len(prefix):]
+    if channel.startswith("+") and len(channel) > 5:
+        return channel[1:]
+    return None
+
+
 async def fetch_messages(channel: str, limit: int) -> list[dict]:
     """Connect to Telegram and pull the last `limit` messages from `channel`."""
     tg_api_id    = int(_require("TG_API_ID"))
@@ -64,12 +77,39 @@ async def fetch_messages(channel: str, limit: int) -> list[dict]:
     me = await client.get_me()
     print(f"[TG] Authenticated as: {me.username or me.first_name}")
 
-    try:
-        entity = await client.get_entity(channel)
-    except Exception as exc:
-        print(f"[ERROR] Could not resolve channel '{channel}': {exc}", file=sys.stderr)
-        await client.disconnect()
-        sys.exit(1)
+    invite_hash = _parse_invite_hash(channel)
+    if invite_hash:
+        print(f"[TG] Private invite link detected — joining channel...")
+        try:
+            result = await client(ImportChatInviteRequest(invite_hash))
+            entity = result.chats[0]
+            channel = entity.title or channel
+            print(f"[TG] Joined: '{channel}'")
+        except Exception as exc:
+            if "INVITE_REQUEST_SENT" in str(exc):
+                print(f"[WARN] Channel requires admin approval — join request sent.", file=sys.stderr)
+                await client.disconnect()
+                sys.exit(1)
+            elif "USER_ALREADY_PARTICIPANT" in str(exc):
+                # Already a member — resolve normally
+                try:
+                    entity = await client.get_entity(f"https://t.me/+{invite_hash}")
+                except Exception:
+                    # Fallback: re-raise original
+                    print(f"[ERROR] Already a member but could not resolve entity: {exc}", file=sys.stderr)
+                    await client.disconnect()
+                    sys.exit(1)
+            else:
+                print(f"[ERROR] Could not join channel: {exc}", file=sys.stderr)
+                await client.disconnect()
+                sys.exit(1)
+    else:
+        try:
+            entity = await client.get_entity(channel)
+        except Exception as exc:
+            print(f"[ERROR] Could not resolve channel '{channel}': {exc}", file=sys.stderr)
+            await client.disconnect()
+            sys.exit(1)
 
     print(f"[TG] Fetching last {limit} messages from '{channel}'...")
     messages = []

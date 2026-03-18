@@ -187,7 +187,7 @@ class MultiStrategyEngine:
         logger.info("[SIGNAL] %s | mint=%s | channel=%s", signal.symbol, signal.mint_address, signal.source_channel)
         signal_log.info("SIGNAL     | %-10s | %-44s | ch=%-20s", signal.symbol, signal.mint_address, signal.source_channel)
         if self._db:
-            self._db.log_signal("SIGNAL", symbol=signal.symbol, mint=signal.mint_address)
+            self._db.log_signal("SIGNAL", symbol=signal.symbol, mint=signal.mint_address, source_channel=signal.source_channel)
 
         if self._cfg.dry_run:
             logger.info("[DRY_RUN] %s — skipping Birdeye and entry", signal.symbol)
@@ -198,7 +198,7 @@ class MultiStrategyEngine:
             logger.warning("[SKIP] No live price for %s — entry aborted", signal.symbol)
             signal_log.info("NO_PRICE   | %-10s | %-44s | ch=%-20s", signal.symbol, signal.mint_address, signal.source_channel)
             if self._db:
-                self._db.log_signal("NO_PRICE", symbol=signal.symbol, mint=signal.mint_address)
+                self._db.log_signal("NO_PRICE", symbol=signal.symbol, mint=signal.mint_address, source_channel=signal.source_channel)
             return
 
         logger.info(
@@ -284,7 +284,7 @@ class MultiStrategyEngine:
             for training_strategy, scorer in self._ml_scorers.items():
                 use_moralis = training_strategy in self._ml_prefer_moralis
                 score_candles = ml_candles if use_moralis else (candles or ml_candles)
-                score = scorer.score(score_candles, chart_ctx=chart_ctx, pair_stats=pair_stats)
+                score = scorer.score(score_candles, chart_ctx=chart_ctx, pair_stats=pair_stats, source_channel=signal.source_channel)
                 ml_scores[training_strategy] = score
                 if score is not None:
                     knn_src = ml_source if use_moralis else "birdeye/1m"
@@ -309,6 +309,7 @@ class MultiStrategyEngine:
                 ml_score=chart_ml_score,
                 pair_stats=pair_stats,
                 candles_1m=candles if candles else None,
+                source_channel=signal.source_channel,
             )
 
         for runner in self._runners:
@@ -362,6 +363,7 @@ class MultiStrategyEngine:
             if runner.cfg.use_policy_agent and not ml_blocked:
                 signal_context = {
                     "ml_score":              ml_score,
+                    "ml_min_score":          runner.cfg.ml_min_score,
                     "used_moralis_10s":      ml_source.startswith("moralis"),
                     "used_birdeye_fallback": ml_source.startswith("birdeye"),
                     "pair_stats_available":  pair_stats is not None,
@@ -439,6 +441,7 @@ class MultiStrategyEngine:
                     strategy=runner.name,
                     entered=position is not None,
                     is_live=runner.cfg.live_trading,
+                    source_channel=signal.source_channel,
                 )
                 if position is not None:
                     runner.set_outcome_id(signal.mint_address, outcome_id)

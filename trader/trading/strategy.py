@@ -291,6 +291,7 @@ class StrategyRunner:
                     self._db.log_signal(
                         "CHART_SKIP", symbol=signal.symbol,
                         mint=signal.mint_address, strategy=self.name,
+                        source_channel=signal.source_channel,
                     )
                 return None
 
@@ -307,6 +308,7 @@ class StrategyRunner:
                 self._db.log_signal(
                     "DUPLICATE", symbol=signal.symbol,
                     mint=signal.mint_address, strategy=self.name,
+                    source_channel=signal.source_channel,
                 )
             return None
 
@@ -321,10 +323,12 @@ class StrategyRunner:
                 self._db.log_signal(
                     "NO_CASH", symbol=signal.symbol,
                     mint=signal.mint_address, strategy=self.name,
+                    source_channel=signal.source_channel,
                 )
             return None
 
         position.strategy_name = self.name
+        position.source_channel = signal.source_channel
         self._portfolio.add_position(position)
 
         logger.info(

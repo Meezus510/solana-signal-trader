@@ -2,7 +2,7 @@
 tests/test_ml_scorer.py — Unit tests for ChartMLScorer and supporting functions.
 
 Covers:
-- extract_features: 13-element output, neutrals when optional inputs absent,
+- extract_features: 14-element output, neutrals when optional inputs absent,
   None when fewer than 3 candles
 - zscore_normalize: zero-mean / unit-variance over training set
 - euclidean: correct distance
@@ -71,11 +71,11 @@ class MockDB:
 # ---------------------------------------------------------------------------
 
 class TestExtractFeatures:
-    def test_returns_13_features(self):
+    def test_returns_14_features(self):
         candles = _make_candles(10)
         feat = extract_features(candles)
         assert feat is not None
-        assert len(feat) == 13
+        assert len(feat) == 14
 
     def test_returns_none_for_fewer_than_3_candles(self):
         assert extract_features(_make_candles(2)) is None

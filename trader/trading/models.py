@@ -81,6 +81,9 @@ class Position:
     # Multi-strategy identity (set by StrategyRunner after buy)
     strategy_name: str = "default"
 
+    # Signal origin (set by StrategyRunner after buy)
+    source_channel: str = ""
+
 
 @dataclass
 class PortfolioState:
