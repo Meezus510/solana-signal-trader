@@ -157,6 +157,7 @@ _FORBIDDEN_KEYS = frozenset([
     "use_chart_filter", "use_reanalyze", "name", "buy_size_usd",
     "starting_cash_usd", "ml_training_strategy", "save_chart_data",
     "use_policy_agent", "timeout_min_gain_pct",
+    "live_trading",   # operator-only — agent cannot toggle live trading
 ])
 
 # Keys allowed for ML_ONLY strategies (quick_pop_chart_ml).
@@ -166,7 +167,6 @@ _ML_ONLY_ALLOWED_KEYS = frozenset([
     "ml_min_score", "ml_high_score_threshold", "ml_max_score_threshold",
     "ml_size_multiplier", "ml_max_size_multiplier",
     "ml_k", "ml_halflife_days", "ml_score_low_pct", "ml_score_high_pct",
-    "live_trading",   # can enable/disable live trading for this strategy
 ])
 
 # Keys the agent IS allowed to write (besides "reason" and "tp_levels")
@@ -181,7 +181,6 @@ _ALLOWED_SCALAR_KEYS = frozenset([
     "use_ml_filter",      # bool — validated separately
     "use_chart_filter",   # bool — validated separately
     "use_reanalyze",      # bool — validated separately
-    "live_trading",       # bool — validated separately
 ])
 
 
@@ -266,7 +265,10 @@ def run(
         )
         return {}
 
-    recent_trades = query_recent_trades(db_path, strategy, limit=20)
+    # ML strategies: only show scored trades so the agent doesn't misread
+    # pre-ML backfill data (null ml_score) as a broken scoring pipeline.
+    scored_only = strategy in ML_ONLY_STRATEGIES or strategy in _CHART_VARIANTS
+    recent_trades = query_recent_trades(db_path, strategy, limit=20, scored_only=scored_only)
 
     # Score buckets only for chart variants (they have ml_score data)
     score_buckets: list[dict] = []
@@ -416,14 +418,9 @@ SERVICE SURVIVAL CONTEXT (read carefully — this affects your decisions):
   Deadline:         {_AI_DEADLINE}  — {urgency}
 
 The AI balance is only affected by strategies with live_trading=true.
-Strategies still on paper (live_trading=false) do NOT count toward the target.
-
 If the service cannot reach ${_AI_PROFIT_TARGET:.2f} profit by {_AI_DEADLINE}, it will be shut down.
-Factor this urgency into your decisions:
-  - Enable live_trading for a strategy only when you have enough evidence it is profitable.
-  - Once live_trading is on, the AI balance rises or falls with every real trade.
-  - Prioritise strategies with the strongest track record and tightest risk controls.
-  - Do NOT enable live_trading on a strategy still showing consistent losses.
+Factor this urgency into your decisions — prioritise parameter changes that improve win rate and PnL.
+Note: live_trading is set by the operator and cannot be changed here.
 """
 
 
@@ -552,17 +549,11 @@ Analyze exit data and propose up to 3 parameter changes. Consider:
    to capture more upside before selling. If TP1 is rarely hit, lower it.
 {'5. No timeout or max_hold for this strategy — focus on stop/trail/TP only.' if is_moonbag else ''}
 
-You may also set:
-- live_trading: true to enable this strategy's trades against the AI balance,
-  or false to keep it paper-only. Only enable when the strategy shows consistent
-  profitability and you have enough evidence to trust it with real capital.
-
 Return ONLY a JSON object with the keys you want to change and a "reason" string.
 Do not include keys you are not changing.
 tp_levels must be the full list of {tp_count} [multiple, fraction] pair(s) if changing any TP.
-live_trading must be a boolean (true or false).
 
-Example: {{"stop_loss_pct": 0.27, "live_trading": false, "reason": "STOP_LOSS exits show avg_max_gain_pct 4.1% — losses are genuine, tightening stop. Not enabling live trading yet."}}
+Example: {{"stop_loss_pct": 0.27, "reason": "STOP_LOSS exits show avg_max_gain_pct 4.1% — losses are genuine, tightening stop."}}
 
 Respond with valid JSON only. No markdown, no explanation outside the JSON."""
 
@@ -692,7 +683,7 @@ Strategy: {strategy}  |  Mode: {live_status}
 Description: quick_pop_chart_ml is a fast scalp strategy that buys on momentum signals,
 sells 60% at 1.5× and 40% at 2.0×, trails at 22% below high after first TP.
 Exits after 45 minutes if TP1 not hit. Chart filter is ALWAYS enabled (not adjustable here).
-Your role is to tune the ML confidence filter and decide on live_trading status.
+Your role is to tune the ML confidence filter only. live_trading is set by the operator.
 {_urgency_section(ai_balance)}
 TOTAL CLOSED TRADES ANALYZED: {total_trades}
 
@@ -721,8 +712,12 @@ EXIT REASON BREAKDOWN:
 LAST 10 TRADES (most recent first):
 {json.dumps(recent_trades[-10:], indent=2)}
 
+NOTE: Trades shown above are only those with a non-null ml_score (scored by the KNN pipeline).
+Older trades with null ml_score predate ML scoring and are excluded — they are NOT evidence
+of a broken pipeline. If no trades appear above, the ML filter is new and has no scored history yet.
+
 SCORE-BUCKET PERFORMANCE (ml_score buckets, chart-filtered trades only):
-{json.dumps(score_buckets, indent=2) if score_buckets else "  No score bucket data yet (use_ml_filter may be disabled or not enough trades)."}
+{json.dumps(score_buckets, indent=2) if score_buckets else "  No score bucket data yet — ML filter is new. Do not raise ml_min_score without bucket evidence."}
 {_format_skipped_section(skipped_stats, _BASE_STRATEGY.get(strategy, "")) if skipped_stats is not None else ""}
 ML GUARDRAILS (you must stay within these bounds):
   ml_min_score:            [0.0, 9.0]

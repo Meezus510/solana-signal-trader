@@ -212,18 +212,28 @@ def query_exit_stats(db_path: str, strategy: str = "quick_pop_chart_ml") -> list
     ]
 
 
-def query_recent_trades(db_path: str, strategy: str = "quick_pop_chart_ml", limit: int = 30) -> list[dict]:
+def query_recent_trades(
+    db_path: str,
+    strategy: str = "quick_pop_chart_ml",
+    limit: int = 30,
+    scored_only: bool = False,
+) -> list[dict]:
     """
     Most recent closed positions for a strategy.
+
+    scored_only — when True, only returns trades that have a non-null ml_score.
+                  Use this for ML strategies so the agent only reasons about
+                  trades the scorer actually evaluated, not pre-ML backfill data.
 
     Returns:
         [{"symbol": "BONK", "ml_score": 7.2, "outcome_pnl_pct": 12.5,
           "outcome_sell_reason": "TP2", "outcome_hold_secs": 830}, ...]
     """
+    score_filter = "AND sc.ml_score IS NOT NULL" if scored_only else ""
     conn = sqlite3.connect(db_path)
     try:
         rows = conn.execute(
-            """
+            f"""
             SELECT sc.symbol, sc.ml_score, so.outcome_pnl_pct, so.outcome_sell_reason,
                    so.outcome_hold_secs, so.outcome_max_gain_pct
             FROM strategy_outcomes so
@@ -232,6 +242,7 @@ def query_recent_trades(db_path: str, strategy: str = "quick_pop_chart_ml", limi
               AND so.closed = 1
               AND so.entered = 1
               AND so.outcome_pnl_pct IS NOT NULL
+              {score_filter}
             ORDER BY sc.ts DESC
             LIMIT ?
             """,
@@ -242,11 +253,11 @@ def query_recent_trades(db_path: str, strategy: str = "quick_pop_chart_ml", limi
 
     return [
         {
-            "symbol":              r[0],
-            "ml_score":            r[1],
-            "outcome_pnl_pct":     round(r[2] or 0.0, 2),
-            "outcome_sell_reason": r[3],
-            "outcome_hold_secs":   r[4],
+            "symbol":               r[0],
+            "ml_score":             r[1],
+            "outcome_pnl_pct":      round(r[2] or 0.0, 2),
+            "outcome_sell_reason":  r[3],
+            "outcome_hold_secs":    r[4],
             "outcome_max_gain_pct": round(r[5] or 0.0, 2),
         }
         for r in rows
