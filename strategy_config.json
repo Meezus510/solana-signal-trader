@@ -82,6 +82,8 @@
   },
   "quick_pop_chart_ml": {
     "live_trading": true,
+    "use_ai_override": false,
+    "use_ai_override_shadow": true,
     "ml_min_score": 2.5,
     "ml_high_score_threshold": 8.0,
     "ml_max_score_threshold": 9.5,

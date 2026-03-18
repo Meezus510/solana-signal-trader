@@ -83,13 +83,20 @@ class TestBuy:
         assert abs(pos.stop_loss_price - 0.65) < 1e-9
 
     def test_insufficient_cash_returns_none(self):
+        # live_trading=True: no auto-reload, so insufficient cash returns None
         port = PortfolioState(starting_cash_usd=5.0, available_cash_usd=5.0)
-        result = PaperExchange(port, _cfg()).buy(_signal(), entry_price=1.0, usd_size=10.0)
+        cfg  = StrategyConfig(
+            **{**_cfg().__dict__, "live_trading": True}  # type: ignore[arg-type]
+        )
+        result = PaperExchange(port, cfg).buy(_signal(), entry_price=1.0, usd_size=10.0)
         assert result is None
 
     def test_insufficient_cash_does_not_deduct(self):
         port = PortfolioState(starting_cash_usd=5.0, available_cash_usd=5.0)
-        PaperExchange(port, _cfg()).buy(_signal(), entry_price=1.0, usd_size=10.0)
+        cfg  = StrategyConfig(
+            **{**_cfg().__dict__, "live_trading": True}  # type: ignore[arg-type]
+        )
+        PaperExchange(port, cfg).buy(_signal(), entry_price=1.0, usd_size=10.0)
         assert port.available_cash_usd == 5.0
 
 

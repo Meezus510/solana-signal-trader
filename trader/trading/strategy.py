@@ -161,6 +161,20 @@ class StrategyConfig:
     # Only meaningful for chart/ML strategies where data quality varies.
     use_policy_agent: bool = False
 
+    # AI override agent (optional — requires ANTHROPIC_API_KEY at runtime).
+    # When True, signals filtered out by ML_SKIP, CHART_SKIP, or POLICY_BLK are
+    # re-evaluated by Claude Haiku.  The agent sees all chart, ML, and pair-stats
+    # data and can override the skip decision or schedule a delayed re-check.
+    # Buys triggered by an override are tagged as AI_OVERRIDE_BUY in the logs.
+    use_ai_override: bool = False
+
+    # Shadow mode for the AI override agent.
+    # When use_ai_override=False AND use_ai_override_shadow=True, the agent is
+    # still called on every filtered signal (in a background task, no trade effect).
+    # Decisions are recorded as SHADOW_OVERRIDE / SHADOW_REJECT / SHADOW_REANALYZE
+    # in ai_override_decisions so you can evaluate agent quality before enabling it.
+    use_ai_override_shadow: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Base runner
