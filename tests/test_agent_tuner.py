@@ -113,9 +113,10 @@ class TestValidateDeltaMLOnly:
         result = _validate_strategy_delta("quick_pop_chart_ml", {"use_ml_filter": False, "reason": "x"})
         assert "use_ml_filter" not in result
 
-    def test_keeps_ml_min_score(self):
+    def test_strips_ml_min_score_locked(self):
+        # ml_min_score is locked at 2.5 for quick_pop_chart_ml — any proposed change is dropped
         result = _validate_strategy_delta("quick_pop_chart_ml", {"ml_min_score": 6.0, "reason": "x"})
-        assert result.get("ml_min_score") == 6.0
+        assert "ml_min_score" not in result
 
     def test_keeps_ml_k(self):
         result = _validate_strategy_delta("quick_pop_chart_ml", {"ml_k": 7, "reason": "x"})
@@ -535,19 +536,30 @@ class TestLoadAgentHistory:
 
 
 # ---------------------------------------------------------------------------
-# Guardrail floor change — ml_min_score floor is now 2.0 (was 3.0)
+# Locked params — ml_min_score is locked for quick_pop_chart_ml
 # ---------------------------------------------------------------------------
 
-class TestGuardrailFloor:
-    def test_ml_min_score_25_not_clamped(self):
+class TestLockedParams:
+    def test_ml_min_score_stripped_for_quick_pop_chart_ml(self):
+        # Locked — any proposed value (including the correct one) is dropped
         result = _validate_strategy_delta("quick_pop_chart_ml", {"ml_min_score": 2.5, "reason": "x"})
+        assert "ml_min_score" not in result
+
+    def test_ml_min_score_stripped_even_when_out_of_range(self):
+        # Lock runs before guardrail clamping — still stripped even if value is invalid
+        result = _validate_strategy_delta("quick_pop_chart_ml", {"ml_min_score": 1.0, "reason": "x"})
+        assert "ml_min_score" not in result
+
+    def test_ml_min_score_stripped_above_ceiling(self):
+        result = _validate_strategy_delta("quick_pop_chart_ml", {"ml_min_score": 9.0, "reason": "x"})
+        assert "ml_min_score" not in result
+
+    def test_ml_min_score_allowed_for_full_control_strategy(self):
+        # Not locked for other strategies — guardrail floor is 2.0
+        result = _validate_strategy_delta("trend_rider_chart_reanalyze", {"ml_min_score": 2.5})
         assert result.get("ml_min_score") == pytest.approx(2.5)
 
-    def test_ml_min_score_below_floor_clamped(self):
-        # Floor is 2.0 — anything below should clamp to 2.0
-        result = _validate_strategy_delta("quick_pop_chart_ml", {"ml_min_score": 1.0, "reason": "x"})
+    def test_ml_min_score_clamped_for_full_control_strategy(self):
+        # Below guardrail floor (2.0) → clamped, not locked
+        result = _validate_strategy_delta("trend_rider_chart_reanalyze", {"ml_min_score": 1.0})
         assert result.get("ml_min_score") == pytest.approx(2.0)
-
-    def test_ml_min_score_above_ceiling_clamped(self):
-        result = _validate_strategy_delta("quick_pop_chart_ml", {"ml_min_score": 9.0, "reason": "x"})
-        assert result.get("ml_min_score") == pytest.approx(7.0)

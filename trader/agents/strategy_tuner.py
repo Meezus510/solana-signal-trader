@@ -169,6 +169,15 @@ _ML_ONLY_ALLOWED_KEYS = frozenset([
     "ml_k", "ml_halflife_days", "ml_score_low_pct", "ml_score_high_pct",
 ])
 
+# Per-strategy locked parameters — the agent cannot change these values.
+# Keys present here are silently dropped from any proposed delta for that strategy.
+# Format: { strategy_name: { param: locked_value, ... } }
+_LOCKED_PARAMS: dict[str, dict[str, Any]] = {
+    "quick_pop_chart_ml": {
+        "ml_min_score": 2.5,   # fixed by operator — do not let the agent raise this
+    },
+}
+
 # Keys the agent IS allowed to write (besides "reason" and "tp_levels")
 _ALLOWED_SCALAR_KEYS = frozenset([
     "stop_loss_pct", "trailing_stop_pct", "timeout_minutes", "max_hold_minutes",
@@ -697,9 +706,10 @@ FIXED PARAMETERS (read-only — these cannot be changed):
   timeout_minutes:  45.0  (fixed)
   chart_filter:     always enabled  (fixed)
   use_ml_filter:    always enabled  (fixed — cannot be toggled)
+  ml_min_score:     2.5  (LOCKED by operator — do NOT propose changes to this value)
 
 CURRENT ML CONFIGURATION:
-  ml_min_score:             {current_params.get('ml_min_score', 5.0)}
+  ml_min_score:             {current_params.get('ml_min_score', 2.5)}  ← LOCKED (operator-set, cannot be changed)
   ml_high_score_threshold:  {current_params.get('ml_high_score_threshold', 8.0)}
   ml_max_score_threshold:   {current_params.get('ml_max_score_threshold', 9.5)}
   ml_size_multiplier:       {current_params.get('ml_size_multiplier', 2.0)}  (2× size for high-score signals)
@@ -738,8 +748,8 @@ You may ONLY adjust ML filter parameters. Analyze score bucket data and recent t
 
 1. use_ml_filter: enable (true) only if >= 20 trades in score bucket data show meaningful
    score variance (some buckets win, some lose). Disable if scores are noisy.
-2. ml_min_score: raise if low-score buckets (0-4) show negative avg_pnl_pct consistently.
-   This acts as a gate — signals below this score are skipped entirely.
+2. ml_min_score: LOCKED at 2.5 for this strategy — do NOT include it in your response.
+   Any ml_min_score value you propose will be silently discarded.
 3. ml_high_score_threshold / ml_max_score_threshold: set floor/ceiling for the buy-size
    multiplier tier. If score 7+ trades clearly outperform, set high_score_threshold=7.
 4. ml_size_multiplier / ml_max_size_multiplier: how much to scale position size for
@@ -752,17 +762,15 @@ You may ONLY adjust ML filter parameters. Analyze score bucket data and recent t
    falls outside the current mapping (e.g., best trades rarely hit 85%).
 
 IMPORTANT: You cannot change tp_levels, stop_loss_pct, trailing_stop_pct, timeout_minutes,
-use_ml_filter, use_chart_filter, pump_ratio_max, or any reanalysis parameters.
-
-You MAY set live_trading: true/false. Only enable when you have enough evidence this
-strategy is profitable. Remember: the AI balance only grows when live_trading=true.
+use_ml_filter, use_chart_filter, pump_ratio_max, ml_min_score, or any reanalysis parameters.
+live_trading is set by the operator and cannot be changed here.
 
 Return ONLY a JSON object with the keys you want to change and a "reason" string.
-ml_k will be rounded to the nearest integer. live_trading must be a boolean.
+ml_k will be rounded to the nearest integer.
 Do not include keys you are not changing.
 
 Example:
-{{"ml_min_score": 5.5, "ml_k": 7, "live_trading": false, "reason": "Score bucket 0-4 shows -12% avg PnL. Not enabling live trading yet — need more data."}}
+{{"ml_high_score_threshold": 7.0, "ml_k": 7, "reason": "Score 7+ trades show +18% avg PnL vs +2% for score 5-6. Raising high_score_threshold to focus size multiplier on best signals."}}
 
 Respond with valid JSON only. No markdown, no explanation outside the JSON."""
 
@@ -808,6 +816,16 @@ def _validate_strategy_delta(strategy: str, delta: dict) -> dict:
                 strategy, sorted(stripped),
             )
         delta = kept
+
+    # Phase 0b: locked params — strip any key that is pinned for this strategy
+    locked = _LOCKED_PARAMS.get(strategy, {})
+    for key, locked_val in locked.items():
+        if key in delta:
+            logger.warning(
+                "[strategy_tuner] %s: %s is locked at %s — ignoring proposed value %r",
+                strategy, key, locked_val, delta[key],
+            )
+            delta = {k: v for k, v in delta.items() if k != key}
 
     # Phase 1 + 2: scalars
     scalar_keys = {k: v for k, v in delta.items()
