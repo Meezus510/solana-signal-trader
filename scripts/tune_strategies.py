@@ -51,6 +51,7 @@ logging.basicConfig(
 logger = logging.getLogger("tune_strategies")
 
 from trader.agents.strategy_tuner import (
+    _BASE_STRATEGY,
     CONTROLLED_STRATEGIES,
     load_config,
     run as tuner_run,
@@ -98,14 +99,19 @@ def _should_tune(
     db_path: str,
     meta: dict,
     every: int,
-) -> tuple[bool, int]:
+) -> tuple[bool, int, str]:
     """
-    Returns (should_tune, current_count).
-    Fires when current_count - baseline >= every.
+    Returns (should_tune, current_count, count_strategy).
+
+    count_strategy is the base strategy whose signal count is used as the
+    trigger (e.g. "quick_pop" for "quick_pop_chart_ml"). Chart variants
+    trigger on base strategy signals so that the tuner fires at a consistent
+    rate regardless of how many signals the chart filter lets through.
     """
-    current = _get_signal_count(db_path, strategy)
+    count_strategy = _BASE_STRATEGY.get(strategy, strategy)
+    current = _get_signal_count(db_path, count_strategy)
     baseline = meta.get("trades_at_last_tune", {}).get(strategy, 0)
-    return (current - baseline) >= every, current
+    return (current - baseline) >= every, current, count_strategy
 
 
 def _update_meta(strategy: str, new_count: int, config: dict) -> None:
@@ -136,17 +142,17 @@ def run_once(
     any_tuned = False
 
     for strategy in strategies:
-        should, current_count = _should_tune(strategy, db_path, meta, every)
+        should, current_count, count_strategy = _should_tune(strategy, db_path, meta, every)
 
         print(f"\n{SEP}")
-        print(f"Strategy: {strategy}")
+        print(f"Strategy: {strategy}  (trigger counts: {count_strategy})")
         baseline = meta.get("trades_at_last_tune", {}).get(strategy, 0)
         new_signals = current_count - baseline
-        print(f"  Signals since last tune: {new_signals} / {every} needed")
+        print(f"  {count_strategy} signals since last tune: {new_signals} / {every} needed")
         print(SEP)
 
         if not should:
-            print(f"  Skipping — not enough new signals yet ({new_signals}/{every})")
+            print(f"  Skipping — not enough new {count_strategy} signals yet ({new_signals}/{every})")
             continue
 
         print(f"  Threshold reached — running tuner...")

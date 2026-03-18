@@ -424,19 +424,20 @@ class TestTuneTrigger:
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             path = f.name
         conn = _make_db(path)
-        # Insert 10 signals (mix of entered + skipped)
+        # Trigger counts base strategy signals (quick_pop), not the chart variant
         for i in range(6):
             cid = _insert_chart(conn)
-            _insert_outcome(conn, cid, "quick_pop_chart_ml", entered=True, closed=True)
+            _insert_outcome(conn, cid, "quick_pop", entered=True, closed=True)
         for i in range(4):
             cid = _insert_chart(conn)
-            _insert_outcome(conn, cid, "quick_pop_chart_ml", entered=False)
+            _insert_outcome(conn, cid, "quick_pop", entered=False)
         conn.close()
 
         meta = {"trades_at_last_tune": {"quick_pop_chart_ml": 0}}
-        should, count = _should_tune("quick_pop_chart_ml", path, meta, every=10)
+        should, count, count_strategy = _should_tune("quick_pop_chart_ml", path, meta, every=10)
         assert should is True
         assert count == 10
+        assert count_strategy == "quick_pop"
 
     def test_does_not_fire_before_threshold(self):
         _should_tune = self._import_should_tune()
@@ -445,11 +446,11 @@ class TestTuneTrigger:
         conn = _make_db(path)
         for _ in range(5):
             cid = _insert_chart(conn)
-            _insert_outcome(conn, cid, "quick_pop_chart_ml", entered=False)
+            _insert_outcome(conn, cid, "quick_pop", entered=False)
         conn.close()
 
         meta = {"trades_at_last_tune": {"quick_pop_chart_ml": 0}}
-        should, count = _should_tune("quick_pop_chart_ml", path, meta, every=10)
+        should, count, count_strategy = _should_tune("quick_pop_chart_ml", path, meta, every=10)
         assert should is False
         assert count == 5
 
@@ -461,27 +462,28 @@ class TestTuneTrigger:
         conn = _make_db(path)
         for _ in range(18):
             cid = _insert_chart(conn)
-            _insert_outcome(conn, cid, "quick_pop_chart_ml", entered=False)
+            _insert_outcome(conn, cid, "quick_pop", entered=False)
         conn.close()
 
         # Baseline at 8 — so 10 new signals have come in
         meta = {"trades_at_last_tune": {"quick_pop_chart_ml": 8}}
-        should, count = _should_tune("quick_pop_chart_ml", path, meta, every=10)
+        should, count, _ = _should_tune("quick_pop_chart_ml", path, meta, every=10)
         assert should is True
         assert count == 18
 
     def test_skipped_signals_alone_trigger_tune(self):
-        """Tuner should fire even if the strategy never entered a single trade."""
+        """Tuner fires based on base strategy skipped signals even if chart variant never entered."""
         _should_tune = self._import_should_tune()
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
             path = f.name
         conn = _make_db(path)
-        # All skipped — chart filter blocked everything
+        # Base strategy saw 10 signals; chart variant skipped all of them
         for _ in range(10):
             cid = _insert_chart(conn)
+            _insert_outcome(conn, cid, "quick_pop", entered=True, closed=True)
             _insert_outcome(conn, cid, "quick_pop_chart_ml", entered=False)
         conn.close()
 
         meta = {"trades_at_last_tune": {}}
-        should, count = _should_tune("quick_pop_chart_ml", path, meta, every=10)
+        should, count, _ = _should_tune("quick_pop_chart_ml", path, meta, every=10)
         assert should is True
