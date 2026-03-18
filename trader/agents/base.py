@@ -136,7 +136,7 @@ def query_score_buckets(db_path: str, strategy: str = "quick_pop_chart_ml") -> l
         rows = conn.execute(
             """
             SELECT
-                CAST(sc.ml_score AS INTEGER) AS bucket_floor,
+                CAST(so.ml_score AS INTEGER) AS bucket_floor,
                 COUNT(*)                     AS cnt,
                 SUM(CASE WHEN so.outcome_pnl_pct > 0 THEN 1 ELSE 0 END) AS wins,
                 AVG(so.outcome_pnl_pct)      AS avg_pnl,
@@ -146,7 +146,7 @@ def query_score_buckets(db_path: str, strategy: str = "quick_pop_chart_ml") -> l
             WHERE so.strategy = ?
               AND so.closed = 1
               AND so.entered = 1
-              AND sc.ml_score IS NOT NULL
+              AND so.ml_score IS NOT NULL
               AND so.outcome_pnl_pct IS NOT NULL
             GROUP BY bucket_floor
             ORDER BY bucket_floor ASC
@@ -229,12 +229,12 @@ def query_recent_trades(
         [{"symbol": "BONK", "ml_score": 7.2, "outcome_pnl_pct": 12.5,
           "outcome_sell_reason": "TP2", "outcome_hold_secs": 830}, ...]
     """
-    score_filter = "AND sc.ml_score IS NOT NULL" if scored_only else ""
+    score_filter = "AND so.ml_score IS NOT NULL" if scored_only else ""
     conn = sqlite3.connect(db_path)
     try:
         rows = conn.execute(
             f"""
-            SELECT sc.symbol, sc.ml_score, so.outcome_pnl_pct, so.outcome_sell_reason,
+            SELECT sc.symbol, so.ml_score, so.outcome_pnl_pct, so.outcome_sell_reason,
                    so.outcome_hold_secs, so.outcome_max_gain_pct
             FROM strategy_outcomes so
             JOIN signal_charts sc ON so.signal_chart_id = sc.id
@@ -296,7 +296,7 @@ def query_skipped_stats(db_path: str, strategy: str, base_strategy: str) -> dict
         rows = conn.execute(
             """
             SELECT base.outcome_pnl_pct, base.outcome_max_gain_pct,
-                   base.outcome_sell_reason, sc.symbol, sc.ml_score
+                   base.outcome_sell_reason, sc.symbol, base.ml_score
               FROM strategy_outcomes skipped
               JOIN signal_charts sc   ON skipped.signal_chart_id = sc.id
               JOIN strategy_outcomes base ON base.signal_chart_id = skipped.signal_chart_id

@@ -76,7 +76,7 @@ class MultiStrategyEngine:
         self._ml_prefer_moralis: set[str] = set()
         if db:
             for r in runners:
-                if r.cfg.use_ml_filter:
+                if r.cfg.save_chart_data:  # score whenever chart data is saved, even if filter is off
                     training = r.cfg.ml_training_strategy or r.cfg.name
                     if training not in self._ml_scorers:
                         self._ml_scorers[training] = ChartMLScorer(
@@ -152,7 +152,7 @@ class MultiStrategyEngine:
         self._ml_prefer_moralis = set()
         if self._db:
             for r in self._runners:
-                if r.cfg.use_ml_filter:
+                if r.cfg.save_chart_data:  # score whenever chart data is saved, even if filter is off
                     training = r.cfg.ml_training_strategy or r.cfg.name
                     if training not in self._ml_scorers:
                         self._ml_scorers[training] = ChartMLScorer(
@@ -454,6 +454,7 @@ class MultiStrategyEngine:
                     entered=position is not None,
                     is_live=runner.cfg.live_trading,
                     source_channel=signal.source_channel,
+                    ml_score=ml_score,
                 )
                 if position is not None:
                     runner.set_outcome_id(signal.mint_address, outcome_id)

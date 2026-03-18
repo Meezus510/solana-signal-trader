@@ -155,7 +155,8 @@ CREATE TABLE IF NOT EXISTS strategy_outcomes (
     outcome_max_gain_pct REAL,
     closed               INTEGER NOT NULL DEFAULT 0,
     is_live              INTEGER NOT NULL DEFAULT 0,
-    source_channel       TEXT NOT NULL DEFAULT ''
+    source_channel       TEXT NOT NULL DEFAULT '',
+    ml_score             REAL
 )
 """
 
@@ -241,6 +242,7 @@ class TradeDatabase:
             ("outcome_pnl_usd", "REAL"),
             ("is_live",         "INTEGER NOT NULL DEFAULT 0"),
             ("source_channel",  "TEXT NOT NULL DEFAULT ''"),
+            ("ml_score",        "REAL"),
         ]:
             try:
                 c.execute(f"ALTER TABLE strategy_outcomes ADD COLUMN {col} {definition}")
@@ -630,22 +632,25 @@ class TradeDatabase:
         entered: bool,
         is_live: bool = False,
         source_channel: str = "",
+        ml_score: float | None = None,
     ) -> int:
         """
         Insert a strategy_outcomes row linked to an existing signal_charts row.
 
-        is_live — when True this trade counts against the AI balance. Set based on
-                  whether live_trading was enabled for this runner at entry time.
+        is_live  — when True this trade counts against the AI balance. Set based on
+                   whether live_trading was enabled for this runner at entry time.
+        ml_score — per-strategy KNN confidence score at signal time (None if scorer
+                   has not yet accumulated enough training data).
 
         Returns the new strategy_outcomes row id so the runner can later fill in
         outcome fields when the position closes.
         """
         cursor = self._conn.execute(
             """
-            INSERT INTO strategy_outcomes (signal_chart_id, strategy, entered, is_live, source_channel)
-            VALUES (?,?,?,?,?)
+            INSERT INTO strategy_outcomes (signal_chart_id, strategy, entered, is_live, source_channel, ml_score)
+            VALUES (?,?,?,?,?,?)
             """,
-            (signal_chart_id, strategy, int(entered), int(is_live), source_channel),
+            (signal_chart_id, strategy, int(entered), int(is_live), source_channel, ml_score),
         )
         self._conn.commit()
         return cursor.lastrowid

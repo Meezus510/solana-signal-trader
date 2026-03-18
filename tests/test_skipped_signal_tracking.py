@@ -55,7 +55,8 @@ def _make_db(path: str) -> sqlite3.Connection:
             outcome_sell_reason  TEXT,
             closed               INTEGER NOT NULL DEFAULT 0,
             outcome_pnl_usd      REAL,
-            is_live              INTEGER NOT NULL DEFAULT 0
+            is_live              INTEGER NOT NULL DEFAULT 0,
+            ml_score             REAL
         )
     """)
     conn.commit()
@@ -72,13 +73,14 @@ def _insert_chart(conn, symbol="BONK", mint="abc", entry_price=0.001, ml_score=N
 
 
 def _insert_outcome(conn, chart_id, strategy, entered, closed=0,
-                    pnl_pct=None, max_gain_pct=None, sell_reason=None) -> int:
+                    pnl_pct=None, max_gain_pct=None, sell_reason=None,
+                    ml_score=None) -> int:
     cur = conn.execute(
         """INSERT INTO strategy_outcomes
                (signal_chart_id, strategy, entered, closed,
-                outcome_pnl_pct, outcome_max_gain_pct, outcome_sell_reason)
-           VALUES (?,?,?,?,?,?,?)""",
-        (chart_id, strategy, int(entered), int(closed), pnl_pct, max_gain_pct, sell_reason),
+                outcome_pnl_pct, outcome_max_gain_pct, outcome_sell_reason, ml_score)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (chart_id, strategy, int(entered), int(closed), pnl_pct, max_gain_pct, sell_reason, ml_score),
     )
     conn.commit()
     return cur.lastrowid
@@ -238,10 +240,10 @@ class TestQuerySkippedStats:
             path = f.name
         conn = _make_db(path)
 
-        cid = _insert_chart(conn, symbol="PEPE", ml_score=7.5)
+        cid = _insert_chart(conn, symbol="PEPE")
         _insert_outcome(conn, cid, "quick_pop_chart_ml", entered=False)
         _insert_outcome(conn, cid, "quick_pop", entered=True, closed=True,
-                        pnl_pct=22.5, max_gain_pct=45.0, sell_reason="TP2")
+                        pnl_pct=22.5, max_gain_pct=45.0, sell_reason="TP2", ml_score=7.5)
         conn.close()
 
         result = query_skipped_stats(path, "quick_pop_chart_ml", "quick_pop")
