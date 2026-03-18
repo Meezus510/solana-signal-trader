@@ -590,6 +590,7 @@ class MultiStrategyEngine:
                     source_channel=signal.source_channel,
                     ml_score=ml_score,
                     is_ai_override=_ai_overrode,
+                    skip_reason=_skip_reason if position is None else None,
                 )
                 if position is not None:
                     runner.set_outcome_id(signal.mint_address, outcome_id)
