@@ -68,6 +68,8 @@ class MultiStrategyEngine:
         self._db = db
         # Mints currently awaiting reanalysis — prevents duplicate scheduling
         self._pending_reanalysis: set[str] = set()
+        # "(mint:runner_name)" keys awaiting AI override re-check
+        self._pending_ai_override: set[str] = set()
         # One ML scorer per unique training strategy, keyed by training strategy name.
         # Chart variants point to their base strategy so they train on unbiased data.
         self._ml_scorers: dict[str, ChartMLScorer] = {}
@@ -435,6 +437,15 @@ class MultiStrategyEngine:
 
             effective_blocked = ml_blocked or policy_blocked
 
+            # Track skip reason for AI override (set before enter_position).
+            _skip_reason: str | None = None
+            if ml_blocked:
+                _skip_reason = "ML_SKIP"
+            elif policy_blocked:
+                _skip_reason = "POLICY_BLK"
+            elif chart_ctx is not None and not chart_ctx.should_enter:
+                _skip_reason = "CHART_SKIP"
+
             position = None
             if not effective_blocked:
                 try:
@@ -444,6 +455,129 @@ class MultiStrategyEngine:
                         "[ERROR] %s: enter_position failed for %s", runner.name, signal.symbol
                     )
                     continue
+
+            # ------------------------------------------------------------------
+            # AI override agent — re-evaluates filtered signals.
+            # Active path  (use_ai_override=True):  may force-enter or re-check.
+            # Shadow path  (use_ai_override_shadow=True, override=False): calls
+            #   agent in background with no trade effect; records SHADOW_* decisions
+            #   so we can evaluate agent quality before enabling it live.
+            # ------------------------------------------------------------------
+            _override_key  = f"{signal.mint_address}:{runner.name}"
+            _ai_overrode   = False   # set True when override actually enters a position
+            _needs_ai_eval = (
+                position is None
+                and _skip_reason is not None
+                and _override_key not in self._pending_ai_override
+                and (runner.cfg.use_ai_override or runner.cfg.use_ai_override_shadow)
+            )
+
+            if _needs_ai_eval:
+                from trader.agents.ai_override import propose_ai_override, summarize_candles, log_override_decision
+                _ai_ctx = {
+                    "ml_score":        ml_score,
+                    "ml_min_score":    runner.cfg.ml_min_score,
+                    "pump_ratio":      chart_ctx.pump_ratio if chart_ctx else None,
+                    "pump_ratio_max":  runner.cfg.pump_ratio_max,
+                    "vol_trend":       chart_ctx.vol_trend if chart_ctx else None,
+                    "chart_reason":    chart_ctx.reason if chart_ctx else None,
+                    "ml_source":       ml_source,
+                    "source_channel":  signal.source_channel,
+                    "pair_stats":      pair_stats,
+                    "candles_summary": summarize_candles(ml_candles),
+                }
+
+                if runner.cfg.use_ai_override:
+                    # Active mode — decision is acted upon immediately
+                    try:
+                        _ai_decision = propose_ai_override(
+                            skip_reason=_skip_reason,
+                            signal_context=_ai_ctx,
+                            strategy=runner.cfg.name,
+                            db_path=self._db.path if self._db else None,
+                            training_strategy=runner.cfg.ml_training_strategy or runner.cfg.name,
+                        )
+                        logger.info(
+                            "[AI_OVERRIDE] [%-12s] %s | override=%s | reanalyze=%.0fs | reason=%s",
+                            runner.name, signal.symbol,
+                            _ai_decision["override"],
+                            _ai_decision["reanalyze_after_seconds"],
+                            _ai_decision["reason"],
+                        )
+
+                        # Determine decision label for DB
+                        if _ai_decision["override"]:
+                            _decision_label = "OVERRIDE"
+                        elif _ai_decision["reanalyze_after_seconds"] > 0:
+                            _decision_label = "REANALYZE"
+                        else:
+                            _decision_label = "REJECT"
+
+                        # Persist decision to DB
+                        if self._db:
+                            self._db.save_ai_override_decision(
+                                strategy=runner.cfg.name,
+                                signal_chart_id=signal_chart_id,
+                                symbol=signal.symbol,
+                                mint=signal.mint_address,
+                                skip_reason=_skip_reason,
+                                decision=_decision_label,
+                                ml_score=ml_score,
+                                pump_ratio=chart_ctx.pump_ratio if chart_ctx else None,
+                                vol_trend=chart_ctx.vol_trend if chart_ctx else None,
+                                agent_reason=_ai_decision["reason"],
+                                reanalyze_delay=_ai_decision["reanalyze_after_seconds"],
+                            )
+
+                        # Log to file
+                        log_override_decision(
+                            strategy=runner.cfg.name,
+                            symbol=signal.symbol,
+                            skip_reason=_skip_reason,
+                            decision=_ai_decision,
+                            signal_context=_ai_ctx,
+                        )
+
+                        if _ai_decision["override"]:
+                            position = runner.enter_position(signal, entry_price, None, buy_size_override)
+                            if position is not None:
+                                _ai_overrode = True
+                                signal_log.info(
+                                    "AI_OVERRIDE_BUY | %-10s | %-44s | skip_was=%-10s | %s",
+                                    signal.symbol, signal.mint_address,
+                                    _skip_reason, _ai_decision["reason"],
+                                )
+                                if self._db:
+                                    self._db.log_signal(
+                                        "AI_OVERRIDE_BUY", symbol=signal.symbol,
+                                        mint=signal.mint_address, strategy=runner.name,
+                                        source_channel=signal.source_channel,
+                                    )
+
+                        elif _ai_decision["reanalyze_after_seconds"] > 0:
+                            _delay = _ai_decision["reanalyze_after_seconds"]
+                            self._pending_ai_override.add(_override_key)
+                            logger.info(
+                                "[AI_OVERRIDE] [%-12s] %s — re-check in %.0fs: %s",
+                                runner.name, signal.symbol, _delay, _ai_decision["reason"],
+                            )
+                            asyncio.create_task(
+                                self._ai_override_reanalyze(signal, runner, _delay, _skip_reason)
+                            )
+
+                    except Exception:
+                        logger.exception(
+                            "[AI_OVERRIDE] Agent call failed for %s — skipping override",
+                            signal.symbol,
+                        )
+
+                else:
+                    # Shadow mode — call agent in background, no trade effect
+                    asyncio.create_task(
+                        self._shadow_override_eval(
+                            signal, runner, _skip_reason, _ai_ctx, signal_chart_id,
+                        )
+                    )
 
             # Save strategy_outcome for runners that track chart data — even when
             # blocked (ml or policy), these become labeled training examples.
@@ -455,6 +589,7 @@ class MultiStrategyEngine:
                     is_live=runner.cfg.live_trading,
                     source_channel=signal.source_channel,
                     ml_score=ml_score,
+                    is_ai_override=_ai_overrode,
                 )
                 if position is not None:
                     runner.set_outcome_id(signal.mint_address, outcome_id)
@@ -551,6 +686,191 @@ class MultiStrategyEngine:
                     "[ERROR] %s: reanalysis enter_position failed for %s",
                     runner.name, signal.symbol,
                 )
+
+    # ------------------------------------------------------------------
+    # AI override reanalysis
+    # ------------------------------------------------------------------
+
+    async def _ai_override_reanalyze(
+        self,
+        signal,
+        runner: StrategyRunner,
+        delay: float,
+        original_skip: str,
+    ) -> None:
+        """
+        Wait `delay` seconds, re-fetch all signal data, and call the AI override
+        agent again.  If it overrides, force-enter the position.  One attempt only.
+        """
+        await asyncio.sleep(delay)
+        override_key = f"{signal.mint_address}:{runner.name}"
+        self._pending_ai_override.discard(override_key)
+
+        logger.info(
+            "[AI_OVERRIDE] [%-12s] %s — re-checking after %.0fs (original skip: %s)",
+            runner.name, signal.symbol, delay, original_skip,
+        )
+
+        entry_price = await self._birdeye.get_price(signal.mint_address)
+        if entry_price is None:
+            logger.warning("[AI_OVERRIDE] %s — no price at re-check, abandoning", signal.symbol)
+            return
+
+        candles = await self._birdeye.get_ohlcv(signal.mint_address, bars=OHLCV_BARS)
+        chart_ctx = compute_chart_context(candles, entry_price)
+
+        ml_candles: list = []
+        ml_source = "none"
+        if self._moralis:
+            try:
+                ml_candles = await self._moralis.get_ohlcv(
+                    signal.mint_address, bars=MORALIS_OHLCV_BARS, interval=MORALIS_OHLCV_INTERVAL,
+                )
+                if ml_candles:
+                    ml_source = f"moralis/{MORALIS_OHLCV_INTERVAL}"
+            except Exception:
+                pass
+        if not ml_candles:
+            try:
+                ml_candles = await self._birdeye.get_ohlcv(
+                    signal.mint_address, bars=ML_OHLCV_BARS, interval=ML_OHLCV_INTERVAL,
+                )
+                if ml_candles:
+                    ml_source = f"birdeye/{ML_OHLCV_INTERVAL}"
+            except Exception:
+                pass
+
+        pair_stats = None
+        if self._moralis:
+            try:
+                pair_stats = await self._moralis.get_pair_stats(signal.mint_address)
+            except Exception:
+                pass
+
+        training_strategy = runner.cfg.ml_training_strategy or runner.cfg.name
+        ml_score = None
+        if training_strategy in self._ml_scorers and ml_candles:
+            use_moralis = training_strategy in self._ml_prefer_moralis
+            score_candles = ml_candles if use_moralis else (candles or ml_candles)
+            ml_score = self._ml_scorers[training_strategy].score(
+                score_candles, chart_ctx=chart_ctx, pair_stats=pair_stats,
+                source_channel=signal.source_channel,
+            )
+
+        try:
+            from trader.agents.ai_override import propose_ai_override, summarize_candles
+            ai_ctx = {
+                "ml_score":        ml_score,
+                "ml_min_score":    runner.cfg.ml_min_score,
+                "pump_ratio":      chart_ctx.pump_ratio if chart_ctx else None,
+                "pump_ratio_max":  runner.cfg.pump_ratio_max,
+                "vol_trend":       chart_ctx.vol_trend if chart_ctx else None,
+                "chart_reason":    chart_ctx.reason if chart_ctx else None,
+                "ml_source":       ml_source,
+                "source_channel":  signal.source_channel,
+                "pair_stats":      pair_stats,
+                "candles_summary": summarize_candles(ml_candles),
+            }
+            ai_decision = propose_ai_override(
+                skip_reason=f"RECHECK_{original_skip}",
+                signal_context=ai_ctx,
+                strategy=runner.cfg.name,
+                db_path=self._db.path if self._db else None,
+                training_strategy=runner.cfg.ml_training_strategy or runner.cfg.name,
+            )
+            logger.info(
+                "[AI_OVERRIDE_RECHECK] [%-12s] %s | override=%s | reason=%s",
+                runner.name, signal.symbol, ai_decision["override"], ai_decision["reason"],
+            )
+
+            if not ai_decision["override"]:
+                signal_log.info(
+                    "AI_OVERRIDE_SKIP | %-10s | %-44s | recheck of %-10s | %s",
+                    signal.symbol, signal.mint_address, original_skip, ai_decision["reason"],
+                )
+                return
+
+            position = runner.enter_position(signal, entry_price, None, None)
+            if position is not None:
+                signal_log.info(
+                    "AI_OVERRIDE_BUY | %-10s | %-44s | recheck of %-10s | %s",
+                    signal.symbol, signal.mint_address, original_skip, ai_decision["reason"],
+                )
+                if self._db:
+                    self._db.log_signal(
+                        "AI_OVERRIDE_BUY", symbol=signal.symbol,
+                        mint=signal.mint_address, strategy=runner.name,
+                        source_channel=signal.source_channel,
+                    )
+
+        except Exception:
+            logger.exception(
+                "[AI_OVERRIDE] Re-check agent call failed for %s", signal.symbol,
+            )
+
+    async def _shadow_override_eval(
+        self,
+        signal,
+        runner: StrategyRunner,
+        skip_reason: str,
+        ai_ctx: dict,
+        signal_chart_id: int | None,
+    ) -> None:
+        """
+        Shadow mode: call the AI override agent with no trade effect.
+        Records SHADOW_OVERRIDE / SHADOW_REJECT / SHADOW_REANALYZE in
+        ai_override_decisions so we can compare to what actually happened.
+        """
+        try:
+            from trader.agents.ai_override import propose_ai_override, log_override_decision
+            decision = propose_ai_override(
+                skip_reason=skip_reason,
+                signal_context=ai_ctx,
+                strategy=runner.cfg.name,
+                db_path=self._db.path if self._db else None,
+                training_strategy=runner.cfg.ml_training_strategy or runner.cfg.name,
+            )
+
+            if decision["override"]:
+                label = "SHADOW_OVERRIDE"
+            elif decision["reanalyze_after_seconds"] > 0:
+                label = "SHADOW_REANALYZE"
+            else:
+                label = "SHADOW_REJECT"
+
+            logger.info(
+                "[AI_SHADOW] [%-12s] %s | would=%s | reason=%s",
+                runner.name, signal.symbol, label, decision["reason"],
+            )
+
+            if self._db:
+                self._db.save_ai_override_decision(
+                    strategy=runner.cfg.name,
+                    signal_chart_id=signal_chart_id,
+                    symbol=signal.symbol,
+                    mint=signal.mint_address,
+                    skip_reason=skip_reason,
+                    decision=label,
+                    ml_score=ai_ctx.get("ml_score"),
+                    pump_ratio=ai_ctx.get("pump_ratio"),
+                    vol_trend=ai_ctx.get("vol_trend"),
+                    agent_reason=decision["reason"],
+                    reanalyze_delay=decision["reanalyze_after_seconds"],
+                )
+
+            log_override_decision(
+                strategy=runner.cfg.name,
+                symbol=signal.symbol,
+                skip_reason=skip_reason,
+                decision=decision,
+                signal_context=ai_ctx,
+                shadow=True,
+            )
+
+        except Exception:
+            logger.exception(
+                "[AI_SHADOW] Agent call failed for %s", signal.symbol,
+            )
 
     # ------------------------------------------------------------------
     # Monitoring loop

@@ -142,6 +142,24 @@ CREATE TABLE IF NOT EXISTS signal_charts (
 )
 """
 
+_CREATE_AI_OVERRIDE_DECISIONS = """
+CREATE TABLE IF NOT EXISTS ai_override_decisions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              TEXT NOT NULL,
+    strategy        TEXT NOT NULL,
+    signal_chart_id INTEGER REFERENCES signal_charts(id),
+    symbol          TEXT NOT NULL,
+    mint            TEXT NOT NULL,
+    skip_reason     TEXT NOT NULL,
+    decision        TEXT NOT NULL,
+    ml_score        REAL,
+    pump_ratio      REAL,
+    vol_trend       TEXT,
+    agent_reason    TEXT,
+    reanalyze_delay REAL NOT NULL DEFAULT 0
+)
+"""
+
 _CREATE_STRATEGY_OUTCOMES = """
 CREATE TABLE IF NOT EXISTS strategy_outcomes (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,7 +174,8 @@ CREATE TABLE IF NOT EXISTS strategy_outcomes (
     closed               INTEGER NOT NULL DEFAULT 0,
     is_live              INTEGER NOT NULL DEFAULT 0,
     source_channel       TEXT NOT NULL DEFAULT '',
-    ml_score             REAL
+    ml_score             REAL,
+    is_ai_override       INTEGER NOT NULL DEFAULT 0
 )
 """
 
@@ -170,6 +189,7 @@ class TradeDatabase:
     """
 
     def __init__(self, path: str = "trader.db", read_only: bool = False) -> None:
+        self.path = path  # exposed so agents can open read-only connections for queries
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -192,6 +212,7 @@ class TradeDatabase:
         c.execute(_CREATE_CHART_SNAPSHOTS)
         c.execute(_CREATE_SIGNAL_CHARTS)
         c.execute(_CREATE_STRATEGY_OUTCOMES)
+        c.execute(_CREATE_AI_OVERRIDE_DECISIONS)
         self._migrate(c)
         c.commit()
 
@@ -243,6 +264,7 @@ class TradeDatabase:
             ("is_live",         "INTEGER NOT NULL DEFAULT 0"),
             ("source_channel",  "TEXT NOT NULL DEFAULT ''"),
             ("ml_score",        "REAL"),
+            ("is_ai_override",  "INTEGER NOT NULL DEFAULT 0"),
         ]:
             try:
                 c.execute(f"ALTER TABLE strategy_outcomes ADD COLUMN {col} {definition}")
@@ -633,27 +655,178 @@ class TradeDatabase:
         is_live: bool = False,
         source_channel: str = "",
         ml_score: float | None = None,
+        is_ai_override: bool = False,
     ) -> int:
         """
         Insert a strategy_outcomes row linked to an existing signal_charts row.
 
-        is_live  — when True this trade counts against the AI balance. Set based on
-                   whether live_trading was enabled for this runner at entry time.
-        ml_score — per-strategy KNN confidence score at signal time (None if scorer
-                   has not yet accumulated enough training data).
+        is_live       — when True this trade counts against the AI balance.
+        ml_score      — KNN confidence score at signal time (None if scorer not ready).
+        is_ai_override — True when the AI override agent forced this entry; used to
+                         compute override win/loss rate independently.
 
         Returns the new strategy_outcomes row id so the runner can later fill in
         outcome fields when the position closes.
         """
         cursor = self._conn.execute(
             """
-            INSERT INTO strategy_outcomes (signal_chart_id, strategy, entered, is_live, source_channel, ml_score)
-            VALUES (?,?,?,?,?,?)
+            INSERT INTO strategy_outcomes
+                (signal_chart_id, strategy, entered, is_live, source_channel, ml_score, is_ai_override)
+            VALUES (?,?,?,?,?,?,?)
             """,
-            (signal_chart_id, strategy, int(entered), int(is_live), source_channel, ml_score),
+            (signal_chart_id, strategy, int(entered), int(is_live),
+             source_channel, ml_score, int(is_ai_override)),
         )
         self._conn.commit()
         return cursor.lastrowid
+
+    def save_ai_override_decision(
+        self,
+        strategy: str,
+        signal_chart_id: int | None,
+        symbol: str,
+        mint: str,
+        skip_reason: str,
+        decision: str,
+        ml_score: float | None,
+        pump_ratio: float | None,
+        vol_trend: str | None,
+        agent_reason: str,
+        reanalyze_delay: float = 0.0,
+    ) -> None:
+        """
+        Persist one AI override agent decision for later outcome analysis.
+
+        decision values:
+            OVERRIDE          — agent said enter; trade was placed
+            REJECT            — agent said skip; no trade
+            REANALYZE         — agent requested delayed re-check; no trade yet
+            SHADOW_OVERRIDE   — AI off, shadow mode: agent would have overridden
+            SHADOW_REJECT     — AI off, shadow mode: agent would have rejected
+            SHADOW_REANALYZE  — AI off, shadow mode: agent would have reanalyzed
+        """
+        self._conn.execute(
+            """
+            INSERT INTO ai_override_decisions
+                (ts, strategy, signal_chart_id, symbol, mint, skip_reason,
+                 decision, ml_score, pump_ratio, vol_trend, agent_reason, reanalyze_delay)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                strategy, signal_chart_id, symbol, mint, skip_reason,
+                decision, ml_score, pump_ratio, vol_trend, agent_reason, reanalyze_delay,
+            ),
+        )
+        self._conn.commit()
+
+    def query_ai_override_stats(self, strategy: str, base_strategy: str) -> dict:
+        """
+        Comprehensive AI override performance breakdown across all four scenarios:
+
+        overrides       — actual trades placed by AI override; shows if overrides profit
+        rejections      — signals AI rejected; shows missed winners vs saved losses
+        shadow_overrides — shadow mode: would-have-overridden vs actual base outcome
+        shadow_rejects  — shadow mode: would-have-rejected vs actual base outcome
+
+        For override trades, outcomes come from strategy_outcomes (is_ai_override=1).
+        For rejected/shadow signals, outcomes come from the base strategy's outcomes
+        on the same signal_chart_id (what quick_pop actually made on those signals).
+        """
+        c = self._conn
+
+        # -- overrides: actual trade outcomes --------------------------------
+        row = c.execute(
+            """
+            SELECT COUNT(*), SUM(closed),
+                   SUM(CASE WHEN closed=1 AND outcome_pnl_pct > 0 THEN 1 ELSE 0 END),
+                   AVG(CASE WHEN closed=1 THEN outcome_pnl_pct END),
+                   AVG(CASE WHEN closed=1 THEN outcome_max_gain_pct END)
+            FROM strategy_outcomes
+            WHERE strategy=? AND is_ai_override=1 AND entered=1
+            """,
+            (strategy,),
+        ).fetchone()
+        total_ov, closed_ov, wins_ov, avg_pnl_ov, avg_peak_ov = row
+        total_ov = total_ov or 0; closed_ov = closed_ov or 0; wins_ov = wins_ov or 0
+
+        # -- rejections: what base strategy made on AI-rejected signals ------
+        rej_rows = c.execute(
+            """
+            SELECT base.outcome_pnl_pct, base.outcome_max_gain_pct,
+                   base.outcome_sell_reason, sc.symbol, aod.ml_score
+            FROM ai_override_decisions aod
+            JOIN signal_charts sc ON sc.id = aod.signal_chart_id
+            JOIN strategy_outcomes base ON base.signal_chart_id = aod.signal_chart_id
+                AND base.strategy = ? AND base.entered = 1
+                AND base.closed = 1 AND base.outcome_pnl_pct IS NOT NULL
+            WHERE aod.strategy = ? AND aod.decision = 'REJECT'
+            ORDER BY aod.ts DESC
+            """,
+            (base_strategy, strategy),
+        ).fetchall()
+
+        rej_pnls    = [r[0] for r in rej_rows]
+        rej_peaks   = [r[1] for r in rej_rows if r[1] is not None]
+        rej_winners = sum(1 for p in rej_pnls if p > 0)
+
+        # -- shadow decisions: what base strategy made on shadow calls -------
+        shad_rows = c.execute(
+            """
+            SELECT aod.decision, base.outcome_pnl_pct, base.outcome_max_gain_pct,
+                   sc.symbol, aod.ml_score, aod.skip_reason
+            FROM ai_override_decisions aod
+            JOIN signal_charts sc ON sc.id = aod.signal_chart_id
+            JOIN strategy_outcomes base ON base.signal_chart_id = aod.signal_chart_id
+                AND base.strategy = ? AND base.entered = 1
+                AND base.closed = 1 AND base.outcome_pnl_pct IS NOT NULL
+            WHERE aod.strategy = ? AND aod.decision IN ('SHADOW_OVERRIDE','SHADOW_REJECT')
+            ORDER BY aod.ts DESC
+            """,
+            (base_strategy, strategy),
+        ).fetchall()
+
+        shad_override_pnls = [r[1] for r in shad_rows if r[0] == 'SHADOW_OVERRIDE']
+        shad_reject_pnls   = [r[1] for r in shad_rows if r[0] == 'SHADOW_REJECT']
+
+        def _stats(pnls: list) -> dict:
+            if not pnls:
+                return {"count": 0, "win_rate_pct": None, "avg_pnl_pct": None}
+            wins = sum(1 for p in pnls if p > 0)
+            return {
+                "count":        len(pnls),
+                "win_rate_pct": round(wins / len(pnls) * 100, 1),
+                "avg_pnl_pct":  round(sum(pnls) / len(pnls), 2),
+            }
+
+        return {
+            "overrides": {
+                "total":          total_ov,
+                "closed":         closed_ov,
+                "wins":           wins_ov,
+                "win_rate_pct":   round(wins_ov / closed_ov * 100, 1) if closed_ov else None,
+                "avg_pnl_pct":    round(avg_pnl_ov, 2) if avg_pnl_ov is not None else None,
+                "avg_peak_pct":   round(avg_peak_ov, 2) if avg_peak_ov is not None else None,
+            },
+            "rejections": {
+                "total":             c.execute(
+                    "SELECT COUNT(*) FROM ai_override_decisions WHERE strategy=? AND decision='REJECT'",
+                    (strategy,)).fetchone()[0],
+                "base_tracked":      len(rej_rows),
+                "would_have_won":    rej_winners,
+                "win_rate_pct":      round(rej_winners / len(rej_rows) * 100, 1) if rej_rows else None,
+                "avg_base_pnl_pct":  round(sum(rej_pnls) / len(rej_pnls), 2) if rej_pnls else None,
+                "avg_base_peak_pct": round(sum(rej_peaks) / len(rej_peaks), 2) if rej_peaks else None,
+                "sample": [
+                    {"symbol": r[3], "pnl_pct": round(r[0], 2),
+                     "peak_pct": round(r[1], 2) if r[1] else None,
+                     "sell_reason": r[2], "ml_score": r[4]}
+                    for r in rej_rows[:10]
+                ],
+            },
+            "shadow_overrides": _stats(shad_override_pnls),
+            "shadow_rejects":   _stats(shad_reject_pnls),
+        }
 
     def load_chart_snapshots(self, strategy: str) -> list[dict]:
         """
