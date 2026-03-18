@@ -21,6 +21,9 @@ from trader.trading.models import PortfolioState, Position, TokenSignal
 
 logger = logging.getLogger(__name__)
 
+# Amount of USD injected when a paper strategy runs out of available cash.
+_PAPER_RELOAD_USD = 1_000.0
+
 
 class PaperExchange:
     """
@@ -59,13 +62,24 @@ class PaperExchange:
         Deducts usd_size from available_cash_usd on success.
         """
         if self.portfolio.available_cash_usd < usd_size:
-            logger.warning(
-                "[SKIP] Insufficient cash for %s — have $%.2f, need $%.2f",
-                signal.symbol,
-                self.portfolio.available_cash_usd,
-                usd_size,
-            )
-            return None
+            if not self._cfg.live_trading:
+                # Paper strategy: reload cash so data collection is never interrupted.
+                self.portfolio.available_cash_usd += _PAPER_RELOAD_USD
+                logger.warning(
+                    "[RELOAD] %s paper cash below trade size — injecting $%.0f "
+                    "(available now $%.2f)",
+                    self._cfg.name,
+                    _PAPER_RELOAD_USD,
+                    self.portfolio.available_cash_usd,
+                )
+            else:
+                logger.warning(
+                    "[SKIP] Insufficient cash for %s — have $%.2f, need $%.2f",
+                    signal.symbol,
+                    self.portfolio.available_cash_usd,
+                    usd_size,
+                )
+                return None
 
         quantity = usd_size / entry_price
         self.portfolio.available_cash_usd -= usd_size
