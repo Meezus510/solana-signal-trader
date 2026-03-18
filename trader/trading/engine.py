@@ -345,8 +345,8 @@ class MultiStrategyEngine:
                     training_strategy,
                 )
                 signal_log.info(
-                    "ML_SKIP    | %-10s | %-44s | score=%.1f",
-                    signal.symbol, signal.mint_address, ml_score,
+                    "ML_SKIP    | %-10s | %-44s | score=%.1f | strategy=%s",
+                    signal.symbol, signal.mint_address, ml_score, runner.name,
                 )
 
             # Scale up buy size on high-confidence signals (max tier checked first).
@@ -404,9 +404,9 @@ class MultiStrategyEngine:
                     if not policy_decision["allow_trade"]:
                         policy_blocked = True
                         signal_log.info(
-                            "POLICY_BLK | %-10s | %-44s | codes=%s",
+                            "POLICY_BLK | %-10s | %-44s | codes=%s | strategy=%s",
                             signal.symbol, signal.mint_address,
-                            policy_decision["reason_codes"],
+                            policy_decision["reason_codes"], runner.name,
                         )
                     else:
                         # Apply buy size multiplier from policy agent.
