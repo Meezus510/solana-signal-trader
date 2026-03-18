@@ -381,15 +381,13 @@ def run(
 def _load_agent_history(strategy: str, max_lines: int = 20) -> str:
     """
     Return the last max_lines agent action log entries for this strategy.
-    Returns empty string if log does not exist or has no entries for this strategy.
+    Returns empty string if the per-strategy log does not exist or is empty.
     """
-    from trader.agents.base import _LOG_PATH
-    if not _LOG_PATH.exists():
+    from trader.agents.base import agent_log_path
+    log_path = agent_log_path(strategy)
+    if not log_path.exists():
         return ""
-    lines = [
-        line for line in _LOG_PATH.read_text().splitlines()
-        if f"| {strategy} |" in line
-    ]
+    lines = log_path.read_text().splitlines()
     if not lines:
         return ""
     return "\n".join(lines[-max_lines:])

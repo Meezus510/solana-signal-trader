@@ -27,7 +27,12 @@ logger = logging.getLogger(__name__)
 # Agent action log — append-only audit trail of every config change.
 # ---------------------------------------------------------------------------
 
-_LOG_PATH = Path(os.getenv("AGENT_LOG_PATH", "logs/agent_actions.log"))
+_LOG_DIR = Path(os.getenv("AGENT_LOG_DIR", "logs"))
+
+
+def agent_log_path(strategy: str) -> Path:
+    """Return the per-strategy agent action log path."""
+    return _LOG_DIR / f"agent_actions_{strategy}.log"
 
 
 def log_agent_action(
@@ -37,7 +42,7 @@ def log_agent_action(
     before: dict[str, Any],
 ) -> None:
     """
-    Append one line per changed key to logs/agent_actions.log.
+    Append one line per changed key to logs/agent_actions_{strategy}.log.
 
     Format:
         2026-03-17T22:01:05Z | strategy_tuner | quick_pop_chart_ml | ml_min_score: 5.0 → 6.0 | reason: ...
@@ -52,9 +57,10 @@ def log_agent_action(
     if not changes:
         return
 
+    log_path = agent_log_path(strategy)
     try:
-        _LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with _LOG_PATH.open("a") as f:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a") as f:
             for change in changes:
                 f.write(f"{ts} | {agent} | {strategy} | {change} | reason: {reason}\n")
     except OSError as exc:

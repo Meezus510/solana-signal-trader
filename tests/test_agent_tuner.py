@@ -428,111 +428,119 @@ class TestLoadStrategyOverrides:
 class TestLogAgentAction:
     def test_writes_one_line_per_changed_key(self, tmp_path, monkeypatch):
         from trader.agents import base
-        monkeypatch.setattr(base, "_LOG_PATH", tmp_path / "agent_actions.log")
+        monkeypatch.setattr(base, "_LOG_DIR", tmp_path)
         base.log_agent_action(
             "strategy_tuner", "quick_pop_chart_ml",
             {"ml_min_score": 3.0, "ml_k": 7, "reason": "test"},
             {"ml_min_score": 5.0, "ml_k": 5},
         )
-        lines = (tmp_path / "agent_actions.log").read_text().splitlines()
+        lines = (tmp_path / "agent_actions_quick_pop_chart_ml.log").read_text().splitlines()
         assert len(lines) == 2
         assert "ml_min_score: 5.0 → 3.0" in lines[0]
         assert "ml_k: 5 → 7" in lines[1]
 
     def test_line_contains_agent_strategy_reason(self, tmp_path, monkeypatch):
         from trader.agents import base
-        monkeypatch.setattr(base, "_LOG_PATH", tmp_path / "agent_actions.log")
+        monkeypatch.setattr(base, "_LOG_DIR", tmp_path)
         base.log_agent_action(
             "strategy_tuner", "quick_pop_chart_ml",
             {"ml_min_score": 3.0, "reason": "buckets negative"},
             {"ml_min_score": 5.0},
         )
-        line = (tmp_path / "agent_actions.log").read_text()
+        line = (tmp_path / "agent_actions_quick_pop_chart_ml.log").read_text()
         assert "strategy_tuner" in line
         assert "quick_pop_chart_ml" in line
         assert "buckets negative" in line
 
     def test_appends_across_calls(self, tmp_path, monkeypatch):
         from trader.agents import base
-        monkeypatch.setattr(base, "_LOG_PATH", tmp_path / "agent_actions.log")
+        monkeypatch.setattr(base, "_LOG_DIR", tmp_path)
         base.log_agent_action("strategy_tuner", "quick_pop_chart_ml",
                               {"ml_min_score": 3.0, "reason": "a"}, {"ml_min_score": 5.0})
         base.log_agent_action("strategy_tuner", "quick_pop_chart_ml",
                               {"ml_min_score": 4.0, "reason": "b"}, {"ml_min_score": 3.0})
-        lines = (tmp_path / "agent_actions.log").read_text().splitlines()
+        lines = (tmp_path / "agent_actions_quick_pop_chart_ml.log").read_text().splitlines()
         assert len(lines) == 2
 
     def test_no_changes_writes_nothing(self, tmp_path, monkeypatch):
         from trader.agents import base
-        log = tmp_path / "agent_actions.log"
-        monkeypatch.setattr(base, "_LOG_PATH", log)
+        monkeypatch.setattr(base, "_LOG_DIR", tmp_path)
         base.log_agent_action("strategy_tuner", "quick_pop_chart_ml",
                               {"reason": "only reason"}, {})
-        assert not log.exists()
+        assert not (tmp_path / "agent_actions_quick_pop_chart_ml.log").exists()
 
     def test_creates_parent_directory(self, tmp_path, monkeypatch):
         from trader.agents import base
-        nested = tmp_path / "logs" / "subdir" / "agent_actions.log"
-        monkeypatch.setattr(base, "_LOG_PATH", nested)
+        nested_dir = tmp_path / "logs" / "subdir"
+        monkeypatch.setattr(base, "_LOG_DIR", nested_dir)
         base.log_agent_action("strategy_tuner", "quick_pop_chart_ml",
                               {"ml_min_score": 3.0, "reason": "x"}, {"ml_min_score": 5.0})
-        assert nested.exists()
+        assert (nested_dir / "agent_actions_quick_pop_chart_ml.log").exists()
 
     def test_reason_not_written_as_own_line(self, tmp_path, monkeypatch):
         from trader.agents import base
-        monkeypatch.setattr(base, "_LOG_PATH", tmp_path / "agent_actions.log")
+        monkeypatch.setattr(base, "_LOG_DIR", tmp_path)
         base.log_agent_action("strategy_tuner", "quick_pop_chart_ml",
                               {"ml_min_score": 3.0, "reason": "x"}, {"ml_min_score": 5.0})
-        lines = (tmp_path / "agent_actions.log").read_text().splitlines()
+        lines = (tmp_path / "agent_actions_quick_pop_chart_ml.log").read_text().splitlines()
         assert len(lines) == 1  # only ml_min_score, not reason
+
+    def test_different_strategies_write_separate_files(self, tmp_path, monkeypatch):
+        from trader.agents import base
+        monkeypatch.setattr(base, "_LOG_DIR", tmp_path)
+        base.log_agent_action("strategy_tuner", "quick_pop_chart_ml",
+                              {"ml_min_score": 3.0, "reason": "a"}, {"ml_min_score": 5.0})
+        base.log_agent_action("strategy_tuner", "trend_rider_chart_reanalyze",
+                              {"stop_loss_pct": 0.25, "reason": "b"}, {"stop_loss_pct": 0.30})
+        assert (tmp_path / "agent_actions_quick_pop_chart_ml.log").exists()
+        assert (tmp_path / "agent_actions_trend_rider_chart_reanalyze.log").exists()
+        assert "ml_min_score" not in (tmp_path / "agent_actions_trend_rider_chart_reanalyze.log").read_text()
+        assert "stop_loss_pct" not in (tmp_path / "agent_actions_quick_pop_chart_ml.log").read_text()
 
 
 # ---------------------------------------------------------------------------
-# _load_agent_history — reads filtered history for a strategy
+# _load_agent_history — reads per-strategy log file
 # ---------------------------------------------------------------------------
 
 class TestLoadAgentHistory:
     def test_returns_empty_when_no_log(self, tmp_path, monkeypatch):
         from trader.agents import base, strategy_tuner
-        monkeypatch.setattr(base, "_LOG_PATH", tmp_path / "nonexistent.log")
+        monkeypatch.setattr(base, "_LOG_DIR", tmp_path)
         result = strategy_tuner._load_agent_history("quick_pop_chart_ml")
         assert result == ""
 
-    def test_returns_only_matching_strategy_lines(self, tmp_path, monkeypatch):
+    def test_returns_all_lines_from_strategy_file(self, tmp_path, monkeypatch):
         from trader.agents import base, strategy_tuner
-        log = tmp_path / "agent_actions.log"
+        monkeypatch.setattr(base, "_LOG_DIR", tmp_path)
+        log = tmp_path / "agent_actions_quick_pop_chart_ml.log"
         log.write_text(
             "2026-03-17T10:00:00Z | strategy_tuner | quick_pop_chart_ml | ml_min_score: 5.0 → 3.0 | reason: a\n"
-            "2026-03-17T10:01:00Z | strategy_tuner | trend_rider_chart_reanalyze | stop_loss_pct: 0.30 → 0.25 | reason: b\n"
             "2026-03-17T10:02:00Z | strategy_tuner | quick_pop_chart_ml | ml_k: 5 → 7 | reason: c\n"
         )
-        monkeypatch.setattr(base, "_LOG_PATH", log)
         result = strategy_tuner._load_agent_history("quick_pop_chart_ml")
         assert "ml_min_score" in result
         assert "ml_k" in result
-        assert "stop_loss_pct" not in result
+
+    def test_other_strategy_file_not_included(self, tmp_path, monkeypatch):
+        from trader.agents import base, strategy_tuner
+        monkeypatch.setattr(base, "_LOG_DIR", tmp_path)
+        (tmp_path / "agent_actions_trend_rider_chart_reanalyze.log").write_text(
+            "2026-03-17T10:01:00Z | strategy_tuner | trend_rider_chart_reanalyze | stop_loss_pct: 0.30 → 0.25 | reason: b\n"
+        )
+        result = strategy_tuner._load_agent_history("quick_pop_chart_ml")
+        assert result == ""
 
     def test_respects_max_lines(self, tmp_path, monkeypatch):
         from trader.agents import base, strategy_tuner
-        log = tmp_path / "agent_actions.log"
+        monkeypatch.setattr(base, "_LOG_DIR", tmp_path)
+        log = tmp_path / "agent_actions_quick_pop_chart_ml.log"
         lines = "\n".join(
             f"2026-03-17T10:{i:02d}:00Z | strategy_tuner | quick_pop_chart_ml | ml_min_score: 5.0 → {i}.0 | reason: x"
             for i in range(30)
         ) + "\n"
         log.write_text(lines)
-        monkeypatch.setattr(base, "_LOG_PATH", log)
         result = strategy_tuner._load_agent_history("quick_pop_chart_ml", max_lines=5)
         assert len(result.splitlines()) == 5
-
-    def test_returns_empty_when_no_matching_lines(self, tmp_path, monkeypatch):
-        from trader.agents import base, strategy_tuner
-        log = tmp_path / "agent_actions.log"
-        log.write_text(
-            "2026-03-17T10:00:00Z | strategy_tuner | trend_rider_chart_reanalyze | stop_loss_pct: 0.30 → 0.25 | reason: x\n"
-        )
-        monkeypatch.setattr(base, "_LOG_PATH", log)
-        result = strategy_tuner._load_agent_history("quick_pop_chart_ml")
-        assert result == ""
 
 
 # ---------------------------------------------------------------------------
