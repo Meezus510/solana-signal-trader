@@ -149,8 +149,9 @@ CREATE TABLE IF NOT EXISTS signal_charts (
     snapshot_ts      TEXT,
     price_window_min    INTEGER NOT NULL DEFAULT 10,
     fetch_attempts      INTEGER NOT NULL DEFAULT 0,
-    price_tracking_done INTEGER NOT NULL DEFAULT 0,
-    price_stale_count   INTEGER NOT NULL DEFAULT 0
+    price_tracking_done   INTEGER NOT NULL DEFAULT 0,
+    price_stale_count     INTEGER NOT NULL DEFAULT 0,
+    price_checkpoint_price REAL
 )
 """
 
@@ -319,8 +320,9 @@ class TradeDatabase:
             ("snapshot_ts",     "TEXT"),
             ("price_window_min",    "INTEGER NOT NULL DEFAULT 10"),
             ("fetch_attempts",     "INTEGER NOT NULL DEFAULT 0"),
-            ("price_tracking_done","INTEGER NOT NULL DEFAULT 0"),
-            ("price_stale_count",  "INTEGER NOT NULL DEFAULT 0"),
+            ("price_tracking_done",    "INTEGER NOT NULL DEFAULT 0"),
+            ("price_stale_count",      "INTEGER NOT NULL DEFAULT 0"),
+            ("price_checkpoint_price", "REAL"),
         ]:
             try:
                 c.execute(f"ALTER TABLE signal_charts ADD COLUMN {col} {definition}")
@@ -961,10 +963,12 @@ class TradeDatabase:
         new_window_min: int,
         stale_count: int,
         done: bool,
+        checkpoint_price: Optional[float] = None,
     ) -> None:
         """
         Update price history watermark after each subsequent 10-min fetch.
         Only replaces peak/trough if the new value is a better extreme.
+        checkpoint_price: if provided, overwrites price_checkpoint_price (set at each 24h boundary).
         """
         self._conn.execute(
             """
@@ -975,15 +979,16 @@ class TradeDatabase:
                    trough_price     = CASE WHEN ? < COALESCE(trough_price,  1e18) THEN ? ELSE trough_price   END,
                    trough_price_ts  = CASE WHEN ? < COALESCE(trough_price,  1e18) THEN ? ELSE trough_price_ts END,
                    trough_pnl_pct   = CASE WHEN ? < COALESCE(trough_price,  1e18) THEN ? ELSE trough_pnl_pct  END,
-                   snapshot_price   = ?,
-                   snapshot_ts      = ?,
-                   price_window_min    = ?,
-                   price_stale_count   = ?,
-                   price_tracking_done = ?
+                   snapshot_price        = ?,
+                   snapshot_ts           = ?,
+                   price_window_min      = ?,
+                   price_stale_count     = ?,
+                   price_tracking_done   = ?,
+                   price_checkpoint_price = CASE WHEN ? IS NOT NULL THEN ? ELSE price_checkpoint_price END
              WHERE id = ?
             """,
             (
-                # peak comparisons (needs value repeated for CASE condition + SET)
+                # peak comparisons
                 peak_price, peak_price,
                 peak_price, peak_price_ts,
                 peak_price, peak_pnl_pct,
@@ -994,6 +999,8 @@ class TradeDatabase:
                 # snapshot + watermark
                 snapshot_price, snapshot_ts,
                 new_window_min, stale_count, 1 if done else 0,
+                # checkpoint (only written when provided)
+                checkpoint_price, checkpoint_price,
                 signal_chart_id,
             ),
         )

@@ -67,7 +67,8 @@ IS_DRY_RUN            = os.getenv("DRY_RUN", "").strip().lower() in ("1", "true"
 POLL_INTERVAL_SECONDS = 600    # 10 minutes between loop runs
 MAX_BATCH             = 20     # Birdeye calls per run
 INTER_REQUEST_SLEEP   = 0.5    # seconds between Birdeye calls
-MAX_WINDOW_MIN        = 1440   # hard cap: stop tracking after 24 hours
+MAX_WINDOW_MIN        = 1440   # base window: 24 hours
+DAILY_EXTENSION_PCT   = 100.0  # if price is >100% above entry at each 24h checkpoint, extend another 24h
 STALE_THRESHOLD       = 3      # consecutive no-movement intervals → mark done
 MAX_ATTEMPTS          = 3      # dead-coin threshold (no candles returned N times)
 
@@ -129,7 +130,7 @@ def _get_pending_rows(db_path: str, max_attempts: int) -> list[tuple]:
         return conn.execute(
             """
             SELECT id, mint, entry_price, ts, price_window_min,
-                   peak_price, trough_price, price_stale_count
+                   peak_price, trough_price, price_stale_count, price_checkpoint_price
               FROM signal_charts
              WHERE price_tracking_done = 0
                AND fetch_attempts < ?
@@ -333,7 +334,7 @@ async def _process_batch(
         cfg    = Config.load()
         client = BirdeyePriceClient(cfg, session)
 
-        for row_id, mint, entry_price, ts_str, current_window_min, stored_peak, stored_trough, stale_count in rows:
+        for row_id, mint, entry_price, ts_str, current_window_min, stored_peak, stored_trough, stale_count, checkpoint_price in rows:
             try:
                 ts_dt = datetime.fromisoformat(ts_str)
             except Exception:
@@ -455,7 +456,33 @@ async def _process_batch(
                 else:
                     new_stale = stale_count + 1
 
-                done = new_stale >= STALE_THRESHOLD or new_window_min >= max_window_min
+                # At each 24h boundary, compare current price to the price at
+                # the previous checkpoint (rolling 24h window):
+                #   - first checkpoint (24h): compare vs entry_price
+                #   - subsequent checkpoints (48h, 72h, ...): compare vs price saved at prior checkpoint
+                # If >100% gain over that 24h window, extend another 24h and
+                # save current snapshot as the new checkpoint baseline.
+                at_daily_checkpoint = (new_window_min % MAX_WINDOW_MIN == 0
+                                       and new_window_min >= MAX_WINDOW_MIN)
+                new_checkpoint_price = None  # only set when we save a new baseline
+                if at_daily_checkpoint:
+                    baseline = checkpoint_price if checkpoint_price is not None else entry_price
+                    gain_pct = (snapshot_price / baseline - 1.0) * 100.0 if baseline else 0.0
+                    if gain_pct > DAILY_EXTENSION_PCT:
+                        logger.info(
+                            "[price_history] row %d %s — %dh checkpoint: +%.1f%% vs prior 24h → extending",
+                            row_id, mint[:8], new_window_min // 60, gain_pct,
+                        )
+                        new_checkpoint_price = snapshot_price  # save as next baseline
+                        done = new_stale >= STALE_THRESHOLD
+                    else:
+                        logger.info(
+                            "[price_history] row %d %s — %dh checkpoint: +%.1f%% ≤ %.0f%% → stopping",
+                            row_id, mint[:8], new_window_min // 60, gain_pct, DAILY_EXTENSION_PCT,
+                        )
+                        done = True
+                else:
+                    done = new_stale >= STALE_THRESHOLD
 
                 peak_price     = batch_peak   if has_new_peak   else stored_peak
                 trough_price   = batch_trough if has_new_trough else stored_trough
@@ -487,6 +514,7 @@ async def _process_batch(
                         new_window_min=new_window_min,
                         stale_count=new_stale,
                         done=done,
+                        checkpoint_price=new_checkpoint_price,
                     )
                     updated += 1
 
