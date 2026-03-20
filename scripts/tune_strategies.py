@@ -43,11 +43,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dotenv import load_dotenv
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
-)
+_LOG_FMT = "%(asctime)s [%(name)s] %(levelname)s %(message)s"
+_LOG_DATE = "%H:%M:%S"
+logging.basicConfig(level=logging.INFO, format=_LOG_FMT, datefmt=_LOG_DATE)
+_fh = logging.FileHandler("tune.log", encoding="utf-8")
+_fh.setFormatter(logging.Formatter(_LOG_FMT, _LOG_DATE))
+logging.getLogger().addHandler(_fh)
 logger = logging.getLogger("tune_strategies")
 
 from trader.agents.strategy_tuner import (
@@ -164,6 +165,11 @@ def run_once(
 
         if not delta:
             print(f"  No changes proposed (insufficient data or no improvements found).")
+            # Still advance the counter so we don't re-trigger every loop
+            if not dry_run:
+                config = load_config()
+                _update_meta(strategy, current_count, config)
+                save_config(config)
             continue
 
         reason = delta.pop("reason", "")
