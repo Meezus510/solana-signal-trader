@@ -33,38 +33,69 @@ SEP = "=" * 72
 
 
 def print_closed_positions(db_path: str) -> None:
-    """Query and print all closed positions directly from the DB."""
+    """
+    Query and print all closed strategy outcomes.
+    Reads from strategy_outcomes (which has simulated DRY_RUN PnL) joined to
+    signal_charts for symbol/entry price. Falls back to positions table for
+    live-traded closes where outcome_pnl_usd may live there instead.
+    """
     conn = sqlite3.connect(db_path)
     rows = conn.execute(
         """
-        SELECT strategy, symbol, entry_price, realized_pnl_usd, sell_reason,
-               opened_at, closed_at
-        FROM positions
-        WHERE status = 'CLOSED'
-        ORDER BY strategy, closed_at
+        SELECT so.strategy,
+               sc.symbol,
+               sc.entry_price,
+               so.outcome_pnl_pct,
+               so.outcome_pnl_usd,
+               so.outcome_sell_reason,
+               so.outcome_hold_secs,
+               sc.peak_pnl_pct,
+               sc.ts
+          FROM strategy_outcomes so
+          JOIN signal_charts sc ON sc.id = so.signal_chart_id
+         WHERE so.entered = 1
+           AND so.closed  = 1
+           AND so.outcome_pnl_pct IS NOT NULL
+         ORDER BY so.strategy, sc.ts
         """
     ).fetchall()
 
     totals = conn.execute(
         """
-        SELECT strategy,
-               COUNT(*) AS total,
-               SUM(CASE WHEN realized_pnl_usd > 0 THEN 1 ELSE 0 END) AS wins,
-               SUM(realized_pnl_usd) AS pnl
-        FROM positions
-        WHERE status = 'CLOSED'
-        GROUP BY strategy
-        ORDER BY strategy
+        SELECT so.strategy,
+               COUNT(*)                                                      AS total,
+               SUM(CASE WHEN so.outcome_pnl_pct > 0 THEN 1 ELSE 0 END)     AS wins,
+               SUM(CASE WHEN so.outcome_pnl_pct <= 0 THEN 1 ELSE 0 END)    AS losses,
+               ROUND(AVG(so.outcome_pnl_pct), 2)                            AS avg_pnl,
+               COALESCE(SUM(so.outcome_pnl_usd), 0.0)                       AS total_usd
+          FROM strategy_outcomes so
+         WHERE so.entered = 1
+           AND so.closed  = 1
+           AND so.outcome_pnl_pct IS NOT NULL
+         GROUP BY so.strategy
+         ORDER BY so.strategy
         """
     ).fetchall()
 
-    grand_total = conn.execute(
+    open_counts = conn.execute(
+        """
+        SELECT so.strategy, COUNT(*) AS open
+          FROM strategy_outcomes so
+         WHERE so.entered = 1
+           AND so.closed  = 0
+         GROUP BY so.strategy
+        """
+    ).fetchall()
+    open_by_strategy = {r[0]: r[1] for r in open_counts}
+
+    grand = conn.execute(
         """
         SELECT COUNT(*),
-               SUM(CASE WHEN realized_pnl_usd > 0 THEN 1 ELSE 0 END),
-               SUM(realized_pnl_usd)
-        FROM positions
-        WHERE status = 'CLOSED'
+               SUM(CASE WHEN outcome_pnl_pct > 0 THEN 1 ELSE 0 END),
+               ROUND(AVG(outcome_pnl_pct), 2),
+               COALESCE(SUM(outcome_pnl_usd), 0.0)
+          FROM strategy_outcomes
+         WHERE entered = 1 AND closed = 1 AND outcome_pnl_pct IS NOT NULL
         """
     ).fetchone()
 
@@ -72,42 +103,51 @@ def print_closed_positions(db_path: str) -> None:
 
     if not rows:
         print(SEP)
-        print("  CLOSED POSITIONS — none yet")
+        print("  CLOSED OUTCOMES — none yet")
         print(SEP)
         return
 
     print(SEP)
-    print("  CLOSED POSITIONS (realized PnL from fully exited trades)")
+    print("  CLOSED OUTCOMES  (simulated via price_history.py candles)")
     print(SEP)
 
     current_strategy = None
-    for strategy, symbol, entry_price, pnl, reason, opened_at, closed_at in rows:
+    for strategy, symbol, entry_price, pnl_pct, pnl_usd, reason, hold_secs, peak_pct, ts in rows:
         if strategy != current_strategy:
             current_strategy = strategy
             print(f"\n  [{strategy}]")
-        sign = "+" if pnl >= 0 else ""
+        hold_str = f"{hold_secs/60:.0f}m" if hold_secs else "—"
+        peak_str = f"peak={peak_pct:+.1f}%" if peak_pct is not None else ""
+        usd_str  = f"${pnl_usd:+.2f}" if pnl_usd is not None else "n/a"
         print(
-            f"    {symbol:<12} entry=${entry_price:<12.8f} "
-            f"pnl=${sign}{pnl:+.4f}  exit={reason or '—':<18} closed={closed_at[:16] if closed_at else '?'}"
+            f"    {str(symbol):<10}  entry={entry_price:.8f}  "
+            f"pnl={pnl_pct:+.1f}% ({usd_str})  "
+            f"exit={str(reason or '—'):<12}  hold={hold_str:<6}  {peak_str}"
         )
 
     print()
     print(SEP)
-    print("  CLOSED POSITIONS SUMMARY")
+    print("  SUMMARY BY STRATEGY")
     print(SEP)
-    for strategy, total, wins, pnl in totals:
+    for strategy, total, wins, losses, avg_pnl, total_usd in totals:
         win_rate = (wins / total * 100) if total else 0.0
+        still_open = open_by_strategy.get(strategy, 0)
         print(
-            f"  [{strategy:<20}]  closed={total:>3}  wins={wins:>3}  "
-            f"win_rate={win_rate:>5.1f}%  realized=${pnl:+.4f}"
+            f"  [{strategy:<28}]  "
+            f"closed={total:>3}  open={still_open:>3}  "
+            f"W/L={wins}/{losses}  win%={win_rate:>5.1f}  "
+            f"avg={avg_pnl:>+6.1f}%  realized={total_usd:>+8.2f}"
         )
 
-    total_count, total_wins, total_pnl = grand_total
+    total_count, total_wins, avg_pnl, total_usd = grand
+    total_losses = total_count - total_wins
     total_win_rate = (total_wins / total_count * 100) if total_count else 0.0
     print(SEP)
     print(
-        f"  GLOBAL                       closed={total_count:>3}  wins={total_wins:>3}  "
-        f"win_rate={total_win_rate:>5.1f}%  realized=${total_pnl:+.4f}"
+        f"  {'GLOBAL':<30}  "
+        f"closed={total_count:>3}  "
+        f"W/L={total_wins}/{total_losses}  win%={total_win_rate:>5.1f}  "
+        f"avg={avg_pnl:>+6.1f}%  realized={total_usd:>+8.2f}"
     )
     print(SEP)
     print()
@@ -190,7 +230,11 @@ def main() -> None:
 
     db.close()
 
-    # BirdeyePriceClient is not needed — print_summary uses last_price from DB
+    # BirdeyePriceClient is not available here — open positions show entry price,
+    # not current market price. Unrealized PnL will read $0 for all open positions.
+    print(SEP)
+    print("  OPEN POSITIONS  (prices shown are entry prices — not live)")
+    print(SEP)
     engine = MultiStrategyEngine(cfg=cfg, runners=runners, birdeye_client=None)
     engine.print_summary()
 

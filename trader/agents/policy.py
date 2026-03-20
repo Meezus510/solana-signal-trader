@@ -103,8 +103,9 @@ def propose_policy_decision(
         raise ValueError("ANTHROPIC_API_KEY not set — required for policy agent")
 
     client = anthropic.Anthropic(api_key=api_key)
-    logger.info("[policy_agent] Calling %s for strategy=%s ml_score=%.2f",
-                _MODEL, strategy, signal_context.get("ml_score", 0))
+    _ml = signal_context.get("ml_score")
+    logger.info("[policy_agent] Calling %s for strategy=%s ml_score=%s",
+                _MODEL, strategy, f"{_ml:.2f}" if _ml is not None else "None")
 
     message = client.messages.create(
         model=_MODEL,

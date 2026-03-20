@@ -96,6 +96,7 @@ class PaperExchange:
             opened_at=datetime.now(timezone.utc),
             closed_at=None,
             highest_price=entry_price,
+            lowest_price=entry_price,
             take_profit_price=entry_price * cfg.take_profit_levels[0].multiple,
             stop_loss_price=entry_price * (1.0 - cfg.stop_loss_pct),
             trailing_active=False,

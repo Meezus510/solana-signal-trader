@@ -263,14 +263,37 @@ def run(
 
     current_params = config.get(strategy, {})
 
-    # Query performance data from DB
+    # Query performance data from DB.
     exit_stats = query_exit_stats(db_path, strategy)
     total_trades = sum(s["count"] for s in exit_stats)
 
-    if total_trades < _MIN_TRADES:
+    # Always fetch base strategy data for supplemental context in the prompt.
+    base_exit_stats: list[dict] = []
+    base_recent_trades: list[dict] = []
+    if strategy in _BASE_STRATEGY:
+        _base_name = _BASE_STRATEGY[strategy]
+        base_exit_stats = query_exit_stats(db_path, _base_name)
+        base_recent_trades = query_recent_trades(db_path, _base_name, limit=20)
+
+    # Minimum-data check.
+    # If the strategy has 1–9 own closed trades and the base strategy has ≥10,
+    # allow the tuner to run — both datasets are passed to the prompt so the
+    # agent can reason about base-strategy outcomes alongside its own limited data.
+    effective_total = total_trades
+    count_strategy = strategy
+    if 0 < total_trades < _MIN_TRADES and strategy in _BASE_STRATEGY:
+        base_total = sum(s["count"] for s in base_exit_stats)
+        if base_total >= _MIN_TRADES:
+            logger.info(
+                "[strategy_tuner] %s has %d own closed trades — base '%s' has %d, allowing tuner to run with both datasets",
+                strategy, total_trades, _BASE_STRATEGY[strategy], base_total,
+            )
+            effective_total = base_total
+
+    if effective_total < _MIN_TRADES:
         logger.info(
             "[strategy_tuner] Only %d closed trades for %s — need %d to run",
-            total_trades, strategy, _MIN_TRADES,
+            total_trades, count_strategy, _MIN_TRADES,
         )
         return {}
 
@@ -309,9 +332,9 @@ def run(
 
     # Build prompt and call Claude (tier-appropriate prompt)
     if strategy in ML_ONLY_STRATEGIES:
-        prompt = _build_prompt_ml_only(strategy, current_params, exit_stats, recent_trades, score_buckets, total_trades, ai_balance, live_trading_on, skipped_stats)
+        prompt = _build_prompt_ml_only(strategy, current_params, exit_stats, recent_trades, score_buckets, total_trades, ai_balance, live_trading_on, skipped_stats, base_exit_stats, base_recent_trades)
     elif strategy in _CHART_VARIANTS:
-        prompt = _build_prompt_chart(strategy, current_params, exit_stats, recent_trades, score_buckets, total_trades, ai_balance, live_trading_on, skipped_stats)
+        prompt = _build_prompt_chart(strategy, current_params, exit_stats, recent_trades, score_buckets, total_trades, ai_balance, live_trading_on, skipped_stats, base_exit_stats, base_recent_trades)
     else:
         prompt = _build_prompt_base(strategy, current_params, exit_stats, recent_trades, total_trades, ai_balance, live_trading_on)
 
@@ -623,6 +646,8 @@ def _build_prompt_chart(
     ai_balance: float = _AI_START_BALANCE,
     live_trading_on: bool = False,
     skipped_stats: dict | None = None,
+    base_exit_stats: list[dict] | None = None,
+    base_recent_trades: list[dict] | None = None,
 ) -> str:
     base = _build_prompt_base(strategy, current_params, exit_stats, recent_trades, total_trades, ai_balance, live_trading_on)
     tp_count = 4 if strategy in _MOONBAG_STRATEGIES else 1
@@ -632,7 +657,18 @@ def _build_prompt_chart(
         base_strategy = _BASE_STRATEGY.get(strategy, "")
         skipped_section = _format_skipped_section(skipped_stats, base_strategy)
 
-    ml_section = f"""{skipped_section}
+    base_section = ""
+    if base_exit_stats or base_recent_trades:
+        _base_name = _BASE_STRATEGY.get(strategy, "base")
+        base_section = f"""
+BASE STRATEGY ({_base_name}) EXIT BREAKDOWN (proxy for unfiltered market conditions):
+{json.dumps(base_exit_stats, indent=2) if base_exit_stats else "  No base strategy data yet."}
+
+BASE STRATEGY LAST 10 TRADES:
+{json.dumps((base_recent_trades or [])[-10:], indent=2) if base_recent_trades else "  None yet."}
+"""
+
+    ml_section = f"""{base_section}{skipped_section}
 
 SCORE-BUCKET PERFORMANCE (ml_score buckets, chart-filtered trades only):
 {json.dumps(score_buckets, indent=2) if score_buckets else "  No score bucket data yet (use_ml_filter may be disabled)."}
@@ -699,6 +735,8 @@ def _build_prompt_ml_only(
     ai_balance: float = _AI_START_BALANCE,
     live_trading_on: bool = False,
     skipped_stats: dict | None = None,
+    base_exit_stats: list[dict] | None = None,
+    base_recent_trades: list[dict] | None = None,
 ) -> str:
     """
     Prompt for ML_ONLY strategies (quick_pop_chart_ml).
@@ -736,11 +774,17 @@ CURRENT ML CONFIGURATION:
   ml_score_low_pct:         {current_params.get('ml_score_low_pct', -35.0)}  (PnL% → score 0)
   ml_score_high_pct:        {current_params.get('ml_score_high_pct', 85.0)}  (PnL% → score 10)
 
-EXIT REASON BREAKDOWN:
-{json.dumps(exit_stats, indent=2)}
+EXIT REASON BREAKDOWN ({strategy} own trades — {total_trades} total):
+{json.dumps(exit_stats, indent=2) if exit_stats else "  No own closed trades yet."}
 
-LAST 10 TRADES (most recent first):
-{json.dumps(recent_trades[-10:], indent=2)}
+LAST 10 TRADES for {strategy} (most recent first):
+{json.dumps(recent_trades[-10:], indent=2) if recent_trades else "  None yet."}
+
+BASE STRATEGY ({_BASE_STRATEGY.get(strategy, "n/a")}) EXIT BREAKDOWN (proxy for market conditions):
+{json.dumps(base_exit_stats, indent=2) if base_exit_stats else "  No base strategy data yet."}
+
+BASE STRATEGY LAST 10 TRADES:
+{json.dumps((base_recent_trades or [])[-10:], indent=2) if base_recent_trades else "  None yet."}
 
 SCORE-BUCKET PERFORMANCE (ml_score buckets, chart-filtered trades only):
 {json.dumps(score_buckets, indent=2) if score_buckets else "  No score bucket data yet — ML filter is new. Do not raise ml_min_score without bucket evidence."}

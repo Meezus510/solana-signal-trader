@@ -205,6 +205,8 @@ class StrategyRunner:
         self._portfolio = PortfolioManager()
         # mint → strategy_outcomes row id (populated by engine when save_chart_data=True)
         self._outcome_ids: dict[str, int] = {}
+        # mint → signal_charts row id (populated by engine when save_chart_data=True)
+        self._signal_chart_ids: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Properties
@@ -229,6 +231,10 @@ class StrategyRunner:
     def set_outcome_id(self, mint: str, outcome_id: int) -> None:
         """Called by the engine after saving a strategy_outcomes row for an entered position."""
         self._outcome_ids[mint] = outcome_id
+
+    def set_signal_chart_id(self, mint: str, signal_chart_id: int) -> None:
+        """Called by the engine after saving a signal_charts row for an entered position."""
+        self._signal_chart_ids[mint] = signal_chart_id
 
     def restore_cash(self, available_cash: float, starting_cash: float) -> None:
         self._exchange.portfolio.available_cash_usd = available_cash
@@ -389,9 +395,11 @@ class StrategyRunner:
             opened_at = opened_at.replace(tzinfo=timezone.utc)
         age_minutes = (now - opened_at).total_seconds() / 60.0
 
-        # 1. Update highest price seen
+        # 1. Update highest/lowest price seen
         if current_price > position.highest_price:
             position.highest_price = current_price
+        if current_price < position.lowest_price:
+            position.lowest_price = current_price
 
         # 2. Check existing stop (values from previous tick — before any update this tick)
         #    Trailing stop if active, else fixed stop_loss_price.
@@ -537,7 +545,7 @@ class StrategyRunner:
 
     def _flush_outcome(self, position: Position, reason: str) -> None:
         """Update strategy_outcomes row with outcome metrics when a position closes."""
-        if not self._cfg.save_chart_data or not self._db:
+        if not self._db:
             return
         outcome_id = self._outcome_ids.pop(position.mint_address, None)
         if outcome_id is None:
@@ -555,6 +563,24 @@ class StrategyRunner:
             outcome_id, pnl_pct, reason, hold_secs, max_gain_pct,
             pnl_usd=position.realized_pnl_usd,
         )
+
+        signal_chart_id = self._signal_chart_ids.pop(position.mint_address, None)
+        if signal_chart_id is not None:
+            now_iso = closed_at.isoformat()
+            trough_pnl_pct = (position.lowest_price / position.entry_price - 1.0) * 100.0
+            hold_min = hold_secs / 60.0
+            self._db.save_price_history(
+                signal_chart_id=signal_chart_id,
+                peak_price=position.highest_price,
+                peak_price_ts=now_iso,
+                peak_pnl_pct=max_gain_pct,
+                trough_price=position.lowest_price,
+                trough_price_ts=now_iso,
+                trough_pnl_pct=trough_pnl_pct,
+                snapshot_price=position.highest_price,
+                snapshot_ts=now_iso,
+                price_window_min=max(1, round(hold_min)),
+            )
 
     # ------------------------------------------------------------------
     # Reporting

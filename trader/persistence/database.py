@@ -138,7 +138,19 @@ CREATE TABLE IF NOT EXISTS signal_charts (
     candles_1m_json TEXT,
     pair_stats_json TEXT,
     ml_score        REAL,
-    source_channel  TEXT NOT NULL DEFAULT ''
+    source_channel  TEXT NOT NULL DEFAULT '',
+    peak_price       REAL,
+    peak_price_ts    TEXT,
+    peak_pnl_pct     REAL,
+    trough_price     REAL,
+    trough_price_ts  TEXT,
+    trough_pnl_pct   REAL,
+    snapshot_price   REAL,
+    snapshot_ts      TEXT,
+    price_window_min    INTEGER NOT NULL DEFAULT 10,
+    fetch_attempts      INTEGER NOT NULL DEFAULT 0,
+    price_tracking_done INTEGER NOT NULL DEFAULT 0,
+    price_stale_count   INTEGER NOT NULL DEFAULT 0
 )
 """
 
@@ -192,10 +204,15 @@ class TradeDatabase:
     def __init__(self, path: str = "trader.db", read_only: bool = False) -> None:
         self.path = path  # exposed so agents can open read-only connections for queries
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        if not read_only:
+        if read_only:
+            # URI mode: truly read-only — any accidental write raises OperationalError
+            uri = f"file:{Path(path).resolve()}?mode=ro"
+            self._conn = sqlite3.connect(uri, uri=True, check_same_thread=False, timeout=30)
+        else:
+            self._conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
             self._create_tables()
         logger.info("[DB] Opened %s%s", path, " (read-only)" if read_only else "")
 
@@ -291,13 +308,26 @@ class TradeDatabase:
 
         # signal_charts columns added after initial release
         for col, definition in [
-            ("source_channel", "TEXT NOT NULL DEFAULT ''"),
+            ("source_channel",  "TEXT NOT NULL DEFAULT ''"),
+            ("peak_price",      "REAL"),
+            ("peak_price_ts",   "TEXT"),
+            ("peak_pnl_pct",    "REAL"),
+            ("trough_price",    "REAL"),
+            ("trough_price_ts", "TEXT"),
+            ("trough_pnl_pct",  "REAL"),
+            ("snapshot_price",  "REAL"),
+            ("snapshot_ts",     "TEXT"),
+            ("price_window_min",    "INTEGER NOT NULL DEFAULT 10"),
+            ("fetch_attempts",     "INTEGER NOT NULL DEFAULT 0"),
+            ("price_tracking_done","INTEGER NOT NULL DEFAULT 0"),
+            ("price_stale_count",  "INTEGER NOT NULL DEFAULT 0"),
         ]:
             try:
                 c.execute(f"ALTER TABLE signal_charts ADD COLUMN {col} {definition}")
                 logger.info("[DB] Migrated: added column %s to signal_charts", col)
-                c.execute("UPDATE signal_charts SET source_channel = ?", (_LEGACY_CHANNEL,))
-                logger.info("[DB] Backfilled signal_charts.source_channel = '%s'", _LEGACY_CHANNEL)
+                if col == "source_channel":
+                    c.execute("UPDATE signal_charts SET source_channel = ?", (_LEGACY_CHANNEL,))
+                    logger.info("[DB] Backfilled signal_charts.source_channel = '%s'", _LEGACY_CHANNEL)
             except sqlite3.OperationalError:
                 pass  # column already exists
 
@@ -481,6 +511,7 @@ class TradeDatabase:
             remaining_quantity=remaining_quantity,
             usd_size=usd_size,
             highest_price=highest_price,
+            lowest_price=entry_price,  # not persisted — reset to entry on restore
             take_profit_price=take_profit_price,
             stop_loss_price=stop_loss_price,
             trailing_active=bool(trailing_active),
@@ -884,6 +915,102 @@ class TradeDatabase:
             (pnl_pct, pnl_usd, sell_reason, hold_secs, max_gain_pct, outcome_id),
         )
         self._conn.commit()
+
+    def save_price_history(
+        self,
+        signal_chart_id: int,
+        peak_price: Optional[float],
+        peak_price_ts: Optional[str],
+        peak_pnl_pct: Optional[float],
+        trough_price: Optional[float],
+        trough_price_ts: Optional[str],
+        trough_pnl_pct: Optional[float],
+        snapshot_price: Optional[float],
+        snapshot_ts: Optional[str],
+        price_window_min: int = 10,
+    ) -> None:
+        """Write post-signal price history to a signal_charts row."""
+        self._conn.execute(
+            """
+            UPDATE signal_charts
+               SET peak_price=?, peak_price_ts=?, peak_pnl_pct=?,
+                   trough_price=?, trough_price_ts=?, trough_pnl_pct=?,
+                   snapshot_price=?, snapshot_ts=?, price_window_min=?
+             WHERE id=?
+            """,
+            (
+                peak_price, peak_price_ts, peak_pnl_pct,
+                trough_price, trough_price_ts, trough_pnl_pct,
+                snapshot_price, snapshot_ts, price_window_min,
+                signal_chart_id,
+            ),
+        )
+        self._conn.commit()
+
+    def advance_price_watermark(
+        self,
+        signal_chart_id: int,
+        peak_price: float,
+        peak_price_ts: str,
+        peak_pnl_pct: float,
+        trough_price: float,
+        trough_price_ts: str,
+        trough_pnl_pct: float,
+        snapshot_price: float,
+        snapshot_ts: str,
+        new_window_min: int,
+        stale_count: int,
+        done: bool,
+    ) -> None:
+        """
+        Update price history watermark after each subsequent 10-min fetch.
+        Only replaces peak/trough if the new value is a better extreme.
+        """
+        self._conn.execute(
+            """
+            UPDATE signal_charts
+               SET peak_price       = CASE WHEN ? > COALESCE(peak_price,   -1e18) THEN ? ELSE peak_price   END,
+                   peak_price_ts    = CASE WHEN ? > COALESCE(peak_price,   -1e18) THEN ? ELSE peak_price_ts END,
+                   peak_pnl_pct     = CASE WHEN ? > COALESCE(peak_price,   -1e18) THEN ? ELSE peak_pnl_pct  END,
+                   trough_price     = CASE WHEN ? < COALESCE(trough_price,  1e18) THEN ? ELSE trough_price   END,
+                   trough_price_ts  = CASE WHEN ? < COALESCE(trough_price,  1e18) THEN ? ELSE trough_price_ts END,
+                   trough_pnl_pct   = CASE WHEN ? < COALESCE(trough_price,  1e18) THEN ? ELSE trough_pnl_pct  END,
+                   snapshot_price   = ?,
+                   snapshot_ts      = ?,
+                   price_window_min    = ?,
+                   price_stale_count   = ?,
+                   price_tracking_done = ?
+             WHERE id = ?
+            """,
+            (
+                # peak comparisons (needs value repeated for CASE condition + SET)
+                peak_price, peak_price,
+                peak_price, peak_price_ts,
+                peak_price, peak_pnl_pct,
+                # trough comparisons
+                trough_price, trough_price,
+                trough_price, trough_price_ts,
+                trough_price, trough_pnl_pct,
+                # snapshot + watermark
+                snapshot_price, snapshot_ts,
+                new_window_min, stale_count, 1 if done else 0,
+                signal_chart_id,
+            ),
+        )
+        self._conn.commit()
+
+    def increment_fetch_attempts(self, signal_chart_id: int) -> int:
+        """
+        Increment fetch_attempts for a signal_charts row and return the new count.
+        Used by price_history.py to track dead coins (no Birdeye candles returned).
+        """
+        row = self._conn.execute(
+            "UPDATE signal_charts SET fetch_attempts = fetch_attempts + 1 WHERE id = ? "
+            "RETURNING fetch_attempts",
+            (signal_chart_id,),
+        ).fetchone()
+        self._conn.commit()
+        return row[0] if row else 1
 
     def get_ai_balance(self, start_usd: float = 1000.0) -> float:
         """

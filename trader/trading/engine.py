@@ -192,8 +192,7 @@ class MultiStrategyEngine:
             self._db.log_signal("SIGNAL", symbol=signal.symbol, mint=signal.mint_address, source_channel=signal.source_channel)
 
         if self._cfg.dry_run:
-            logger.info("[DRY_RUN] %s — skipping Birdeye and entry", signal.symbol)
-            return
+            logger.info("[DRY_RUN] %s — data collection mode (no positions)", signal.symbol)
 
         entry_price = await self._birdeye.get_price(signal.mint_address)
         if entry_price is None:
@@ -594,6 +593,7 @@ class MultiStrategyEngine:
                 )
                 if position is not None:
                     runner.set_outcome_id(signal.mint_address, outcome_id)
+                    runner.set_signal_chart_id(signal.mint_address, signal_chart_id)
 
         # Schedule reanalysis if chart filter skipped this signal, at least one
         # runner has reanalysis enabled, and this mint isn't already pending.
@@ -890,7 +890,7 @@ class MultiStrategyEngine:
         A mint is tracked until ALL strategies have exited it.
         """
         if self._cfg.dry_run:
-            logger.info("[DRY_RUN] Monitor loop disabled — no positions will be opened")
+            logger.info("[DRY_RUN] Monitor loop disabled — outcomes simulated by price_history.py")
             return
 
         mode = f"{cycles} cycles" if cycles is not None else "live (∞)"

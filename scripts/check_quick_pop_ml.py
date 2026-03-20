@@ -90,7 +90,50 @@ def main() -> None:
         print(f"  Entered         : {entered}/{len(rows)}")
 
     # ------------------------------------------------------------------
-    # 2. Overall outcome summary
+    # 2. quick_pop_chart entered buys (the base strategy)
+    # ------------------------------------------------------------------
+    buy_rows = conn.execute(
+        """
+        SELECT sc.ts, sc.symbol, so.outcome_pnl_pct, so.outcome_sell_reason,
+               so.outcome_hold_secs, so.closed
+          FROM strategy_outcomes so
+          JOIN signal_charts sc ON so.signal_chart_id = sc.id
+         WHERE so.strategy = 'quick_pop_chart'
+           AND so.entered  = 1
+         ORDER BY sc.ts DESC
+         LIMIT ?
+        """,
+        (args.limit,),
+    ).fetchall()
+
+    print(f"\n{SEP}")
+    print(f"  QUICK_POP_CHART — last {args.limit} entered buys (base strategy / training source)")
+    print(SEP)
+
+    if not buy_rows:
+        print("  No entered buys found for quick_pop_chart.")
+    else:
+        closed_count = sum(1 for r in buy_rows if r[5] == 1)
+        wins = sum(1 for r in buy_rows if r[2] is not None and r[2] > 0)
+        losses = sum(1 for r in buy_rows if r[2] is not None and r[2] <= 0)
+        pnls = [r[2] for r in buy_rows if r[2] is not None]
+        avg_pnl = sum(pnls) / len(pnls) if pnls else None
+
+        print(f"  {'ts':16}  {'symbol':12}  {'pnl%':7}  {'reason':14}  {'hold':8}")
+        print(f"  {'-'*16}  {'-'*12}  {'-'*7}  {'-'*14}  {'-'*8}")
+        for ts, symbol, pnl, reason, hold_secs, closed in buy_rows:
+            pnl_str  = f"{pnl:+.1f}%" if pnl is not None else "open"
+            hold_str = f"{hold_secs/60:.0f}m"  if hold_secs is not None else "-"
+            reason_str = reason or ("open" if not closed else "-")
+            print(f"  {str(ts)[:16]}  {str(symbol):<12}  {pnl_str:<7}  {reason_str:<14}  {hold_str}")
+
+        print()
+        print(f"  Total shown     : {len(buy_rows)}  ({closed_count} closed)")
+        if avg_pnl is not None:
+            print(f"  Win/Loss        : {wins}W / {losses}L  avg={avg_pnl:+.1f}%")
+
+    # ------------------------------------------------------------------
+    # 3. Overall outcome summary
     # ------------------------------------------------------------------
     summary = conn.execute(
         """
