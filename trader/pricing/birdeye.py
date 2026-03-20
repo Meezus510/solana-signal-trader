@@ -331,9 +331,14 @@ class BirdeyePriceClient:
         Fetch token metadata from Birdeye's token overview endpoint.
 
         Returns a flat dict with fields merged into pair_stats for ML features:
-            market_cap_usd   — USD market cap at signal time (None if unavailable)
-            liquidity_usd    — total USD liquidity across all pools
-            holder_count     — number of unique holders
+            market_cap_usd        — USD market cap at signal time (None if unavailable)
+            liquidity_usd         — total USD liquidity across all pools
+            holder_count          — number of unique holders
+            unique_wallet_5m      — distinct wallets that traded in last 5 min
+            unique_wallet_hist_5m — distinct wallets that traded 5–10 min ago
+            price_change_30m_pct  — price % change over last 30 min
+            buy_volume_usd_5m     — buy-side USD volume in last 5 min
+            sell_volume_usd_5m    — sell-side USD volume in last 5 min
 
         Returns None on any error so callers fall back to neutral ML features.
 
@@ -359,18 +364,28 @@ class BirdeyePriceClient:
                     return None
 
                 data = (await resp.json()).get("data") or {}
-                mc  = data.get("marketCap") or data.get("realMc")
-                liq = data.get("liquidity")
-                hld = data.get("holder")
+                mc   = data.get("marketCap") or data.get("realMc")
+                liq  = data.get("liquidity")
+                hld  = data.get("holder")
+                uw5  = data.get("uniqueWallet5m")
+                uwh5 = data.get("uniqueWalletHistory5m")
+                pc30 = data.get("priceChange30mPercent")
+                vb5  = data.get("vBuy5mUSD")
+                vs5  = data.get("vSell5mUSD")
 
-                if mc is None and liq is None and hld is None:
+                if mc is None and liq is None and hld is None and uw5 is None:
                     logger.debug("[TokenOverview] no usable metadata for %s", mint_address)
                     return None
 
                 return {
-                    "market_cap_usd": float(mc)  if mc  is not None else None,
-                    "liquidity_usd":  float(liq) if liq is not None else None,
-                    "holder_count":   int(hld)   if hld is not None else None,
+                    "market_cap_usd":        float(mc)   if mc   is not None else None,
+                    "liquidity_usd":         float(liq)  if liq  is not None else None,
+                    "holder_count":          int(hld)    if hld  is not None else None,
+                    "unique_wallet_5m":      int(uw5)    if uw5  is not None else None,
+                    "unique_wallet_hist_5m": int(uwh5)   if uwh5 is not None else None,
+                    "price_change_30m_pct":  float(pc30) if pc30 is not None else None,
+                    "buy_volume_usd_5m":     float(vb5)  if vb5  is not None else None,
+                    "sell_volume_usd_5m":    float(vs5)  if vs5  is not None else None,
                 }
 
         except asyncio.TimeoutError:

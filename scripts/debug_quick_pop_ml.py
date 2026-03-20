@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """
-scripts/debug_moonbag_ml.py — Deep investigation of ML separability for infinite_moonbag.
+scripts/debug_quick_pop_ml.py — Deep investigation of ML separability for quick_pop.
 
 Phase 1: Feature distribution analysis — which features differ between winners/losers?
 Phase 2: Rule-based thresholds — single-feature and combo rules via LOO-CV
 Phase 3: Weighted KNN with best features emphasized
 Phase 4: Summary + recommendation
+
+Key differences vs moonbag:
+  - Trains on 'quick_pop' base strategy (not managed variant)
+  - ml_prefer_moralis=True → 10s candles ARE live at scoring time (unlike moonbag)
+  - 21-feature vector (18 chart/pair features + 3 token metadata)
+  - Token metadata (idx 18-20) likely all fallback=0.5 in historical data
+  - Winners defined as outcome_pnl_pct > 0 (scalp exit PnL, not peak)
 """
 from __future__ import annotations
 
@@ -14,7 +21,6 @@ import math
 import sqlite3
 import sys
 from datetime import datetime, timezone
-from itertools import product
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -33,6 +39,7 @@ FEAT_NAMES = [
     "unique_wallet_5m_norm", "wallet_momentum_5m", "price_change_30m_norm", "buy_vol_ratio_5m",
 ]
 
+
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
@@ -45,7 +52,7 @@ def load_data(db_path: str) -> list[dict]:
                sc.source_channel, sc.ts, sc.pump_ratio as raw_pump
         FROM strategy_outcomes so
         JOIN signal_charts sc ON sc.id = so.signal_chart_id
-        WHERE so.strategy = 'infinite_moonbag' AND so.closed = 1 AND so.entered = 1
+        WHERE so.strategy = 'quick_pop' AND so.closed = 1 AND so.entered = 1
         ORDER BY so.id
     """).fetchall()
     conn.close()
@@ -107,11 +114,14 @@ def feature_separability(records, all_feats):
 
     separability = []
     for fi, name in enumerate(FEAT_NAMES):
-        w_vals = [f[fi] for f in winner_feats]
-        l_vals = [f[fi] for f in loser_feats]
+        w_vals = [f[fi] for f in winner_feats if fi < len(f)]
+        l_vals = [f[fi] for f in loser_feats  if fi < len(f)]
+        if not w_vals or not l_vals:
+            separability.append((fi, name, 0.0, 0.0, 0.0, 0.0, 0.0))
+            print(f"  {name:<25} {'N/A':>9}")
+            continue
         w_mean, w_std = _mean(w_vals), _std(w_vals)
         l_mean, l_std = _mean(l_vals), _std(l_vals)
-        # Cohen's d
         pooled_std = math.sqrt((w_std**2 + l_std**2) / 2) if (w_std + l_std) > 0 else 1.0
         cohens_d = abs(w_mean - l_mean) / (pooled_std + 1e-9)
         separability.append((fi, name, w_mean, w_std, l_mean, l_std, cohens_d))
@@ -120,7 +130,7 @@ def feature_separability(records, all_feats):
     print()
     separability.sort(key=lambda x: x[6], reverse=True)
     print("  Top features by separability (Cohen's d):")
-    for fi, name, wm, ws, lm, ls, d in separability[:6]:
+    for fi, name, wm, ws, lm, ls, d in separability[:8]:
         direction = "WINNERS > LOSERS" if wm > lm else "LOSERS > WINNERS"
         print(f"    [{fi:2d}] {name:<28} d={d:.3f}  ({direction})")
 
@@ -128,15 +138,53 @@ def feature_separability(records, all_feats):
 
 
 # ---------------------------------------------------------------------------
+# Phase 1b: Peak PnL separability (secondary label)
+# ---------------------------------------------------------------------------
+
+def peak_separability(records, all_feats):
+    print("=" * 80)
+    print("PHASE 1b: SEPARABILITY BY PEAK PnL > 49% (TP1 proxy)")
+    print("=" * 80)
+
+    # TP1 at 1.5× = 50% gain — approximate threshold for catching a real pump
+    winner_feats = [all_feats[i] for i, r in enumerate(records)
+                    if r["position_peak_pnl_pct"] > 49.0 and all_feats[i] is not None]
+    loser_feats  = [all_feats[i] for i, r in enumerate(records)
+                    if r["position_peak_pnl_pct"] <= 49.0 and all_feats[i] is not None]
+
+    print(f"  Peak>49% (hit TP1): {len(winner_feats)} | Others: {len(loser_feats)}\n")
+    print(f"  {'Feature':<25} {'W_mean':>9} {'W_std':>7} {'L_mean':>9} {'L_std':>7} {'Sep':>7}")
+    print("  " + "-" * 70)
+
+    separability2 = []
+    for fi, name in enumerate(FEAT_NAMES):
+        w_vals = [f[fi] for f in winner_feats if fi < len(f)]
+        l_vals = [f[fi] for f in loser_feats  if fi < len(f)]
+        if not w_vals or not l_vals:
+            separability2.append((fi, name, 0.0, 0.0, 0.0, 0.0, 0.0))
+            continue
+        w_mean, w_std = _mean(w_vals), _std(w_vals)
+        l_mean, l_std = _mean(l_vals), _std(l_vals)
+        pooled_std = math.sqrt((w_std**2 + l_std**2) / 2) if (w_std + l_std) > 0 else 1.0
+        cohens_d = abs(w_mean - l_mean) / (pooled_std + 1e-9)
+        separability2.append((fi, name, w_mean, w_std, l_mean, l_std, cohens_d))
+        print(f"  {name:<25} {w_mean:>9.3f} {w_std:>7.3f} {l_mean:>9.3f} {l_std:>7.3f} {cohens_d:>7.3f}")
+
+    print()
+    separability2.sort(key=lambda x: x[6], reverse=True)
+    print("  Top features by separability (Cohen's d):")
+    for fi, name, wm, ws, lm, ls, d in separability2[:8]:
+        direction = "WINNERS > LOSERS" if wm > lm else "LOSERS > WINNERS"
+        print(f"    [{fi:2d}] {name:<28} d={d:.3f}  ({direction})")
+
+    return separability2
+
+
+# ---------------------------------------------------------------------------
 # Phase 2: Rule-based filters (single feature thresholds)
 # ---------------------------------------------------------------------------
 
 def loo_rule(records, all_feats, feat_idx, threshold, direction="above"):
-    """
-    LOO rule: pass if feat[feat_idx] <direction> threshold.
-    direction: 'above' means pass if feat >= threshold (higher = better)
-               'below' means pass if feat <= threshold (lower = better)
-    """
     n = len(records)
     winners_through = losers_blocked = 0
     winners_total = sum(1 for r in records if r["outcome_pnl_pct"] > 0)
@@ -145,7 +193,7 @@ def loo_rule(records, all_feats, feat_idx, threshold, direction="above"):
     for i in range(n):
         f = all_feats[i]
         is_winner = records[i]["outcome_pnl_pct"] > 0
-        if f is None:
+        if f is None or feat_idx >= len(f):
             if is_winner: winners_through += 1
             continue
         val = f[feat_idx]
@@ -163,13 +211,11 @@ def rule_search(records, all_feats, separability):
     print("PHASE 2: SINGLE-FEATURE RULE SEARCH")
     print("=" * 80)
 
-    # For each of the top-8 features, sweep thresholds
-    top_feats = separability[:8]
+    top_feats = separability[:10]
     best_rules = []
 
     for fi, name, wm, ws, lm, ls, d in top_feats:
-        # Get all values for this feature
-        vals = sorted(set(f[fi] for f in all_feats if f is not None))
+        vals = sorted(set(f[fi] for f in all_feats if f is not None and fi < len(f)))
         direction = "above" if wm > lm else "below"
 
         best_wt = best_lb = 0
@@ -177,7 +223,6 @@ def rule_search(records, all_feats, separability):
 
         for threshold in vals:
             wt, lb, wn, ln = loo_rule(records, all_feats, fi, threshold, direction)
-            # Prioritise: all winners through, then maximize losers blocked
             if wt > best_wt or (wt == best_wt and lb > best_lb):
                 best_wt, best_lb = wt, lb
                 best_thresh = threshold
@@ -190,7 +235,7 @@ def rule_search(records, all_feats, separability):
     best_rules.sort(key=lambda x: (x[1], x[2]), reverse=True)
     print(f"\n  {'Feature':<28} {'Dir':<6} {'Thresh':>9} {'W':>5} {'L_blk':>6} {'Comb':>5}")
     print("  " + "-" * 65)
-    for combined, wt, lb, fi, name, thr, dir_, wn, ln in best_rules[:10]:
+    for combined, wt, lb, fi, name, thr, dir_, wn, ln in best_rules[:12]:
         print(f"  {name:<28} {dir_:<6} {thr:>9.3f} {wt:>3}/{wn}  {lb:>3}/{ln}  {combined:>5}")
 
     return best_rules
@@ -231,12 +276,10 @@ def two_rule_search(records, all_feats, separability):
     top_feats = separability[:6]
     best_combos = []
 
-    # Candidate thresholds per feature
     def candidate_thresholds(fi, wm, lm):
-        vals = sorted(set(f[fi] for f in all_feats if f is not None))
-        # Use percentile-based candidates to keep search manageable
+        vals = sorted(set(f[fi] for f in all_feats if f is not None and fi < len(f)))
         n = len(vals)
-        step = max(1, n // 10)
+        step = max(1, n // 12)
         return vals[::step] + [vals[-1]]
 
     for i, (fi1, nm1, wm1, ws1, lm1, ls1, d1) in enumerate(top_feats):
@@ -264,7 +307,7 @@ def two_rule_search(records, all_feats, separability):
         seen.add(key)
         print(f"  {nm1:<25} {t1:>8.3f}  {nm2:<25} {t2:>8.3f}  {wt:>3}/{wn}  {lb:>3}/{ln}  {combined:>5}")
         shown += 1
-        if shown >= 10: break
+        if shown >= 12: break
 
     return best_combos
 
@@ -297,13 +340,16 @@ def weighted_knn_loo(records, all_feats, feat_weights, label_key, k,
             if is_winner: winners_through += 1
             continue
 
-        # Apply weights
-        wq = [qf[j] * feat_weights[j] for j in range(len(qf))]
+        n_feat = len(qf)
+        wq = [qf[j] * (feat_weights[j] if j < len(feat_weights) else 1.0)
+              for j in range(n_feat)]
 
         train_feats, train_labels, recency_ws = [], [], []
         for j in range(n):
             if j == i or all_feats[j] is None: continue
-            wf = [all_feats[j][k2] * feat_weights[k2] for k2 in range(len(all_feats[j]))]
+            tf = all_feats[j]
+            wf = [tf[k2] * (feat_weights[k2] if k2 < len(feat_weights) else 1.0)
+                  for k2 in range(len(tf))]
             age = (now - timestamps[j]).total_seconds() / 86400.0
             train_feats.append(wf)
             train_labels.append(records[j][label_key])
@@ -344,14 +390,16 @@ def weighted_knn_search(records, all_feats, separability):
     print("PHASE 4: WEIGHTED KNN (emphasize top-separating features)")
     print("=" * 80)
 
-    # Build two weight vectors: uniform and top-4 boosted
-    uniform_weights = [1.0] * 18
-    boosted_weights = [1.0] * 18
-    for fi, name, wm, ws, lm, ls, d in separability[:4]:
-        boosted_weights[fi] = 3.0  # 3x weight on top separators
+    # 21-element weight vectors
+    uniform_weights    = [1.0] * 21
+    boosted_weights    = [1.0] * 21
+    selective_weights  = [0.2] * 21
+    no10s_weights      = [1.0] * 21  # zero out 10s (test whether 10s adds noise)
+    for j in range(6):
+        no10s_weights[j] = 0.0
 
-    # Only features that matter (zero out weakest)
-    selective_weights = [0.2] * 18
+    for fi, name, wm, ws, lm, ls, d in separability[:4]:
+        boosted_weights[fi] = 3.0
     for fi, name, wm, ws, lm, ls, d in separability[:6]:
         selective_weights[fi] = 3.0
 
@@ -359,15 +407,16 @@ def weighted_knn_search(records, all_feats, separability):
         ("uniform",    uniform_weights),
         ("top4_boost", boosted_weights),
         ("selective",  selective_weights),
+        ("no_10s",     no10s_weights),
     ]
 
     best = []
     for wname, weights in weight_configs:
-        for label_key in ["outcome_max_gain_pct", "outcome_pnl_pct", "position_peak_pnl_pct"]:
+        for label_key in ["outcome_pnl_pct", "position_peak_pnl_pct", "outcome_max_gain_pct"]:
             for k in [3, 5, 7]:
-                for hl in [7.0, 14.0, 30.0]:
-                    for sl, sh in [(-35, 150), (-20, 300), (-35, 300)]:
-                        for ms in [1.0, 1.5, 2.0, 2.5, 3.0]:
+                for hl in [3.0, 7.0, 14.0, 30.0]:
+                    for sl, sh in [(-45, 130), (-35, 150), (-45, 200), (-35, 300), (-50, 300)]:
+                        for ms in [1.5, 2.0, 2.5, 3.0, 4.0, 5.0]:
                             wt, lb, wn, ln = weighted_knn_loo(
                                 records, all_feats, weights, label_key,
                                 k, hl, sl, sh, ms)
@@ -375,8 +424,8 @@ def weighted_knn_search(records, all_feats, separability):
                             best.append((combined, wt, lb, wname, label_key, k, hl, sl, sh, ms, wn, ln))
 
     best.sort(key=lambda x: (x[1], x[2]), reverse=True)
-    print(f"\n  {'Weights':<12} {'Label':<20} {'K':>3} {'HL':>5} {'SL':>5} {'SH':>5} {'MinSc':>6} {'W':>5} {'L_blk':>6} {'Comb':>5}")
-    print("  " + "-" * 90)
+    print(f"\n  {'Weights':<12} {'Label':<12} {'K':>3} {'HL':>5} {'SL':>5} {'SH':>5} {'MinSc':>6} {'W':>5} {'L_blk':>6} {'Comb':>5}")
+    print("  " + "-" * 95)
     shown = 0
     seen_top = set()
     for row in best:
@@ -385,9 +434,9 @@ def weighted_knn_search(records, all_feats, separability):
         if key in seen_top and shown > 5: continue
         seen_top.add(key)
         lk_short = lk.replace("outcome_", "").replace("_pct", "").replace("position_", "")
-        print(f"  {wname:<12} {lk_short:<20} {k:>3} {hl:>5.0f} {sl:>5.0f} {sh:>5.0f} {ms:>6.1f} {wt:>3}/{wn}  {lb:>3}/{ln}  {combined:>5}")
+        print(f"  {wname:<12} {lk_short:<12} {k:>3} {hl:>5.0f} {sl:>5.0f} {sh:>5.0f} {ms:>6.1f} {wt:>3}/{wn}  {lb:>3}/{ln}  {combined:>5}")
         shown += 1
-        if shown >= 15: break
+        if shown >= 20: break
 
     return best
 
@@ -402,10 +451,32 @@ def main():
     n = len(records)
     winners_total = sum(1 for r in records if r["outcome_pnl_pct"] > 0)
     losers_total  = n - winners_total
-    print(f"\n{n} trades | {winners_total} winners | {losers_total} losers\n")
+    tp1_hits = sum(1 for r in records if r["position_peak_pnl_pct"] > 49.0)
 
-    # Phase 1
+    print(f"\n{n} trades | {winners_total} exit-winners | {losers_total} exit-losers")
+    print(f"TP1 proxy (peak>49%): {tp1_hits} hits | "
+          f"avg_peak={sum(r['position_peak_pnl_pct'] for r in records)/n:.1f}%\n")
+
+    # Channel breakdown
+    for ch in ["WizzyCasino", "WizzyTrades", ""]:
+        ch_rec = [r for r in records if r["source_channel"] == ch]
+        if ch_rec:
+            ch_w = sum(1 for r in ch_rec if r["outcome_pnl_pct"] > 0)
+            print(f"  channel={ch or 'other':<14} n={len(ch_rec):>3} | "
+                  f"winners={ch_w} ({100*ch_w/len(ch_rec):.0f}%) | "
+                  f"avg_pnl={sum(r['outcome_pnl_pct'] for r in ch_rec)/len(ch_rec):.1f}% | "
+                  f"avg_peak={sum(r['position_peak_pnl_pct'] for r in ch_rec)/len(ch_rec):.1f}%")
+    print()
+
+    feat_null = sum(1 for f in all_feats if f is None)
+    print(f"  Feature extraction: {n - feat_null}/{n} rows have valid features\n")
+
+    # Phase 1: separability on exit PnL winners
     separability = feature_separability(records, all_feats)
+    print()
+
+    # Phase 1b: separability on TP1-proxy winners
+    sep_peak = peak_separability(records, all_feats)
     print()
 
     # Phase 2
@@ -425,14 +496,12 @@ def main():
     print("SUMMARY & RECOMMENDATION")
     print("=" * 80)
 
-    # Best single rule
     br = best_rules[0] if best_rules else None
     if br:
         combined, wt, lb, fi, name, thr, dir_, wn, ln = br
         print(f"\nBest single rule:  {name} {'>=' if dir_=='above' else '<='} {thr:.3f}")
         print(f"  Winners through: {wt}/{wn}  |  Losers blocked: {lb}/{ln}  |  Combined: {combined}")
 
-    # Best combo rule
     bc = None
     seen = set()
     for row in best_combos:
@@ -447,13 +516,24 @@ def main():
         print(f"                   AND {nm2} {'>=' if dir2=='above' else '<='} {t2:.3f}")
         print(f"  Winners through: {wt}/{wn}  |  Losers blocked: {lb}/{ln}  |  Combined: {combined}")
 
-    # Best weighted KNN
     bk = best_knn[0] if best_knn else None
     if bk:
         combined, wt, lb, wname, lk, k, hl, sl, sh, ms, wn, ln = bk
         print(f"\nBest weighted KNN: weights={wname}, label={lk}, K={k}, HL={hl}, "
               f"score=[{sl},{sh}], min={ms}")
         print(f"  Winners through: {wt}/{wn}  |  Losers blocked: {lb}/{ln}  |  Combined: {combined}")
+
+    # Current config (for comparison)
+    print(f"\nCurrent config: K=5, HL=3d, score=[-45,130], min_score=2.5, label=position_peak_pnl_pct")
+    wt, lb, wn, ln = weighted_knn_loo(
+        records, all_feats,
+        [1.0] * 21,
+        "position_peak_pnl_pct",
+        k=5, halflife_days=3.0,
+        score_low=-45.0, score_high=130.0,
+        min_score=2.5,
+    )
+    print(f"  Winners through: {wt}/{wn}  |  Losers blocked: {lb}/{ln}  |  Combined: {wt+lb}")
 
 
 if __name__ == "__main__":

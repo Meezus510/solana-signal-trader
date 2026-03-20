@@ -92,15 +92,15 @@
     "use_ai_override_shadow": true,
     "ml_training_strategy": "quick_pop",
     "ml_training_label": "position_peak_pnl_pct",
-    "ml_min_score": 2.5,
+    "ml_min_score": 3.0,
     "ml_high_score_threshold": 6.0,
     "ml_max_score_threshold": 8.0,
     "ml_size_multiplier": 1.2,
     "ml_max_size_multiplier": 2.0,
     "ml_k": 5,
-    "ml_halflife_days": 3.0,
-    "ml_score_low_pct": -45.0,
-    "ml_score_high_pct": 130.0
+    "ml_halflife_days": 14.0,
+    "ml_score_low_pct": -35.0,
+    "ml_score_high_pct": 300.0
   },
   "moonbag_managed": {
     "live_trading": false,

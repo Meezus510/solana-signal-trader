@@ -76,6 +76,20 @@ Log-scale normalisation used because market cap and liquidity span multiple orde
                             $1K→0.43, $10K→0.57, $100K→0.71, $1M→0.86, $10M→1.0
 21. holder_count_norm     — log10(holder_count) / 5, clamped [0, 1]    [fallback 0.5]
                             10→0.20, 100→0.40, 1K→0.60, 10K→0.80, 100K→1.0
+
+Wallet activity features (from Birdeye token overview — fallback 0.0/1.0/0.5 when unavailable):
+22. unique_wallet_5m_norm — min(unique_wallet_5m / 50, 3.0)            [fallback 0.0]
+                            Distinct wallets trading in last 5m, normalised.
+                            50 wallets→1.0, 150→3.0. Organic vs wash-trading signal.
+23. wallet_momentum_5m    — min(unique_wallet_5m / max(unique_wallet_hist_5m, 1), 5.0) [fallback 1.0]
+                            Ratio of current to previous-window unique wallets.
+                            >1 = wallet count growing (momentum building), <1 = shrinking.
+24. price_change_30m_norm — price_change_30m_pct / 200, clamped [-1, 1] [fallback 0.0]
+                            How much the token already pumped over the last 30 min.
+                            +200% in 30m → 1.0 (likely exhausted), flat → 0.0.
+25. buy_vol_ratio_5m      — buy_volume_usd_5m / (buy + sell volume usd 5m) [fallback 0.5]
+                            5-minute buy pressure in USD. Complements buy_vol_ratio_1h
+                            (idx 16) with a shorter, more immediate timeframe.
 """
 
 from __future__ import annotations
@@ -237,6 +251,23 @@ def extract_features(
     f_liquidity_norm   = max(0.0, min(1.0, math.log10(max(liq, 1.0)) / 7.0)) if liq else 0.5
     f_holder_norm      = max(0.0, min(1.0, math.log10(max(hld, 1.0)) / 5.0)) if hld else 0.5
 
+    # ------------------------------------------------------------------
+    # Features 22-25: Wallet activity (from Birdeye token overview)
+    # All fall back to neutral when unavailable.
+    # ------------------------------------------------------------------
+    uw5  = ps.get("unique_wallet_5m")
+    uwh5 = ps.get("unique_wallet_hist_5m")
+    pc30 = ps.get("price_change_30m_pct")
+    vb5  = ps.get("buy_volume_usd_5m")
+    vs5  = ps.get("sell_volume_usd_5m")
+
+    f_unique_wallet_5m   = min((uw5 or 0) / 50.0, 3.0) if uw5 is not None else 0.0
+    f_wallet_momentum    = min((uw5 or 0) / max(uwh5 or 0, 1), 5.0) if uw5 is not None else 1.0
+    f_price_change_30m   = max(-1.0, min(1.0, (pc30 or 0.0) / 200.0)) if pc30 is not None else 0.0
+    f_buy_vol_ratio_5m   = (vb5 / ((vb5 or 0.0) + (vs5 or 0.0) + 1e-9)
+                            if (vb5 is not None and vs5 is not None and (vb5 + vs5) > 0)
+                            else 0.5)
+
     return (
         feats_10s
         + feats_1m
@@ -245,6 +276,7 @@ def extract_features(
             f_buy_vol_ratio_1h, f_liquidity_change_1h,
             f_channel,
             f_market_cap_norm, f_liquidity_norm, f_holder_norm,
+            f_unique_wallet_5m, f_wallet_momentum, f_price_change_30m, f_buy_vol_ratio_5m,
         ]
     )
 

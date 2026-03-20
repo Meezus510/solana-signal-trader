@@ -172,15 +172,55 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         ml_training_strategy="quick_pop",  # train on unfiltered base outcomes
         ml_training_label="position_peak_pnl_pct",  # predict peak pump, not exit PnL
         ml_prefer_moralis=True,      # use 10s candles for KNN — fast-scalp pump shape
-        ml_min_score=_qp_chart.get("ml_min_score", 5.0),
-        ml_high_score_threshold=_qp_chart.get("ml_high_score_threshold", 8.0),
-        ml_max_score_threshold=_qp_chart.get("ml_max_score_threshold", 9.5),
-        ml_size_multiplier=_qp_chart.get("ml_size_multiplier", 2.0),
-        ml_max_size_multiplier=_qp_chart.get("ml_max_size_multiplier", 3.0),
+        ml_min_score=_qp_chart.get("ml_min_score", 3.0),
+        ml_high_score_threshold=_qp_chart.get("ml_high_score_threshold", 6.0),
+        ml_max_score_threshold=_qp_chart.get("ml_max_score_threshold", 8.0),
+        ml_size_multiplier=_qp_chart.get("ml_size_multiplier", 1.2),
+        ml_max_size_multiplier=_qp_chart.get("ml_max_size_multiplier", 2.0),
         ml_k=int(_qp_chart.get("ml_k", 5)),
         ml_halflife_days=_qp_chart.get("ml_halflife_days", 14.0),
         ml_score_low_pct=_qp_chart.get("ml_score_low_pct", -35.0),
-        ml_score_high_pct=_qp_chart.get("ml_score_high_pct", 85.0),
+        ml_score_high_pct=_qp_chart.get("ml_score_high_pct", 300.0),
+        # Feature weights for quick_pop KNN (21 features total).
+        # Weights derived from Cohen's d separability on 82 closed trades,
+        # using TP1-proxy label (peak_pnl > 49%) which matches the strategy's
+        # actual objective of catching tokens that pump past TP1 (1.5×).
+        #
+        # ZEROED (0×) — confirmed useless or actively harmful:
+        #   idx 0-5  (10s OHLCV)     — despite being live at scoring time, high variance
+        #                               (vol_momentum_10s std=28) adds noise. Phase 4
+        #                               shows no_10s configs consistently outperform uniform.
+        #   idx 7    vol_momentum_1m — d=0.23, LOSERS>WINNERS in both labels: tokens with
+        #                               recent vol spike tend to be already pumped out.
+        #   idx 18-20 (token metadata) — 96% fallback=0.5 in historical data; inflated
+        #                               Cohen's d in Phase 1 is a statistical artifact.
+        #                               Will activate automatically once sufficient real
+        #                               market_cap/liquidity data accumulates.
+        #
+        # LOW (0.5×) — weak or inconsistent signal:
+        #   idx 9    recent_momentum_1m — d≈0.04-0.13, mixed direction.
+        #   idx 10   volatility_1m      — d=0.24 exit but d=0.09 TP1, inconsistent.
+        #   idx 12   buy_ratio_5m       — d≈0.12 both, weak.
+        #
+        # MODERATE (1-2×) — useful signals:
+        #   idx 11   candle_count_1m    — d=0.31 TP1 (fewer candles = newer token = better).
+        #   idx 14   price_change_5m_norm — d=0.17 TP1, d=0.13 exit.
+        #   idx 15   buy_vol_ratio_1h   — d=0.25 TP1.
+        #   idx 16   liquidity_change_1h — d=0.32 TP1: rising liquidity = better outcome.
+        #   idx 17   source_channel     — d=0.17 TP1 (minor channel difference).
+        #
+        # HIGH (3-5×) — dominant separators:
+        #   idx 6    pump_ratio_1m      — d=0.39 TP1, d=0.26 exit: bigger price pump = wins.
+        #   idx 8    price_slope_1m     — d=0.38 TP1, d=0.26 exit: steeper uptrend = wins.
+        #   idx 13   activity_5m_norm   — d=0.49 TP1: best single predictor; high market
+        #                               activity at signal time reliably predicts TP1 hits.
+        ml_feature_weights=(
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,   # idx  0-5:  10s features — zeroed (noise)
+            3.0, 0.0, 3.0, 0.5, 0.5, 1.0,   # idx  6-11: 1m OHLCV (pump=3, vol_mom=0, slope=3, rec_mom=0.5, vol=0.5, cnt=1)
+            0.5, 5.0, 1.0, 1.5, 2.0, 1.0,   # idx 12-17: pair stats + source_channel
+            0.0, 0.0, 0.0,                   # idx 18-20: token metadata — zeroed (96% fallback)
+            0.0, 0.0, 0.0, 0.0,             # idx 21-24: wallet activity — zeroed until data accumulates
+        ),
         live_trading=_qp_chart.get("live_trading", False),
     )
 
@@ -284,6 +324,7 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
             0.0, 0.3, 0.0, 2.0, 0.0, 0.0,   # idx  6-11: 1m OHLCV (pump=0, vol_mom=0.3, slope=0, rec_mom=2, vol=0, cnt=0)
             0.3, 1.0, 1.0, 0.0, 1.0, 8.0,   # idx 12-17: pair stats + source_channel
             6.0, 4.0, 2.0,                   # idx 18-20: market_cap, liquidity, holder_count
+            0.0, 0.0, 0.0, 0.0,             # idx 21-24: wallet activity — zeroed until data accumulates
         ),
         live_trading=_mb_chart.get("live_trading", False),
     )
