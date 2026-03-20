@@ -104,7 +104,7 @@ def _should_tune(
     Returns (should_tune, current_count, count_strategy).
 
     count_strategy is the base strategy whose signal count is used as the
-    trigger (e.g. "quick_pop" for "quick_pop_chart_ml"). Chart variants
+    trigger (e.g. "quick_pop" for "quick_pop_managed"). Chart variants
     trigger on base strategy signals so that the tuner fires at a consistent
     rate regardless of how many signals the chart filter lets through.
     """

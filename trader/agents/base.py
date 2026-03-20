@@ -45,7 +45,7 @@ def log_agent_action(
     Append one line per changed key to logs/agent_actions_{strategy}.log.
 
     Format:
-        2026-03-17T22:01:05Z | strategy_tuner | quick_pop_chart_ml | ml_min_score: 5.0 → 6.0 | reason: ...
+        2026-03-17T22:01:05Z | strategy_tuner | quick_pop_managed | ml_min_score: 5.0 → 6.0 | reason: ...
     """
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     reason = delta.get("reason", "")
@@ -125,7 +125,7 @@ def validate_delta(delta: dict[str, Any]) -> dict[str, Any]:
 # DB queries — read-only, return plain dicts for prompt serialisation.
 # ---------------------------------------------------------------------------
 
-def query_score_buckets(db_path: str, strategy: str = "quick_pop_chart_ml") -> list[dict]:
+def query_score_buckets(db_path: str, strategy: str = "quick_pop_managed") -> list[dict]:
     """
     Break strategy_outcomes into 1-point ml_score buckets and return win rate +
     avg PnL per bucket.
@@ -174,7 +174,7 @@ def query_score_buckets(db_path: str, strategy: str = "quick_pop_chart_ml") -> l
     return buckets
 
 
-def query_exit_stats(db_path: str, strategy: str = "quick_pop_chart_ml") -> list[dict]:
+def query_exit_stats(db_path: str, strategy: str = "quick_pop_managed") -> list[dict]:
     """
     Per-sell-reason breakdown from strategy_outcomes.
 
@@ -220,7 +220,7 @@ def query_exit_stats(db_path: str, strategy: str = "quick_pop_chart_ml") -> list
 
 def query_recent_trades(
     db_path: str,
-    strategy: str = "quick_pop_chart_ml",
+    strategy: str = "quick_pop_managed",
     limit: int = 30,
     scored_only: bool = False,
 ) -> list[dict]:

@@ -18,7 +18,7 @@ Group A — no chart filter (enters every signal unconditionally):
     quick_pop, trend_rider, infinite_moonbag
 
 Group B — chart filter enabled (skips late pumps and dying volume):
-    quick_pop_chart_ml (+ ML filter), trend_rider_chart_reanalyze (+ reanalyze), infinite_moonbag_chart
+    quick_pop_managed (+ ML filter), trend_rider_managed (+ reanalyze), moonbag_managed
 """
 
 from __future__ import annotations
@@ -38,9 +38,9 @@ from trader.trading.strategy import (
 logger = logging.getLogger(__name__)
 
 _CONTROLLED = frozenset([
-    "trend_rider", "trend_rider_chart_reanalyze",
-    "infinite_moonbag", "infinite_moonbag_chart",
-    "quick_pop_chart_ml",
+    "trend_rider", "trend_rider_managed",
+    "infinite_moonbag", "moonbag_managed",
+    "quick_pop_managed",
 ])
 
 _CONFIG_PATH = Path(__file__).parent.parent.parent / "strategy_config.json"
@@ -66,20 +66,20 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
     """
     Instantiate and return all active strategy runners.
 
-    quick_pop / quick_pop_chart_ml
+    quick_pop / quick_pop_managed
         Fast scalp: TP1 at 1.5× (sell 60%) → TP2 at 2.0× (sell 40%) — fully exits.
         Trail at 22% below high after TP1.
         Exit after 45 min if TP1 not yet hit (price still < 1.49×).
-        quick_pop_chart_ml also applies chart filter + ML confidence gating (score < 5
+        quick_pop_managed also applies chart filter + ML confidence gating (score < 5
         skips, score ≥ 8 doubles size, score ≥ 9.5 triples size).
 
-    trend_rider / trend_rider_chart_reanalyze
+    trend_rider / trend_rider_managed
         Momentum hold: TP1 at 1.8× (sell 50% of original).
         Trail at 30% below high after TP1.
         Exit after 90 min if price < entry × 1.15. Max hold: 4 hours.
-        trend_rider_chart_reanalyze also re-checks skipped signals after a delay.
+        trend_rider_managed also re-checks skipped signals after a delay.
 
-    infinite_moonbag / infinite_moonbag_chart (v2)
+    infinite_moonbag / moonbag_managed (v2)
         Grace period 90s: −30% floor. After grace: −20% floor.
         TP ladder: 1.8×/20%, 2.5×/15%, 4.0×/15%, 6.0×/10% of original.
         Stop ladder: 1.8×→1.00× (breakeven), 2.5×→1.65×, 4.0×→2.60×, 6.0×→4.20×.
@@ -150,9 +150,9 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
     # Group B — chart-filtered mirrors
     # ------------------------------------------------------------------
 
-    _qp_chart = _o("quick_pop_chart_ml")
+    _qp_chart = _o("quick_pop_managed")
     quick_pop_chart_cfg = StrategyConfig(
-        name="quick_pop_chart_ml",
+        name="quick_pop_managed",
         buy_size_usd=30.0,
         stop_loss_pct=0.20,       # fixed — not agent-controlled
         take_profit_levels=(      # fixed — not agent-controlled
@@ -163,9 +163,9 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         starting_cash_usd=cfg.starting_cash_usd,
         timeout_minutes=45.0,     # fixed — not agent-controlled
         timeout_min_gain_pct=0.49,  # fixed — not agent-controlled
-        use_chart_filter=False,   # locked off for quick_pop_chart_ml — AI override agent decides instead
+        use_chart_filter=False,   # locked off for quick_pop_managed — AI override agent decides instead
         save_chart_data=True,
-        use_ml_filter=True,          # always on for quick_pop_chart_ml — not agent-controlled
+        use_ml_filter=True,          # always on for quick_pop_managed — not agent-controlled
         use_policy_agent=True,
         use_ai_override=_qp_chart.get("use_ai_override", False),
         use_ai_override_shadow=_qp_chart.get("use_ai_override_shadow", False),
@@ -184,12 +184,12 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         live_trading=_qp_chart.get("live_trading", False),
     )
 
-    _tr_chart = _o("trend_rider_chart_reanalyze")
+    _tr_chart = _o("trend_rider_managed")
     trend_rider_chart_cfg = StrategyConfig(
-        name="trend_rider_chart_reanalyze",
+        name="trend_rider_managed",
         buy_size_usd=cfg.buy_size_usd,
         stop_loss_pct=_tr_chart.get("stop_loss_pct", 0.30),
-        take_profit_levels=_tp("trend_rider_chart_reanalyze", [
+        take_profit_levels=_tp("trend_rider_managed", [
             TakeProfitLevel(multiple=1.8, sell_fraction_original=0.50),
         ]),
         trailing_stop_pct=_tr_chart.get("trailing_stop_pct", 0.30),
@@ -218,12 +218,12 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         live_trading=_tr_chart.get("live_trading", False),
     )
 
-    _mb_chart = _o("infinite_moonbag_chart")
+    _mb_chart = _o("moonbag_managed")
     moonbag_chart_cfg = StrategyConfig(
-        name="infinite_moonbag_chart",
+        name="moonbag_managed",
         buy_size_usd=5.0,
         stop_loss_pct=_mb_chart.get("stop_loss_pct", 0.30),
-        take_profit_levels=_tp("infinite_moonbag_chart", [
+        take_profit_levels=_tp("moonbag_managed", [
             TakeProfitLevel(multiple=1.8, sell_fraction_original=0.20),
             TakeProfitLevel(multiple=2.5, sell_fraction_original=0.15),
             TakeProfitLevel(multiple=4.0, sell_fraction_original=0.15),

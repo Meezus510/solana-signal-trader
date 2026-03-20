@@ -37,7 +37,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-# Current live config for quick_pop_chart_ml — update these when you change registry.py
+# Current live config for quick_pop_managed — update these when you change registry.py
 CURRENT_CONFIG = {
     "ml_min_score":            2.5,
     "ml_high_score_threshold": 8.0,
@@ -159,8 +159,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--strategy",
-        default="quick_pop_chart_ml",
-        help="Strategy to analyze (default: quick_pop_chart_ml)",
+        default="quick_pop_managed",
+        help="Strategy to analyze (default: quick_pop_managed)",
     )
     args = parser.parse_args()
 

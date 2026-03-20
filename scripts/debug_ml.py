@@ -158,14 +158,14 @@ def check_db(db_path: str) -> None:
     else:
         print(f"  ✓ Some signals have been scored ({with_score}/{total_sc})")
 
-    # quick_pop_chart_ml strategy_outcomes
+    # quick_pop_managed strategy_outcomes
     qp_stats = conn.execute(
         """
         SELECT COUNT(*),
                SUM(CASE WHEN entered = 1 THEN 1 ELSE 0 END),
                SUM(CASE WHEN entered = 0 THEN 1 ELSE 0 END)
           FROM strategy_outcomes
-         WHERE strategy = 'quick_pop_chart_ml'
+         WHERE strategy = 'quick_pop_managed'
         """
     ).fetchone()
     total_qp, entered_qp, skipped_qp = qp_stats

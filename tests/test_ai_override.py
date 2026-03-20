@@ -68,7 +68,7 @@ class TestSaveAiOverrideDecision:
         chart_id = _insert_chart(db)
 
         db.save_ai_override_decision(
-            strategy="quick_pop_chart_ml",
+            strategy="quick_pop_managed",
             signal_chart_id=chart_id,
             symbol="BONK",
             mint="abc123",
@@ -88,7 +88,7 @@ class TestSaveAiOverrideDecision:
             (chart_id,),
         ).fetchone()
 
-        assert row[0] == "quick_pop_chart_ml"
+        assert row[0] == "quick_pop_managed"
         assert row[1] == "BONK"
         assert row[2] == "abc123"
         assert row[3] == "ML_SKIP"
@@ -102,7 +102,7 @@ class TestSaveAiOverrideDecision:
     def test_null_signal_chart_id_allowed(self, tmp_path):
         db = _make_db(tmp_path)
         db.save_ai_override_decision(
-            strategy="quick_pop_chart_ml",
+            strategy="quick_pop_managed",
             signal_chart_id=None,
             symbol="WIF",
             mint="xyz",
@@ -123,7 +123,7 @@ class TestSaveAiOverrideDecision:
     def test_all_decision_types_accepted(self, tmp_path, decision):
         db = _make_db(tmp_path)
         db.save_ai_override_decision(
-            strategy="quick_pop_chart_ml",
+            strategy="quick_pop_managed",
             signal_chart_id=None,
             symbol="TKN",
             mint="m",
@@ -140,7 +140,7 @@ class TestSaveAiOverrideDecision:
     def test_reanalyze_delay_stored(self, tmp_path):
         db = _make_db(tmp_path)
         db.save_ai_override_decision(
-            strategy="quick_pop_chart_ml", signal_chart_id=None,
+            strategy="quick_pop_managed", signal_chart_id=None,
             symbol="X", mint="m", skip_reason="ML_SKIP", decision="REANALYZE",
             ml_score=None, pump_ratio=None, vol_trend=None, agent_reason="check again",
             reanalyze_delay=120.0,
@@ -158,7 +158,7 @@ class TestSaveStrategyOutcomeAiOverride:
         db = _make_db(tmp_path)
         sc_id = _insert_chart(db)
         row_id = db.save_strategy_outcome(
-            signal_chart_id=sc_id, strategy="quick_pop_chart_ml",
+            signal_chart_id=sc_id, strategy="quick_pop_managed",
             entered=True, is_ai_override=True,
         )
         row = db._conn.execute(
@@ -170,7 +170,7 @@ class TestSaveStrategyOutcomeAiOverride:
         db = _make_db(tmp_path)
         sc_id = _insert_chart(db)
         row_id = db.save_strategy_outcome(
-            signal_chart_id=sc_id, strategy="quick_pop_chart_ml",
+            signal_chart_id=sc_id, strategy="quick_pop_managed",
             entered=True, is_ai_override=False,
         )
         row = db._conn.execute(
@@ -183,7 +183,7 @@ class TestSaveStrategyOutcomeAiOverride:
         db = _make_db(tmp_path)
         sc_id = _insert_chart(db)
         row_id = db.save_strategy_outcome(
-            signal_chart_id=sc_id, strategy="quick_pop_chart_ml", entered=True,
+            signal_chart_id=sc_id, strategy="quick_pop_managed", entered=True,
         )
         row = db._conn.execute(
             "SELECT is_ai_override FROM strategy_outcomes WHERE id=?", (row_id,)
@@ -193,7 +193,7 @@ class TestSaveStrategyOutcomeAiOverride:
     def test_ai_override_flag_independent_per_row(self, tmp_path):
         db = _make_db(tmp_path)
         sc_id = _insert_chart(db)
-        ov_id   = db.save_strategy_outcome(sc_id, "quick_pop_chart_ml", entered=True,  is_ai_override=True)
+        ov_id   = db.save_strategy_outcome(sc_id, "quick_pop_managed", entered=True,  is_ai_override=True)
         norm_id = db.save_strategy_outcome(sc_id, "quick_pop",           entered=True,  is_ai_override=False)
         flags = {
             r[0]: r[1]
@@ -217,7 +217,7 @@ class TestQueryAiOverrideStats:
 
     def test_empty_db_returns_zero_overrides(self, tmp_path):
         db, path = self._setup(tmp_path)
-        stats = db.query_ai_override_stats("quick_pop_chart_ml", "quick_pop")
+        stats = db.query_ai_override_stats("quick_pop_managed", "quick_pop")
         assert stats["overrides"]["total"] == 0
         assert stats["overrides"]["closed"] == 0
         assert stats["overrides"]["win_rate_pct"] is None
@@ -230,16 +230,16 @@ class TestQueryAiOverrideStats:
         for pnl in (30.0, -15.0):
             sc_id = _insert_chart(db)
             db.save_ai_override_decision(
-                strategy="quick_pop_chart_ml", signal_chart_id=sc_id,
+                strategy="quick_pop_managed", signal_chart_id=sc_id,
                 symbol="TK", mint="m", skip_reason="ML_SKIP", decision="OVERRIDE",
                 ml_score=1.8, pump_ratio=2.1, vol_trend="RISING", agent_reason="test",
             )
             ov_id = db.save_strategy_outcome(
-                sc_id, "quick_pop_chart_ml", entered=True, is_ai_override=True,
+                sc_id, "quick_pop_managed", entered=True, is_ai_override=True,
             )
             _close_outcome(db, ov_id, pnl)
 
-        stats = db.query_ai_override_stats("quick_pop_chart_ml", "quick_pop")
+        stats = db.query_ai_override_stats("quick_pop_managed", "quick_pop")
         ov = stats["overrides"]
         assert ov["total"]        == 2
         assert ov["closed"]       == 2
@@ -251,14 +251,14 @@ class TestQueryAiOverrideStats:
         db, path = self._setup(tmp_path)
         sc_id = _insert_chart(db)
         db.save_ai_override_decision(
-            strategy="quick_pop_chart_ml", signal_chart_id=sc_id,
+            strategy="quick_pop_managed", signal_chart_id=sc_id,
             symbol="TK", mint="m", skip_reason="ML_SKIP", decision="OVERRIDE",
             ml_score=2.0, pump_ratio=2.0, vol_trend="RISING", agent_reason="x",
         )
         # Trade entered but NOT closed yet
-        db.save_strategy_outcome(sc_id, "quick_pop_chart_ml", entered=True, is_ai_override=True)
+        db.save_strategy_outcome(sc_id, "quick_pop_managed", entered=True, is_ai_override=True)
 
-        stats = db.query_ai_override_stats("quick_pop_chart_ml", "quick_pop")
+        stats = db.query_ai_override_stats("quick_pop_managed", "quick_pop")
         assert stats["overrides"]["total"]  == 1
         assert stats["overrides"]["closed"] == 0
         assert stats["overrides"]["win_rate_pct"] is None
@@ -269,15 +269,15 @@ class TestQueryAiOverrideStats:
         # AI rejected — base strategy entered and won
         sc_id = _insert_chart(db)
         db.save_ai_override_decision(
-            strategy="quick_pop_chart_ml", signal_chart_id=sc_id,
+            strategy="quick_pop_managed", signal_chart_id=sc_id,
             symbol="BONK", mint="m", skip_reason="ML_SKIP", decision="REJECT",
             ml_score=0.9, pump_ratio=1.5, vol_trend="DYING", agent_reason="too weak",
         )
-        db.save_strategy_outcome(sc_id, "quick_pop_chart_ml", entered=False)
+        db.save_strategy_outcome(sc_id, "quick_pop_managed", entered=False)
         base_id = db.save_strategy_outcome(sc_id, "quick_pop", entered=True)
         _close_outcome(db, base_id, pnl_pct=45.0, max_gain=80.0)
 
-        stats = db.query_ai_override_stats("quick_pop_chart_ml", "quick_pop")
+        stats = db.query_ai_override_stats("quick_pop_managed", "quick_pop")
         rej = stats["rejections"]
         assert rej["total"]            == 1
         assert rej["base_tracked"]     == 1
@@ -293,15 +293,15 @@ class TestQueryAiOverrideStats:
 
         sc_id = _insert_chart(db)
         db.save_ai_override_decision(
-            strategy="quick_pop_chart_ml", signal_chart_id=sc_id,
+            strategy="quick_pop_managed", signal_chart_id=sc_id,
             symbol="WIF", mint="m", skip_reason="CHART_SKIP", decision="REJECT",
             ml_score=None, pump_ratio=3.5, vol_trend="DYING", agent_reason="pump too big",
         )
-        db.save_strategy_outcome(sc_id, "quick_pop_chart_ml", entered=False)
+        db.save_strategy_outcome(sc_id, "quick_pop_managed", entered=False)
         base_id = db.save_strategy_outcome(sc_id, "quick_pop", entered=True)
         _close_outcome(db, base_id, pnl_pct=-18.0, max_gain=3.0)
 
-        stats = db.query_ai_override_stats("quick_pop_chart_ml", "quick_pop")
+        stats = db.query_ai_override_stats("quick_pop_managed", "quick_pop")
         rej = stats["rejections"]
         assert rej["would_have_won"]   == 0
         assert rej["win_rate_pct"]     == pytest.approx(0.0)
@@ -313,15 +313,15 @@ class TestQueryAiOverrideStats:
         # Shadow: agent would have overridden; base strategy won
         sc_id = _insert_chart(db)
         db.save_ai_override_decision(
-            strategy="quick_pop_chart_ml", signal_chart_id=sc_id,
+            strategy="quick_pop_managed", signal_chart_id=sc_id,
             symbol="PEPE", mint="m", skip_reason="ML_SKIP", decision="SHADOW_OVERRIDE",
             ml_score=1.5, pump_ratio=2.0, vol_trend="RISING", agent_reason="strong",
         )
-        db.save_strategy_outcome(sc_id, "quick_pop_chart_ml", entered=False)
+        db.save_strategy_outcome(sc_id, "quick_pop_managed", entered=False)
         base_id = db.save_strategy_outcome(sc_id, "quick_pop", entered=True)
         _close_outcome(db, base_id, pnl_pct=25.0)
 
-        stats = db.query_ai_override_stats("quick_pop_chart_ml", "quick_pop")
+        stats = db.query_ai_override_stats("quick_pop_managed", "quick_pop")
         sh = stats["shadow_overrides"]
         assert sh["count"]        == 1
         assert sh["win_rate_pct"] == pytest.approx(100.0)
@@ -332,15 +332,15 @@ class TestQueryAiOverrideStats:
 
         sc_id = _insert_chart(db)
         db.save_ai_override_decision(
-            strategy="quick_pop_chart_ml", signal_chart_id=sc_id,
+            strategy="quick_pop_managed", signal_chart_id=sc_id,
             symbol="DOGE", mint="m", skip_reason="CHART_SKIP", decision="SHADOW_REJECT",
             ml_score=None, pump_ratio=4.0, vol_trend="DYING", agent_reason="too pumped",
         )
-        db.save_strategy_outcome(sc_id, "quick_pop_chart_ml", entered=False)
+        db.save_strategy_outcome(sc_id, "quick_pop_managed", entered=False)
         base_id = db.save_strategy_outcome(sc_id, "quick_pop", entered=True)
         _close_outcome(db, base_id, pnl_pct=-20.0)
 
-        stats = db.query_ai_override_stats("quick_pop_chart_ml", "quick_pop")
+        stats = db.query_ai_override_stats("quick_pop_managed", "quick_pop")
         sr = stats["shadow_rejects"]
         assert sr["count"]        == 1
         assert sr["win_rate_pct"] == pytest.approx(0.0)   # -20% is a loss
@@ -351,15 +351,15 @@ class TestQueryAiOverrideStats:
         for i in range(15):
             sc_id = _insert_chart(db, symbol=f"TK{i}", ts=f"2026-01-01T{i:02d}:00:00")
             db.save_ai_override_decision(
-                strategy="quick_pop_chart_ml", signal_chart_id=sc_id,
+                strategy="quick_pop_managed", signal_chart_id=sc_id,
                 symbol=f"TK{i}", mint=f"m{i}", skip_reason="ML_SKIP", decision="REJECT",
                 ml_score=0.5, pump_ratio=1.0, vol_trend="FLAT", agent_reason="weak",
             )
-            db.save_strategy_outcome(sc_id, "quick_pop_chart_ml", entered=False)
+            db.save_strategy_outcome(sc_id, "quick_pop_managed", entered=False)
             base_id = db.save_strategy_outcome(sc_id, "quick_pop", entered=True)
             _close_outcome(db, base_id, pnl_pct=10.0)
 
-        stats = db.query_ai_override_stats("quick_pop_chart_ml", "quick_pop")
+        stats = db.query_ai_override_stats("quick_pop_managed", "quick_pop")
         assert len(stats["rejections"]["sample"]) == 10
 
 
@@ -424,71 +424,71 @@ class TestLogOverrideDecision:
 
     def test_creates_log_file(self, tmp_path):
         with patch.dict(os.environ, {"AGENT_LOG_DIR": str(tmp_path)}):
-            log_override_decision("quick_pop_chart_ml", "BONK", "ML_SKIP",
+            log_override_decision("quick_pop_managed", "BONK", "ML_SKIP",
                                   self._decision(override=True), self._ctx())
-        log_file = tmp_path / "ai_override_quick_pop_chart_ml.log"
+        log_file = tmp_path / "ai_override_quick_pop_managed.log"
         assert log_file.exists()
 
     def test_override_action_label(self, tmp_path):
         with patch.dict(os.environ, {"AGENT_LOG_DIR": str(tmp_path)}):
-            log_override_decision("quick_pop_chart_ml", "BONK", "ML_SKIP",
+            log_override_decision("quick_pop_managed", "BONK", "ML_SKIP",
                                   self._decision(override=True, reason="good signal"), self._ctx())
-        content = (tmp_path / "ai_override_quick_pop_chart_ml.log").read_text()
+        content = (tmp_path / "ai_override_quick_pop_managed.log").read_text()
         assert "OVERRIDE" in content
         assert "good signal" in content
 
     def test_reject_action_label(self, tmp_path):
         with patch.dict(os.environ, {"AGENT_LOG_DIR": str(tmp_path)}):
-            log_override_decision("quick_pop_chart_ml", "WIF", "CHART_SKIP",
+            log_override_decision("quick_pop_managed", "WIF", "CHART_SKIP",
                                   self._decision(override=False, reanalyze=0.0, reason="weak"),
                                   self._ctx())
-        content = (tmp_path / "ai_override_quick_pop_chart_ml.log").read_text()
+        content = (tmp_path / "ai_override_quick_pop_managed.log").read_text()
         assert "REJECT" in content
 
     def test_reanalyze_action_label_and_delay(self, tmp_path):
         with patch.dict(os.environ, {"AGENT_LOG_DIR": str(tmp_path)}):
-            log_override_decision("quick_pop_chart_ml", "PEPE", "ML_SKIP",
+            log_override_decision("quick_pop_managed", "PEPE", "ML_SKIP",
                                   self._decision(override=False, reanalyze=120.0, reason="unclear"),
                                   self._ctx())
-        content = (tmp_path / "ai_override_quick_pop_chart_ml.log").read_text()
+        content = (tmp_path / "ai_override_quick_pop_managed.log").read_text()
         assert "REANALYZE" in content
         assert "120" in content
 
     def test_shadow_prefix_added(self, tmp_path):
         with patch.dict(os.environ, {"AGENT_LOG_DIR": str(tmp_path)}):
-            log_override_decision("quick_pop_chart_ml", "BONK", "ML_SKIP",
+            log_override_decision("quick_pop_managed", "BONK", "ML_SKIP",
                                   self._decision(override=True), self._ctx(), shadow=True)
-        content = (tmp_path / "ai_override_quick_pop_chart_ml.log").read_text()
+        content = (tmp_path / "ai_override_quick_pop_managed.log").read_text()
         assert "SHADOW_OVERRIDE" in content
 
     def test_symbol_and_skip_reason_in_line(self, tmp_path):
         with patch.dict(os.environ, {"AGENT_LOG_DIR": str(tmp_path)}):
-            log_override_decision("quick_pop_chart_ml", "DOGE123", "POLICY_BLK",
+            log_override_decision("quick_pop_managed", "DOGE123", "POLICY_BLK",
                                   self._decision(), self._ctx())
-        content = (tmp_path / "ai_override_quick_pop_chart_ml.log").read_text()
+        content = (tmp_path / "ai_override_quick_pop_managed.log").read_text()
         assert "DOGE123" in content
         assert "POLICY_BLK" in content
 
     def test_ml_score_none_shown_as_none(self, tmp_path):
         with patch.dict(os.environ, {"AGENT_LOG_DIR": str(tmp_path)}):
-            log_override_decision("quick_pop_chart_ml", "TKN", "ML_SKIP",
+            log_override_decision("quick_pop_managed", "TKN", "ML_SKIP",
                                   self._decision(), self._ctx(ml_score=None))
-        content = (tmp_path / "ai_override_quick_pop_chart_ml.log").read_text()
+        content = (tmp_path / "ai_override_quick_pop_managed.log").read_text()
         assert "None" in content
 
     def test_non_fatal_on_bad_dir(self):
         """Should not raise even if log dir can't be written."""
         with patch.dict(os.environ, {"AGENT_LOG_DIR": "/nonexistent_root_dir/subdir"}):
             # Should complete without raising
-            log_override_decision("quick_pop_chart_ml", "TKN", "ML_SKIP",
+            log_override_decision("quick_pop_managed", "TKN", "ML_SKIP",
                                   self._decision(), self._ctx())
 
     def test_appends_multiple_lines(self, tmp_path):
         with patch.dict(os.environ, {"AGENT_LOG_DIR": str(tmp_path)}):
             for symbol in ("BONK", "WIF", "PEPE"):
-                log_override_decision("quick_pop_chart_ml", symbol, "ML_SKIP",
+                log_override_decision("quick_pop_managed", symbol, "ML_SKIP",
                                       self._decision(), self._ctx())
-        lines = (tmp_path / "ai_override_quick_pop_chart_ml.log").read_text().splitlines()
+        lines = (tmp_path / "ai_override_quick_pop_managed.log").read_text().splitlines()
         assert len(lines) == 3
 
 

@@ -63,7 +63,7 @@ class TestSaveStrategyOutcome:
         sc_id = _insert_signal_chart(db)
         row_id = db.save_strategy_outcome(
             signal_chart_id=sc_id,
-            strategy="quick_pop_chart_ml",
+            strategy="quick_pop_managed",
             entered=True,
             ml_score=7.3,
         )
@@ -77,7 +77,7 @@ class TestSaveStrategyOutcome:
         sc_id = _insert_signal_chart(db)
         row_id = db.save_strategy_outcome(
             signal_chart_id=sc_id,
-            strategy="quick_pop_chart_ml",
+            strategy="quick_pop_managed",
             entered=True,
             ml_score=None,
         )
@@ -89,8 +89,8 @@ class TestSaveStrategyOutcome:
     def test_different_strategies_store_independent_scores(self, tmp_path):
         db = _make_trade_db(str(tmp_path / "trader.db"))
         sc_id = _insert_signal_chart(db)
-        id_a = db.save_strategy_outcome(sc_id, "quick_pop_chart_ml", entered=True, ml_score=6.0)
-        id_b = db.save_strategy_outcome(sc_id, "trend_rider_chart_reanalyze", entered=True, ml_score=8.5)
+        id_a = db.save_strategy_outcome(sc_id, "quick_pop_managed", entered=True, ml_score=6.0)
+        id_b = db.save_strategy_outcome(sc_id, "trend_rider_managed", entered=True, ml_score=8.5)
         rows = {
             r[0]: r[1]
             for r in db._conn.execute(
@@ -116,7 +116,7 @@ class TestQueryScoreBuckets:
         for pnl in (20.0, -10.0):
             sc_id = _insert_signal_chart(db, sc_ml_score=9.9)  # wrong score on chart row
             row_id = db.save_strategy_outcome(
-                sc_id, "quick_pop_chart_ml", entered=True, ml_score=5.5,
+                sc_id, "quick_pop_managed", entered=True, ml_score=5.5,
             )
             db._conn.execute(
                 """UPDATE strategy_outcomes
@@ -129,56 +129,56 @@ class TestQueryScoreBuckets:
 
     def test_returns_bucket_for_outcome_ml_score(self, tmp_path):
         path = self._setup_db(tmp_path)
-        buckets = query_score_buckets(path, "quick_pop_chart_ml")
+        buckets = query_score_buckets(path, "quick_pop_managed")
         assert len(buckets) == 1
         assert buckets[0]["bucket"] == "5.0-5.9"
 
     def test_ignores_signal_chart_ml_score(self, tmp_path):
         """sc.ml_score=9.9 must NOT create a bucket-9 entry."""
         path = self._setup_db(tmp_path)
-        buckets = query_score_buckets(path, "quick_pop_chart_ml")
+        buckets = query_score_buckets(path, "quick_pop_managed")
         bucket_labels = [b["bucket"] for b in buckets]
         assert "9.0-9.9" not in bucket_labels
 
     def test_win_rate_computed_correctly(self, tmp_path):
         path = self._setup_db(tmp_path)
-        bucket = query_score_buckets(path, "quick_pop_chart_ml")[0]
+        bucket = query_score_buckets(path, "quick_pop_managed")[0]
         assert bucket["count"] == 2
         assert bucket["win_rate"] == pytest.approx(0.5)
 
     def test_null_outcome_ml_score_excluded(self, tmp_path):
         db = _make_trade_db(str(tmp_path / "trader.db"))
         sc_id = _insert_signal_chart(db)
-        row_id = db.save_strategy_outcome(sc_id, "quick_pop_chart_ml", entered=True, ml_score=None)
+        row_id = db.save_strategy_outcome(sc_id, "quick_pop_managed", entered=True, ml_score=None)
         db._conn.execute(
             "UPDATE strategy_outcomes SET closed=1, outcome_pnl_pct=10.0 WHERE id=?", (row_id,)
         )
         db._conn.commit()
-        buckets = query_score_buckets(str(tmp_path / "trader.db"), "quick_pop_chart_ml")
+        buckets = query_score_buckets(str(tmp_path / "trader.db"), "quick_pop_managed")
         assert buckets == []
 
     def test_not_entered_excluded(self, tmp_path):
         db = _make_trade_db(str(tmp_path / "trader.db"))
         sc_id = _insert_signal_chart(db)
-        row_id = db.save_strategy_outcome(sc_id, "quick_pop_chart_ml", entered=False, ml_score=6.0)
+        row_id = db.save_strategy_outcome(sc_id, "quick_pop_managed", entered=False, ml_score=6.0)
         db._conn.execute(
             "UPDATE strategy_outcomes SET closed=1, outcome_pnl_pct=15.0 WHERE id=?", (row_id,)
         )
         db._conn.commit()
-        assert query_score_buckets(str(tmp_path / "trader.db"), "quick_pop_chart_ml") == []
+        assert query_score_buckets(str(tmp_path / "trader.db"), "quick_pop_managed") == []
 
     def test_different_strategies_bucketed_independently(self, tmp_path):
         db = _make_trade_db(str(tmp_path / "trader.db"))
         sc_id = _insert_signal_chart(db)
-        for strategy, score in [("quick_pop_chart_ml", 5.0), ("trend_rider_chart_reanalyze", 7.0)]:
+        for strategy, score in [("quick_pop_managed", 5.0), ("trend_rider_managed", 7.0)]:
             row_id = db.save_strategy_outcome(sc_id, strategy, entered=True, ml_score=score)
             db._conn.execute(
                 "UPDATE strategy_outcomes SET closed=1, outcome_pnl_pct=10.0 WHERE id=?", (row_id,)
             )
         db._conn.commit()
         path = str(tmp_path / "trader.db")
-        qp_buckets = query_score_buckets(path, "quick_pop_chart_ml")
-        tr_buckets  = query_score_buckets(path, "trend_rider_chart_reanalyze")
+        qp_buckets = query_score_buckets(path, "quick_pop_managed")
+        tr_buckets  = query_score_buckets(path, "trend_rider_managed")
         assert qp_buckets[0]["bucket"] == "5.0-5.9"
         assert tr_buckets[0]["bucket"]  == "7.0-7.9"
 
@@ -192,25 +192,25 @@ class TestQueryRecentTrades:
         db = _make_trade_db(str(tmp_path / "trader.db"))
         sc_id = _insert_signal_chart(db, sc_ml_score=9.9)  # different from outcome score
         row_id = db.save_strategy_outcome(
-            sc_id, "quick_pop_chart_ml", entered=True, ml_score=6.2,
+            sc_id, "quick_pop_managed", entered=True, ml_score=6.2,
         )
         db._conn.execute(
             "UPDATE strategy_outcomes SET closed=1, outcome_pnl_pct=12.0 WHERE id=?", (row_id,)
         )
         db._conn.commit()
-        trades = query_recent_trades(str(tmp_path / "trader.db"), "quick_pop_chart_ml")
+        trades = query_recent_trades(str(tmp_path / "trader.db"), "quick_pop_managed")
         assert len(trades) == 1
         assert trades[0]["ml_score"] == pytest.approx(6.2)
 
     def test_null_outcome_ml_score_returned_as_none(self, tmp_path):
         db = _make_trade_db(str(tmp_path / "trader.db"))
         sc_id = _insert_signal_chart(db, sc_ml_score=8.0)
-        row_id = db.save_strategy_outcome(sc_id, "quick_pop_chart_ml", entered=True, ml_score=None)
+        row_id = db.save_strategy_outcome(sc_id, "quick_pop_managed", entered=True, ml_score=None)
         db._conn.execute(
             "UPDATE strategy_outcomes SET closed=1, outcome_pnl_pct=5.0 WHERE id=?", (row_id,)
         )
         db._conn.commit()
-        trades = query_recent_trades(str(tmp_path / "trader.db"), "quick_pop_chart_ml")
+        trades = query_recent_trades(str(tmp_path / "trader.db"), "quick_pop_managed")
         assert trades[0]["ml_score"] is None
 
     def test_scored_only_filters_null_ml_score(self, tmp_path):
@@ -218,14 +218,14 @@ class TestQueryRecentTrades:
         for score in (5.0, None):
             sc_id = _insert_signal_chart(db)
             row_id = db.save_strategy_outcome(
-                sc_id, "quick_pop_chart_ml", entered=True, ml_score=score,
+                sc_id, "quick_pop_managed", entered=True, ml_score=score,
             )
             db._conn.execute(
                 "UPDATE strategy_outcomes SET closed=1, outcome_pnl_pct=10.0 WHERE id=?", (row_id,)
             )
         db._conn.commit()
         trades = query_recent_trades(
-            str(tmp_path / "trader.db"), "quick_pop_chart_ml", scored_only=True
+            str(tmp_path / "trader.db"), "quick_pop_managed", scored_only=True
         )
         assert len(trades) == 1
         assert trades[0]["ml_score"] == pytest.approx(5.0)
@@ -234,12 +234,12 @@ class TestQueryRecentTrades:
         db = _make_trade_db(str(tmp_path / "trader.db"))
         for i in range(5):
             sc_id = _insert_signal_chart(db)
-            row_id = db.save_strategy_outcome(sc_id, "quick_pop_chart_ml", entered=True, ml_score=float(i))
+            row_id = db.save_strategy_outcome(sc_id, "quick_pop_managed", entered=True, ml_score=float(i))
             db._conn.execute(
                 "UPDATE strategy_outcomes SET closed=1, outcome_pnl_pct=10.0 WHERE id=?", (row_id,)
             )
         db._conn.commit()
-        trades = query_recent_trades(str(tmp_path / "trader.db"), "quick_pop_chart_ml", limit=3)
+        trades = query_recent_trades(str(tmp_path / "trader.db"), "quick_pop_managed", limit=3)
         assert len(trades) == 3
 
 
@@ -258,7 +258,7 @@ class TestQuerySkippedStatsMlScore:
         sc_id = _insert_signal_chart(db, symbol="PEPE", sc_ml_score=9.9)  # decoy on chart row
 
         # Chart variant skips it (no ml_score on this row — it was blocked)
-        db.save_strategy_outcome(sc_id, "quick_pop_chart_ml", entered=False, ml_score=None)
+        db.save_strategy_outcome(sc_id, "quick_pop_managed", entered=False, ml_score=None)
 
         # Base strategy enters and has its own score
         base_id = db.save_strategy_outcome(sc_id, "quick_pop", entered=True, ml_score=7.5)
@@ -271,7 +271,7 @@ class TestQuerySkippedStatsMlScore:
         )
         db._conn.commit()
 
-        result = query_skipped_stats(str(tmp_path / "trader.db"), "quick_pop_chart_ml", "quick_pop")
+        result = query_skipped_stats(str(tmp_path / "trader.db"), "quick_pop_managed", "quick_pop")
         assert result["base_entered"] == 1
         outcome = result["sample_outcomes"][0]
         assert outcome["symbol"] == "PEPE"
@@ -280,11 +280,11 @@ class TestQuerySkippedStatsMlScore:
     def test_sample_outcome_ml_score_none_when_not_scored(self, tmp_path):
         db = _make_trade_db(str(tmp_path / "trader.db"))
         sc_id = _insert_signal_chart(db)
-        db.save_strategy_outcome(sc_id, "quick_pop_chart_ml", entered=False)
+        db.save_strategy_outcome(sc_id, "quick_pop_managed", entered=False)
         base_id = db.save_strategy_outcome(sc_id, "quick_pop", entered=True, ml_score=None)
         db._conn.execute(
             "UPDATE strategy_outcomes SET closed=1, outcome_pnl_pct=5.0 WHERE id=?", (base_id,)
         )
         db._conn.commit()
-        result = query_skipped_stats(str(tmp_path / "trader.db"), "quick_pop_chart_ml", "quick_pop")
+        result = query_skipped_stats(str(tmp_path / "trader.db"), "quick_pop_managed", "quick_pop")
         assert result["sample_outcomes"][0]["ml_score"] is None

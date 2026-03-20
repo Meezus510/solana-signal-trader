@@ -22,7 +22,7 @@ Usage:
             "pair_stats": {...},
             "candles_summary": {...},
         },
-        strategy="quick_pop_chart_ml",
+        strategy="quick_pop_managed",
         db_path="/path/to/trades.db",
         training_strategy="quick_pop",
     )
@@ -90,7 +90,7 @@ def propose_ai_override(
         All available signal data: ml_score, chart context, pair stats,
         candles summary, source channel, etc.
     strategy : str
-        Strategy name (e.g. "quick_pop_chart_ml").
+        Strategy name (e.g. "quick_pop_managed").
     db_path : str | None
         Path to the SQLite DB. When provided, historical context (score buckets,
         recent trade outcomes, previously-skipped signal outcomes) is added to

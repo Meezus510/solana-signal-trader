@@ -130,7 +130,7 @@ class StrategyConfig:
     # Defaults to this strategy's own name when None.
     # Chart/ML variants should point to their base strategy so the scorer
     # trains on unbiased, unfiltered outcomes.
-    # e.g. quick_pop_chart_ml → "quick_pop"
+    # e.g. quick_pop_managed → "quick_pop"
     ml_training_strategy: Optional[str] = None
 
     # Which outcome column to use as the KNN training label.

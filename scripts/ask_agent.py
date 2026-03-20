@@ -194,12 +194,12 @@ STRATEGY PERMISSIONS:
     → NOT autonomously controlled — changes require manual edits by a human.
       The tuner uses their closed trade outcomes as ML training data only.
 
-  trend_rider_chart_reanalyze, infinite_moonbag_chart (CHART variants — FULL CONTROL)
+  trend_rider_managed, moonbag_managed (CHART variants — FULL CONTROL)
     → Can autonomously change: TP levels, stop_loss_pct, trailing_stop_pct,
       timeout_minutes, pump_ratio_max, use_reanalyze + all delay params,
       use_ml_filter (CAN ENABLE ML FILTERING), all ML params, live_trading
 
-  quick_pop_chart_ml (ML variant — ML ONLY)
+  quick_pop_managed (ML variant — ML ONLY)
     → Can autonomously change: ml_min_score, ml_high/max_score_threshold,
       ml_size_multiplier, ml_max_size_multiplier, ml_k, ml_halflife_days,
       ml_score_low_pct, ml_score_high_pct, live_trading

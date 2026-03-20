@@ -18,7 +18,7 @@ Verdict logic (conservative — stop loss wins if both would have been hit):
 
 Usage:
     python scripts/check_shadow_override.py
-    python scripts/check_shadow_override.py --strategy quick_pop_chart_ml
+    python scripts/check_shadow_override.py --strategy quick_pop_managed
     python scripts/check_shadow_override.py --limit 50
 """
 

@@ -248,7 +248,7 @@ def run_scenario(scenario: dict, db_path: str | None, training_strategy: str) ->
     decision = propose_ai_override(
         skip_reason=scenario["skip_reason"],
         signal_context=scenario["signal_context"],
-        strategy="quick_pop_chart_ml",
+        strategy="quick_pop_managed",
         db_path=db_path,
         training_strategy=training_strategy,
     )
@@ -330,7 +330,7 @@ def main() -> None:
 
     print(f"\n{SEP}")
     print(f"  AI Override Agent — live test  ({len(scenarios)} scenario(s))")
-    print(f"  Model: claude-haiku-4-5-20251001  |  strategy: quick_pop_chart_ml")
+    print(f"  Model: claude-haiku-4-5-20251001  |  strategy: quick_pop_managed")
     print(SEP)
 
     passed_count = 0

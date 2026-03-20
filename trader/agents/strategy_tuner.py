@@ -6,12 +6,12 @@ proposes + applies parameter adjustments.
 
 Permission tiers
 ----------------
-FULL_CONTROL (trend_rider, trend_rider_chart_reanalyze, infinite_moonbag,
-              infinite_moonbag_chart):
+FULL_CONTROL (trend_rider, trend_rider_managed, infinite_moonbag,
+              moonbag_managed):
     TP levels, stop/trail/timeout, chart filter settings, reanalysis settings,
     and all ML params.
 
-ML_ONLY (quick_pop_chart_ml):
+ML_ONLY (quick_pop_managed):
     ML score thresholds, size multipliers, KNN hyperparams, and use_ml_filter
     toggle only. No TP/stop/chart filter/reanalysis changes.
 
@@ -69,9 +69,9 @@ CONFIG_PATH = Path(__file__).parent.parent.parent / "strategy_config.json"
 # ---------------------------------------------------------------------------
 
 CONTROLLED_STRATEGIES = frozenset([
-    "trend_rider_chart_reanalyze",
-    "infinite_moonbag_chart",
-    "quick_pop_chart_ml",
+    "trend_rider_managed",
+    "moonbag_managed",
+    "quick_pop_managed",
 ])
 
 # Permission tiers — define what each strategy is allowed to change.
@@ -84,31 +84,31 @@ CONTROLLED_STRATEGIES = frozenset([
 #                   and use_ml_filter toggle only. No TP/stop/chart changes.
 #
 FULL_CONTROL_STRATEGIES = frozenset([
-    "trend_rider_chart_reanalyze",
-    "infinite_moonbag_chart",
+    "trend_rider_managed",
+    "moonbag_managed",
 ])
 
 ML_ONLY_STRATEGIES = frozenset([
-    "quick_pop_chart_ml",
+    "quick_pop_managed",
 ])
 
 _CHART_VARIANTS = frozenset([
-    "trend_rider_chart_reanalyze",
-    "infinite_moonbag_chart",
-    "quick_pop_chart_ml",
+    "trend_rider_managed",
+    "moonbag_managed",
+    "quick_pop_managed",
 ])
 
 # Maps each chart variant to the base strategy whose outcomes proxy "phantom PnL"
 # for signals the chart variant filtered out.
 _BASE_STRATEGY: dict[str, str] = {
-    "quick_pop_chart_ml":         "quick_pop",
-    "trend_rider_chart_reanalyze": "trend_rider",
-    "infinite_moonbag_chart":      "infinite_moonbag",
+    "quick_pop_managed":         "quick_pop",
+    "trend_rider_managed": "trend_rider",
+    "moonbag_managed":      "infinite_moonbag",
 }
 
 _MOONBAG_STRATEGIES = frozenset([
     "infinite_moonbag",
-    "infinite_moonbag_chart",
+    "moonbag_managed",
 ])
 
 # ---------------------------------------------------------------------------
@@ -135,7 +135,7 @@ _TP_GUARDRAILS: dict[str, list[tuple[float, float, float, float]]] = {
     "trend_rider": [
         (1.3, 3.0, 0.30, 0.75),   # tp1
     ],
-    "trend_rider_chart_reanalyze": [
+    "trend_rider_managed": [
         (1.3, 3.0, 0.30, 0.75),   # tp1
     ],
     "infinite_moonbag": [
@@ -144,7 +144,7 @@ _TP_GUARDRAILS: dict[str, list[tuple[float, float, float, float]]] = {
         (2.5, 6.0, 0.08, 0.30),   # tp3
         (3.5, 9.0, 0.05, 0.25),   # tp4
     ],
-    "infinite_moonbag_chart": [
+    "moonbag_managed": [
         (1.3, 2.5, 0.10, 0.40),   # tp1
         (1.8, 3.5, 0.08, 0.30),   # tp2
         (2.5, 6.0, 0.08, 0.30),   # tp3
@@ -160,8 +160,8 @@ _FORBIDDEN_KEYS = frozenset([
     "live_trading",   # operator-only — agent cannot toggle live trading
 ])
 
-# Keys allowed for ML_ONLY strategies (quick_pop_chart_ml).
-# use_ml_filter is intentionally excluded — it is permanently ON for quick_pop_chart_ml
+# Keys allowed for ML_ONLY strategies (quick_pop_managed).
+# use_ml_filter is intentionally excluded — it is permanently ON for quick_pop_managed
 # and the agent cannot toggle it.
 _ML_ONLY_ALLOWED_KEYS = frozenset([
     "ml_min_score", "ml_high_score_threshold", "ml_max_score_threshold",
@@ -173,7 +173,7 @@ _ML_ONLY_ALLOWED_KEYS = frozenset([
 # Keys present here are silently dropped from any proposed delta for that strategy.
 # Format: { strategy_name: { param: locked_value, ... } }
 _LOCKED_PARAMS: dict[str, dict[str, Any]] = {
-    "quick_pop_chart_ml": {
+    "quick_pop_managed": {
         "ml_min_score": 2.5,   # fixed by operator — do not let the agent raise this
     },
 }
@@ -448,7 +448,7 @@ SERVICE SURVIVAL CONTEXT (read carefully — this affects your decisions):
   Deadline:         {_AI_DEADLINE}  — {urgency}
 
 TRADING MODE:
-  quick_pop_chart_ml — LIVE (real money, counts toward AI balance)
+  quick_pop_managed — LIVE (real money, counts toward AI balance)
   All other strategies — PAPER ONLY (no real money at risk, used for research and comparison)
 
 IMPORTANT CONTEXT — read before interpreting PnL:
@@ -457,11 +457,11 @@ IMPORTANT CONTEXT — read before interpreting PnL:
      labelled trade data and test parameter configurations so that when a paper strategy
      goes live, it has the best possible chance of being profitable from day one.
   2. We are in the early calibration phase. The system only recently started live trading.
-     Early negative PnL in quick_pop_chart_ml likely includes pre-ML backfill trades
+     Early negative PnL in quick_pop_managed likely includes pre-ML backfill trades
      (low-confidence signals that the ML filter at score ≥ 2.5 now blocks). Those losses
      are from BEFORE the filter was tuned — do not treat them as evidence the strategy is broken.
      Judge current performance only on trades with a non-null ml_score.
-  3. Paper strategies (trend_rider_chart_reanalyze, infinite_moonbag_chart) have a dual goal:
+  3. Paper strategies (trend_rider_managed, moonbag_managed) have a dual goal:
      (a) accumulate labelled trade history so their ML models can be trained, AND
      (b) trend toward positive PnL so they are ready to go live when performance justifies it.
      Paper PnL does not affect the AI balance, but positive paper PnL is the target direction —
@@ -470,7 +470,7 @@ IMPORTANT CONTEXT — read before interpreting PnL:
      from ML-scored trades (ml_score IS NOT NULL). Pre-ML trades are historical noise.
      Your tuning decisions should be driven by ML-scored trades only.
 
-Your primary goal is to grow the AI balance by maximising PnL for quick_pop_chart_ml.
+Your primary goal is to grow the AI balance by maximising PnL for quick_pop_managed.
 All paper trading supports that goal — it is the research lab that feeds the live strategy.
 live_trading is set by the operator and cannot be changed here.
 """
@@ -739,7 +739,7 @@ def _build_prompt_ml_only(
     base_recent_trades: list[dict] | None = None,
 ) -> str:
     """
-    Prompt for ML_ONLY strategies (quick_pop_chart_ml).
+    Prompt for ML_ONLY strategies (quick_pop_managed).
     The agent can only adjust ML filter parameters — TP, stop, and chart filter
     settings are fixed and cannot be changed.
     """
@@ -747,7 +747,7 @@ def _build_prompt_ml_only(
 
     return f"""You are a parameter tuner for a Solana trading bot.
 Strategy: {strategy}  |  Mode: {live_status}
-Description: quick_pop_chart_ml is a fast scalp strategy that buys on momentum signals,
+Description: quick_pop_managed is a fast scalp strategy that buys on momentum signals,
 sells 60% at 1.5× and 40% at 2.0×, trails at 22% below high after first TP.
 Exits after 45 minutes if TP1 not hit. Chart filter is ALWAYS enabled (not adjustable here).
 Your role is to tune the ML confidence filter only. live_trading is set by the operator.

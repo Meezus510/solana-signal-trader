@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-scripts/check_quick_pop_ml.py — Inspect quick_pop_chart_ml signal history.
+scripts/check_quick_pop_ml.py — Inspect quick_pop_managed signal history.
 
 Checks:
-  1. Recent signals seen by quick_pop_chart_ml — entered vs skipped
+  1. Recent signals seen by quick_pop_managed — entered vs skipped
   2. Candle source for each signal (moralis-10s vs birdeye-1m)
   3. Whether ml_score is populated and what values look like
   4. Training data quality (quick_pop closed outcomes used by KNN)
@@ -42,7 +42,7 @@ def main() -> None:
     conn = sqlite3.connect(DB_PATH)
 
     # ------------------------------------------------------------------
-    # 1. Recent quick_pop_chart_ml signals
+    # 1. Recent quick_pop_managed signals
     # ------------------------------------------------------------------
     rows = conn.execute(
         """
@@ -53,7 +53,7 @@ def main() -> None:
                so.entered, so.outcome_pnl_pct
           FROM strategy_outcomes so
           JOIN signal_charts sc ON so.signal_chart_id = sc.id
-         WHERE so.strategy = 'quick_pop_chart_ml'
+         WHERE so.strategy = 'quick_pop_managed'
          ORDER BY sc.ts DESC
          LIMIT ?
         """,
@@ -65,7 +65,7 @@ def main() -> None:
     print(SEP)
 
     if not rows:
-        print("  No signals found for quick_pop_chart_ml.")
+        print("  No signals found for quick_pop_managed.")
     else:
         scored = sum(1 for r in rows if r[2] is not None)
         moralis = sum(1 for r in rows if r[5] and r[5] > 400)
@@ -147,7 +147,7 @@ def main() -> None:
           MAX(sc.ts)
         FROM strategy_outcomes so
         JOIN signal_charts sc ON so.signal_chart_id = sc.id
-        WHERE so.strategy = 'quick_pop_chart_ml'
+        WHERE so.strategy = 'quick_pop_managed'
         """
     ).fetchone()
 
@@ -179,7 +179,7 @@ def main() -> None:
           MIN(sc.ml_score), MAX(sc.ml_score), AVG(sc.ml_score)
         FROM strategy_outcomes so
         JOIN signal_charts sc ON so.signal_chart_id = sc.id
-        WHERE so.strategy = 'quick_pop_chart_ml'
+        WHERE so.strategy = 'quick_pop_managed'
           AND sc.ml_score IS NOT NULL
         """
     ).fetchone()

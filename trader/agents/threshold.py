@@ -40,7 +40,7 @@ _MODEL = "claude-haiku-4-5-20251001"
 
 def run(
     db_path: str = "trader.db",
-    strategy: str = "quick_pop_chart_ml",
+    strategy: str = "quick_pop_managed",
     current_config: dict | None = None,
 ) -> dict:
     """
@@ -129,7 +129,7 @@ def _build_prompt(
     )
 
     return f"""You are a parameter tuner for a Solana paper trading bot.
-The bot uses a KNN ML scorer (0–10) to gate entries on the quick_pop_chart_ml strategy.
+The bot uses a KNN ML scorer (0–10) to gate entries on the quick_pop_managed strategy.
 Scores below ml_min_score → skip trade.
 Scores >= ml_high_score_threshold → double position size.
 Scores >= ml_max_score_threshold → triple position size.

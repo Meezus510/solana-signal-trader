@@ -72,22 +72,22 @@ class MockDB:
 # ---------------------------------------------------------------------------
 
 class TestExtractFeatures:
-    def test_returns_18_features_with_both_sources(self):
+    def test_returns_21_features_with_both_sources(self):
         feat = extract_features(_make_candles(10), candles_1m=_make_candles(8))
         assert feat is not None
-        assert len(feat) == 18
+        assert len(feat) == 21
 
-    def test_returns_18_features_with_10s_only(self):
-        # candles_1m absent → features 7-12 are neutral but vector is still 18
+    def test_returns_21_features_with_10s_only(self):
+        # candles_1m absent → features 7-12 are neutral but vector is still 21
         feat = extract_features(_make_candles(10))
         assert feat is not None
-        assert len(feat) == 18
+        assert len(feat) == 21
 
-    def test_returns_18_features_with_1m_only(self):
-        # candles_10s too short → features 1-6 are neutral but vector is still 18
+    def test_returns_21_features_with_1m_only(self):
+        # candles_10s too short → features 1-6 are neutral but vector is still 21
         feat = extract_features([], candles_1m=_make_candles(10))
         assert feat is not None
-        assert len(feat) == 18
+        assert len(feat) == 21
 
     def test_returns_none_when_both_sources_too_short(self):
         assert extract_features(_make_candles(2)) is None

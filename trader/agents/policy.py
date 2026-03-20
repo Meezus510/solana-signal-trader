@@ -16,7 +16,7 @@ Usage:
             "liquidity_usd": 45000,
             "slippage_bps": 120,
         },
-        strategy="quick_pop_chart_ml",
+        strategy="quick_pop_managed",
     )
     # decision = {
     #     "allow_trade": True,
@@ -67,7 +67,7 @@ _LOW_LIQUIDITY_USD   = 20_000   # below this → reduce size
 
 def propose_policy_decision(
     signal_context: dict,
-    strategy: str = "quick_pop_chart_ml",
+    strategy: str = "quick_pop_managed",
     db_path: str | None = None,          # reserved for future history look-ups
 ) -> dict:
     """
