@@ -2,8 +2,8 @@
 tests/test_ml_scorer.py — Unit tests for ChartMLScorer and supporting functions.
 
 Covers:
-- extract_features: 14-element output, neutrals when optional inputs absent,
-  None when fewer than 3 candles
+- extract_features: 18-element output, neutrals when optional inputs absent,
+  None when both candle sources have fewer than 3 candles
 - zscore_normalize: zero-mean / unit-variance over training set
 - euclidean: correct distance
 - ChartMLScorer: None when too few snapshots, score in [0, 10],
@@ -49,12 +49,13 @@ def _make_snapshot(pnl_pct: float, days_ago: float = 1.0) -> dict:
     candles = _make_candles(10)
     ts = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
     return {
-        "candles_json": json.dumps(candles),
+        "candles_json":    json.dumps(candles),
+        "candles_1m_json": json.dumps(_make_candles(8)),
         "pair_stats_json": None,
-        "pump_ratio": None,
-        "vol_trend": None,
+        "pump_ratio":      None,
+        "vol_trend":       None,
         "outcome_pnl_pct": pnl_pct,
-        "ts": ts,
+        "ts":              ts,
     }
 
 
@@ -62,7 +63,7 @@ class MockDB:
     def __init__(self, snapshots: list[dict]):
         self._snapshots = snapshots
 
-    def load_chart_snapshots(self, strategy: str) -> list[dict]:
+    def load_chart_snapshots(self, strategy: str, label_column: str = "outcome_pnl_pct") -> list[dict]:
         return self._snapshots
 
 
@@ -71,76 +72,93 @@ class MockDB:
 # ---------------------------------------------------------------------------
 
 class TestExtractFeatures:
-    def test_returns_14_features(self):
-        candles = _make_candles(10)
-        feat = extract_features(candles)
+    def test_returns_18_features_with_both_sources(self):
+        feat = extract_features(_make_candles(10), candles_1m=_make_candles(8))
         assert feat is not None
-        assert len(feat) == 14
+        assert len(feat) == 18
 
-    def test_returns_none_for_fewer_than_3_candles(self):
+    def test_returns_18_features_with_10s_only(self):
+        # candles_1m absent → features 7-12 are neutral but vector is still 18
+        feat = extract_features(_make_candles(10))
+        assert feat is not None
+        assert len(feat) == 18
+
+    def test_returns_18_features_with_1m_only(self):
+        # candles_10s too short → features 1-6 are neutral but vector is still 18
+        feat = extract_features([], candles_1m=_make_candles(10))
+        assert feat is not None
+        assert len(feat) == 18
+
+    def test_returns_none_when_both_sources_too_short(self):
         assert extract_features(_make_candles(2)) is None
         assert extract_features([]) is None
+        assert extract_features(_make_candles(2), candles_1m=_make_candles(2)) is None
 
-    def test_pump_ratio_flat_price_is_one(self):
-        candles = _make_candles(10, price=2.0)
-        feat = extract_features(candles)
-        # All closes equal all lows (within the flat data): pump_ratio ~= 1.0
+    def test_pump_ratio_10s_flat_price_is_one(self):
+        feat = extract_features(_make_candles(10, price=2.0))
+        # features 1-6 from 10s candles; pump_ratio = feat[0]
         assert feat[0] >= 1.0
 
-    def test_vol_trend_rising_encoded_as_one(self):
-        candles = _make_candles(10)
-        feat = extract_features(candles, vol_trend_1m="RISING")
-        assert feat[7] == pytest.approx(1.0)
+    def test_pump_ratio_1m_flat_price_is_one(self):
+        feat = extract_features([], candles_1m=_make_candles(10, price=2.0))
+        # features 7-12 from 1m candles; pump_ratio_1m = feat[6]
+        assert feat[6] >= 1.0
 
-    def test_vol_trend_dying_encoded_as_zero(self):
-        candles = _make_candles(10)
-        feat = extract_features(candles, vol_trend_1m="DYING")
-        assert feat[7] == pytest.approx(0.0)
+    def test_10s_neutral_when_short(self):
+        # candles_10s has <3 → features 1-6 should be neutral [1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+        feat = extract_features([], candles_1m=_make_candles(10))
+        assert feat[0] == pytest.approx(1.0)   # neutral pump_ratio
+        assert feat[1] == pytest.approx(1.0)   # neutral vol_momentum
+        assert feat[2] == pytest.approx(0.0)   # neutral price_slope
+        assert feat[5] == pytest.approx(0.0)   # neutral candle_count_norm
 
-    def test_vol_trend_absent_neutral(self):
-        candles = _make_candles(10)
-        feat = extract_features(candles)
-        assert feat[7] == pytest.approx(0.5)
-
-    def test_pump_ratio_1m_fallback_to_short_candle_ratio(self):
-        candles = _make_candles(10, price=3.0)
-        feat_without = extract_features(candles)
-        # Feature 7 (f_pump_1m) should fall back to the candle pump_ratio (feat[0])
-        assert feat_without[6] == pytest.approx(feat_without[0])
-
-    def test_pump_ratio_1m_explicit_value_used(self):
-        candles = _make_candles(10)
-        feat = extract_features(candles, pump_ratio_1m=5.0)
-        assert feat[6] == pytest.approx(5.0)
+    def test_1m_neutral_when_absent(self):
+        # candles_1m absent → features 7-12 should be neutral
+        feat = extract_features(_make_candles(10))
+        assert feat[6]  == pytest.approx(1.0)   # neutral pump_ratio_1m
+        assert feat[7]  == pytest.approx(1.0)   # neutral vol_momentum_1m
+        assert feat[8]  == pytest.approx(0.0)   # neutral price_slope_1m
+        assert feat[11] == pytest.approx(0.0)   # neutral candle_count_norm_1m
 
     def test_pair_stats_buy_ratio_balanced_when_absent(self):
-        candles = _make_candles(10)
-        feat = extract_features(candles)
-        assert feat[8] == pytest.approx(0.5)  # neutral buy_ratio_5m
+        feat = extract_features(_make_candles(10))
+        assert feat[12] == pytest.approx(0.5)   # neutral buy_ratio_5m (index 12)
 
     def test_pair_stats_buy_ratio_all_buys(self):
-        candles = _make_candles(10)
-        feat = extract_features(candles, pair_stats={"buys_5m": 100, "sells_5m": 0})
-        assert feat[8] == pytest.approx(1.0, abs=0.01)
+        feat = extract_features(_make_candles(10), pair_stats={"buys_5m": 100, "sells_5m": 0})
+        assert feat[12] == pytest.approx(1.0, abs=0.01)
 
     def test_pair_stats_buy_vol_neutral_when_absent(self):
-        candles = _make_candles(10)
-        feat = extract_features(candles)
-        assert feat[11] == pytest.approx(0.5)  # neutral buy_vol_ratio_1h
+        feat = extract_features(_make_candles(10))
+        assert feat[15] == pytest.approx(0.5)   # neutral buy_vol_ratio_1h (index 15)
 
-    def test_price_slope_positive_for_rising_candles(self):
+    def test_price_slope_positive_for_rising_10s_candles(self):
         candles = [
             {"t": i, "o": 1.0 + i * 0.01, "h": 1.1 + i * 0.01,
              "l": 0.9 + i * 0.01, "c": 1.0 + i * 0.01, "v": 100.0}
             for i in range(10)
         ]
         feat = extract_features(candles)
-        assert feat[2] > 0  # price_slope_pct
+        assert feat[2] > 0   # price_slope_10s
 
-    def test_candle_count_norm_scales_with_n(self):
+    def test_price_slope_positive_for_rising_1m_candles(self):
+        candles = [
+            {"t": i * 60, "o": 1.0 + i * 0.01, "h": 1.1 + i * 0.01,
+             "l": 0.9 + i * 0.01, "c": 1.0 + i * 0.01, "v": 100.0}
+            for i in range(10)
+        ]
+        feat = extract_features([], candles_1m=candles)
+        assert feat[8] > 0   # price_slope_1m
+
+    def test_candle_count_norm_10s_scales_with_n(self):
         feat10 = extract_features(_make_candles(10))
         feat20 = extract_features(_make_candles(20))
-        assert feat20[5] > feat10[5]  # candle_count_norm
+        assert feat20[5] > feat10[5]   # candle_count_10s
+
+    def test_candle_count_norm_1m_scales_with_n(self):
+        feat10 = extract_features([], candles_1m=_make_candles(10))
+        feat20 = extract_features([], candles_1m=_make_candles(20))
+        assert feat20[11] > feat10[11]  # candle_count_1m
 
 
 # ---------------------------------------------------------------------------

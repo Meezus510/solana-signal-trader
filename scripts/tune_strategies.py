@@ -6,9 +6,8 @@ Monitors total buy signals received per strategy. When N new signals have
 accumulated since the last tune, fires Agent E (strategy_tuner) to analyze
 performance and propose + apply parameter adjustments to strategy_config.json.
 
-"Signal" means any row in strategy_outcomes for the strategy — including
-skipped signals (entered=0). This lets the tuner fire even when chart/ML
-filters are blocking most entries.
+"Signal" means an actual BUY (entered=1) in strategy_outcomes for the
+base strategy. The count increments by 1 for every buy.
 
 Changes take effect on the next hot-reload cycle (strategy_config.json mtime
 is watched by the engine) or bot restart.
@@ -74,15 +73,15 @@ CONTROLLED_LIST = sorted(CONTROLLED_STRATEGIES)
 
 def _get_signal_count(db_path: str, strategy: str) -> int:
     """
-    Count total buy signals received for a strategy (entered OR skipped).
+    Count total BUY signals entered for a strategy (entered=1 only).
 
-    Uses COUNT(*) on all strategy_outcomes rows — including skipped signals
-    (entered=0) — so the tuner fires even when filters block most entries.
+    Counts only actual buys so the tuner trigger reflects real trade activity,
+    not filtered/skipped signals.
     """
     try:
         conn = sqlite3.connect(db_path)
         row = conn.execute(
-            "SELECT COUNT(*) FROM strategy_outcomes WHERE strategy=?",
+            "SELECT COUNT(*) FROM strategy_outcomes WHERE strategy=? AND entered=1",
             (strategy,),
         ).fetchone()
         conn.close()
@@ -196,6 +195,29 @@ def run_once(
         print(f"\n  No strategies reached the tune threshold.")
 
 
+def _reset_baselines(strategies: list[str], db_path: str, dry_run: bool) -> None:
+    """
+    On startup, set trades_at_last_tune to the current DB buy count for each
+    strategy so the tuner always measures N *new* signals from this run, not
+    from a stale previous session.
+    """
+    try:
+        config = load_config()
+    except FileNotFoundError:
+        return
+    changed = False
+    for strategy in strategies:
+        count_strategy = _BASE_STRATEGY.get(strategy, strategy)
+        current = _get_signal_count(db_path, count_strategy)
+        stored = config.get("_meta", {}).get("trades_at_last_tune", {}).get(strategy, 0)
+        if current != stored:
+            _update_meta(strategy, current, config)
+            print(f"[startup] Reset baseline for {strategy}: {stored} → {current}")
+            changed = True
+    if changed and not dry_run:
+        save_config(config)
+
+
 def run_loop(
     strategies: list[str],
     db_path: str,
@@ -205,6 +227,7 @@ def run_loop(
     """Poll every POLL_INTERVAL_SECONDS and fire the tuner when thresholds are met."""
     print(f"[loop] Watching {len(strategies)} strategy(s). Polling every {POLL_INTERVAL_SECONDS}s.")
     print(f"[loop] Will tune when {every} new buy signals accumulate. Press Ctrl+C to stop.\n")
+    _reset_baselines(strategies, db_path, dry_run)
     try:
         while True:
             run_once(strategies, db_path, every, dry_run)

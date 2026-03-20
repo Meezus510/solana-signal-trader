@@ -323,6 +323,65 @@ class BirdeyePriceClient:
 
         return []
 
+    async def get_token_overview(
+        self,
+        mint_address: str,
+    ) -> Optional[dict]:
+        """
+        Fetch token metadata from Birdeye's token overview endpoint.
+
+        Returns a flat dict with fields merged into pair_stats for ML features:
+            market_cap_usd   — USD market cap at signal time (None if unavailable)
+            liquidity_usd    — total USD liquidity across all pools
+            holder_count     — number of unique holders
+
+        Returns None on any error so callers fall back to neutral ML features.
+
+        Endpoint: GET /defi/token_overview?address=<mint>
+        """
+        url = f"{self._cfg.birdeye_base_url}/defi/token_overview"
+        params = {"address": mint_address}
+        try:
+            async with self._session.get(
+                url,
+                headers=self._headers(),
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=self._cfg.request_timeout_seconds),
+            ) as resp:
+                if resp.status == 401:
+                    logger.warning("[TokenOverview] 401 Unauthorized for %s — skipping metadata", mint_address)
+                    return None
+                if resp.status == 429:
+                    logger.warning("[TokenOverview] 429 rate limit for %s — skipping metadata", mint_address)
+                    return None
+                if resp.status != 200:
+                    logger.warning("[TokenOverview] HTTP %d for %s — skipping metadata", resp.status, mint_address)
+                    return None
+
+                data = (await resp.json()).get("data") or {}
+                mc  = data.get("marketCap") or data.get("realMc")
+                liq = data.get("liquidity")
+                hld = data.get("holder")
+
+                if mc is None and liq is None and hld is None:
+                    logger.debug("[TokenOverview] no usable metadata for %s", mint_address)
+                    return None
+
+                return {
+                    "market_cap_usd": float(mc)  if mc  is not None else None,
+                    "liquidity_usd":  float(liq) if liq is not None else None,
+                    "holder_count":   int(hld)   if hld is not None else None,
+                }
+
+        except asyncio.TimeoutError:
+            logger.warning("[TokenOverview] timeout for %s", mint_address)
+        except aiohttp.ClientError as exc:
+            logger.warning("[TokenOverview] HTTP error for %s: %s", mint_address, exc)
+        except Exception as exc:
+            logger.error("[TokenOverview] unexpected error for %s: %s", mint_address, exc)
+
+        return None
+
     async def _individual_with_rate_limit(
         self,
         mint_addresses: list[str],

@@ -58,8 +58,10 @@ class Position:
     closed_at: Optional[datetime]
 
     # Strategy state
-    highest_price: float          # running max — drives trailing stop
-    lowest_price: float           # running min — tracked for post-signal training data
+    highest_price: float                  # running max — drives trailing stop
+    highest_price_ts: Optional[datetime]  # when highest_price was first reached
+    lowest_price: float                   # running min — tracked for training data
+    lowest_price_ts: Optional[datetime]   # when lowest_price was first reached
     take_profit_price: float      # entry_price × take_profit_multiple
     stop_loss_price: float        # entry_price × (1 − stop_loss_pct)
     trailing_active: bool         # True after partial TP sell fires

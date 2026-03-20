@@ -133,6 +133,13 @@ class StrategyConfig:
     # e.g. quick_pop_chart_ml → "quick_pop"
     ml_training_strategy: Optional[str] = None
 
+    # Which outcome column to use as the KNN training label.
+    # "outcome_pnl_pct"      — final exit PnL% (default, exit-price based)
+    # "position_peak_pnl_pct" — highest price reached before sell (peak-pump based)
+    # quick_pop uses peak so the model learns "did this signal actually pump?"
+    # rather than "did our exit happen to be profitable?"
+    ml_training_label: str = "outcome_pnl_pct"
+
     # When True, the KNN scorer uses Moralis 10s candles (if available) instead
     # of Birdeye 1m.  Enable only for fast-scalp strategies (quick_pop) where
     # short-term pump shape matters most.  Trend/moonbag strategies should leave
@@ -147,6 +154,13 @@ class StrategyConfig:
     ml_halflife_days: float = 14.0
     ml_score_low_pct: float = -35.0
     ml_score_high_pct: float = 85.0
+
+    # Per-feature weights for the KNN scorer (18-element list, one per feature).
+    # When set, each feature value is multiplied by its weight before z-score
+    # normalisation, giving higher-separability features proportionally more
+    # influence on the euclidean distance.  None = uniform weights (default).
+    # Feature order matches ml_scorer.py FEAT_NAMES (indices 0–17).
+    ml_feature_weights: Optional[tuple[float, ...]] = None
 
     # Live trading flag — when True, closed trades from this strategy affect the
     # AI balance (tracked via is_live=1 in strategy_outcomes).
@@ -245,6 +259,12 @@ class StrategyRunner:
             self._portfolio.add_position(pos)
         if positions:
             logger.info("[%s] Restored %d open position(s)", self.name, len(positions))
+
+    def restore_closed_positions(self, positions: list[Position]) -> None:
+        for pos in positions:
+            self._portfolio.add_closed_position(pos)
+        if positions:
+            logger.info("[%s] Restored %d closed position(s)", self.name, len(positions))
 
     # ------------------------------------------------------------------
     # Position queries
@@ -398,8 +418,10 @@ class StrategyRunner:
         # 1. Update highest/lowest price seen
         if current_price > position.highest_price:
             position.highest_price = current_price
+            position.highest_price_ts = now
         if current_price < position.lowest_price:
             position.lowest_price = current_price
+            position.lowest_price_ts = now
 
         # 2. Check existing stop (values from previous tick — before any update this tick)
         #    Trailing stop if active, else fixed stop_loss_price.
@@ -558,10 +580,19 @@ class StrategyRunner:
             closed_at = closed_at.replace(tzinfo=timezone.utc)
         hold_secs = (closed_at - opened_at).total_seconds()
         max_gain_pct = (position.highest_price / position.entry_price - 1.0) * 100.0
+        trough_pnl_pct = (position.lowest_price / position.entry_price - 1.0) * 100.0
         pnl_pct = (position.realized_pnl_usd / position.usd_size * 100.0) if position.usd_size else 0.0
+        peak_ts   = position.highest_price_ts.isoformat() if position.highest_price_ts else None
+        trough_ts = position.lowest_price_ts.isoformat() if position.lowest_price_ts else None
         self._db.update_strategy_outcome(
             outcome_id, pnl_pct, reason, hold_secs, max_gain_pct,
             pnl_usd=position.realized_pnl_usd,
+            position_peak_price=position.highest_price,
+            position_peak_ts=peak_ts,
+            position_peak_pnl_pct=max_gain_pct,
+            position_trough_price=position.lowest_price,
+            position_trough_ts=trough_ts,
+            position_trough_pnl_pct=trough_pnl_pct,
         )
 
         signal_chart_id = self._signal_chart_ids.pop(position.mint_address, None)
@@ -638,13 +669,13 @@ class InfiniteMoonbagRunner(StrategyRunner):
         stop floor = entry × 0.70  (−30% catastrophic)
 
     After grace:
-        stop floor = entry × 0.78  (−22% normal)
+        stop floor = entry × 0.80  (−20% normal)
 
     Stop ladder (floor multiples of entry, triggered by highest_price_seen):
-        highest ≥ 1.8× → stop ≥ entry × 1.35
-        highest ≥ 2.5× → stop ≥ entry × 1.90
-        highest ≥ 4.0× → stop ≥ entry × 2.80
-        highest ≥ 6.0× → stop ≥ entry × 3.50
+        highest ≥ 2.5× → stop ≥ entry × 1.65  (+65% locked)
+        highest ≥ 4.0× → stop ≥ entry × 2.60  (+160% locked)
+        highest ≥ 6.0× → stop ≥ entry × 4.20  (+320% locked)
+        (1.8× rung removed — see _STOP_MILESTONES comment)
 
     All stops are monotonic (only ever raised, never lowered).
 
@@ -659,14 +690,26 @@ class InfiniteMoonbagRunner(StrategyRunner):
 
     _GRACE_SECONDS = 90.0
     _GRACE_FLOOR      = 0.70  # entry × 0.70 during grace  (−30%)
-    _POST_GRACE_FLOOR = 0.78  # entry × 0.78 after grace   (−22%)
+    _POST_GRACE_FLOOR = 0.80  # entry × 0.80 after grace   (−20%)
+    # Tightened from −22% → −20%: big winners (PIXELS/DOOLYSAURUS/CHIBELON/MOCHI/CHUCK)
+    # never dipped below −16.4% from entry, so −20% cuts losers 2% faster with no winner risk.
 
     # Fixed floor milestones — (highest_multiple, stop_floor_multiple_of_entry)
+    # Data-driven update 2026-03-20 based on 59-trade analysis:
+    #   • 1.8× rung REMOVED: the old 1.35× lock-in caused MOCHI to exit at +34%
+    #     on a 1.8×→entry retrace — token then pumped to +436%. MOCHI's retrace
+    #     went to −4.1% from entry (0.959×), which is above the −20% after-grace
+    #     floor (0.80×). Removing this rung keeps the floor at 0.80× after a 1.8×
+    #     hit, letting MOCHI-type tokens survive the retrace and continue.
+    #     Cost: tokens that peak at ~1.8× and crash now exit at −20% instead of
+    #     +35%. Given TP1 already sold 20% at 1.8×, blended exit is still ~breakeven.
+    #   • 2.5× rung lowered 1.90→1.65: more room for retracements at this level.
+    #   • 4.0× rung lowered 2.80→2.60: slight loosening, still locks +160%.
+    #   • 6.0× rung raised 3.50→4.20: tighten at the top — lock in more at 6×.
     _STOP_MILESTONES: tuple[tuple[float, float], ...] = (
-        (1.8, 1.35),   # highest ≥ 1.8× → stop ≥ entry × 1.35
-        (2.5, 1.90),   # highest ≥ 2.5× → stop ≥ entry × 1.90
-        (4.0, 2.80),   # highest ≥ 4.0× → stop ≥ entry × 2.80
-        (6.0, 3.50),   # highest ≥ 6.0× → stop ≥ entry × 3.50
+        (2.5, 1.65),   # highest ≥ 2.5× → stop ≥ entry × 1.65  (+65% locked)
+        (4.0, 2.60),   # highest ≥ 4.0× → stop ≥ entry × 2.60  (+160% locked)
+        (6.0, 4.20),   # highest ≥ 6.0× → stop ≥ entry × 4.20  (+320% locked)
     )
 
     # Maps TP index → Position flag attribute name

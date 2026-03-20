@@ -44,6 +44,11 @@ class PortfolioManager:
         self._open_by_mint[position.mint_address] = position
         logger.debug("Position added: %s | mint=%s", position.symbol, position.mint_address)
 
+    def add_closed_position(self, position: Position) -> None:
+        """Register a historical closed position (for summary reporting only)."""
+        self._all.append(position)
+        logger.debug("Closed position loaded: %s | mint=%s", position.symbol, position.mint_address)
+
     def close_position(self, mint_address: str) -> None:
         """
         Remove a position from the open-position index.

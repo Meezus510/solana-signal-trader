@@ -227,6 +227,7 @@ def main() -> None:
             available_cash, starting_cash = saved
             runner.restore_cash(available_cash, starting_cash)
         runner.restore_positions(db.load_open_positions(runner.name))
+        runner.restore_closed_positions(db.load_closed_positions(runner.name))
 
     db.close()
 

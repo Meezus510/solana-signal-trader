@@ -80,9 +80,9 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         trend_rider_chart_reanalyze also re-checks skipped signals after a delay.
 
     infinite_moonbag / infinite_moonbag_chart (v2)
-        Grace period 90s: −30% floor. After grace: −22% floor.
+        Grace period 90s: −30% floor. After grace: −20% floor.
         TP ladder: 1.8×/20%, 2.5×/15%, 4.0×/15%, 6.0×/10% of original.
-        Stop ladder: 1.8×→1.35×, 2.5×→1.90×, 4.0×→2.80×, 6.0×→3.50×.
+        Stop ladder: 1.8×→1.00× (breakeven), 2.5×→1.65×, 4.0×→2.60×, 6.0×→4.20×.
     """
     overrides = _load_strategy_overrides()
 
@@ -142,6 +142,7 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         ]),
         trailing_stop_pct=_o("infinite_moonbag").get("trailing_stop_pct", 0.30),
         starting_cash_usd=cfg.starting_cash_usd,
+        save_chart_data=True,
         live_trading=_o("infinite_moonbag").get("live_trading", False),
     )
 
@@ -169,6 +170,7 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         use_ai_override=_qp_chart.get("use_ai_override", False),
         use_ai_override_shadow=_qp_chart.get("use_ai_override_shadow", False),
         ml_training_strategy="quick_pop",  # train on unfiltered base outcomes
+        ml_training_label="position_peak_pnl_pct",  # predict peak pump, not exit PnL
         ml_prefer_moralis=True,      # use 10s candles for KNN — fast-scalp pump shape
         ml_min_score=_qp_chart.get("ml_min_score", 5.0),
         ml_high_score_threshold=_qp_chart.get("ml_high_score_threshold", 8.0),
@@ -195,6 +197,7 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         timeout_minutes=_tr_chart.get("timeout_minutes", 90.0),
         timeout_min_gain_pct=_tr_chart.get("timeout_min_gain_pct", 0.15),
         max_hold_minutes=_tr_chart.get("max_hold_minutes", 240.0),
+        save_chart_data=True,
         use_chart_filter=_tr_chart.get("use_chart_filter", True),
         pump_ratio_max=_tr_chart.get("pump_ratio_max", 3.5),
         use_reanalyze=_tr_chart.get("use_reanalyze", True),
@@ -228,19 +231,60 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         ]),
         trailing_stop_pct=_mb_chart.get("trailing_stop_pct", 0.30),
         starting_cash_usd=cfg.starting_cash_usd,
+        save_chart_data=True,
         use_chart_filter=_mb_chart.get("use_chart_filter", True),
         pump_ratio_max=_mb_chart.get("pump_ratio_max", 3.5),
         ml_training_strategy="infinite_moonbag",
+        # position_peak_pnl_pct trains on the highest price reached before sell —
+        # "did the signal pump?" not "did our exit lock in profit?".
+        # Uses all 64 closed rows (signal_chart_peak_pnl_pct only has 17 with
+        # price_tracking_done=1, too few for reliable KNN).
+        ml_training_label="position_peak_pnl_pct",
         use_ml_filter=_mb_chart.get("use_ml_filter", False),
-        ml_min_score=_mb_chart.get("ml_min_score", 5.0),
-        ml_high_score_threshold=_mb_chart.get("ml_high_score_threshold", 8.0),
-        ml_max_score_threshold=_mb_chart.get("ml_max_score_threshold", 9.5),
+        ml_min_score=_mb_chart.get("ml_min_score", 2.0),
+        ml_high_score_threshold=_mb_chart.get("ml_high_score_threshold", 6.0),
+        ml_max_score_threshold=_mb_chart.get("ml_max_score_threshold", 8.0),
         ml_size_multiplier=_mb_chart.get("ml_size_multiplier", 2.0),
         ml_max_size_multiplier=_mb_chart.get("ml_max_size_multiplier", 3.0),
-        ml_k=int(_mb_chart.get("ml_k", 5)),
+        ml_k=int(_mb_chart.get("ml_k", 3)),
         ml_halflife_days=_mb_chart.get("ml_halflife_days", 14.0),
         ml_score_low_pct=_mb_chart.get("ml_score_low_pct", -35.0),
-        ml_score_high_pct=_mb_chart.get("ml_score_high_pct", 85.0),
+        ml_score_high_pct=_mb_chart.get("ml_score_high_pct", 150.0),
+        # Feature weights for moonbag KNN (21 features total).
+        # Weights derived from Cohen's d separability analysis on 65 closed trades.
+        #
+        # ZEROED (0×) — confirmed useless or actively harmful:
+        #   idx 0-5  (10s OHLCV)     — moonbag passes candles_10s=[] at scoring time;
+        #                               always neutral constants, weighting them adds noise.
+        #   idx 6    pump_ratio_1m   — d=0.08, LOSERS>WINNERS: near-zero signal.
+        #   idx 8    price_slope_1m  — d=0.08, LOSERS>WINNERS: near-zero signal.
+        #   idx 10   volatility_1m   — d=0.01: pure noise, winners/losers identical.
+        #   idx 11   candle_count_1m — d=0.02: pure noise.
+        #   idx 15   buy_vol_ratio_1h— d=0.02: pure noise.
+        #
+        # KEPT LOW (0.3×) — weak or partially wrong-direction signal:
+        #   idx 7    vol_momentum_1m — d=0.14, LOSERS>WINNERS: weak, keep very low.
+        #   idx 12   buy_ratio_5m    — d=0.17, LOSERS>WINNERS: 38% fallback rate + wrong dir.
+        #
+        # MODERATE (1-2×) — useful signals with reasonable d:
+        #   idx 9    recent_momentum_1m  — d=0.50, W>L: best 1m feature.
+        #   idx 13   activity_5m_norm    — d=0.16, W>L.
+        #   idx 14   price_change_5m_norm— d=0.13, W>L.
+        #   idx 16   liquidity_change_1h — d=0.18, W>L.
+        #
+        # HIGH (8×) — dominant separator:
+        #   idx 17   source_channel  — d=1.04: every winner was WizzyCasino.
+        #
+        # TOKEN METADATA (6×/4×/2×) — no historical data yet (100% fallback = 0.5).
+        #   Mathematically inert now (all-same value → zero distance contribution
+        #   after z-normalisation), but weights are pre-set so they activate
+        #   automatically as new signals with real market cap/liquidity data accumulate.
+        ml_feature_weights=(
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,   # idx  0-5:  10s features — zeroed
+            0.0, 0.3, 0.0, 2.0, 0.0, 0.0,   # idx  6-11: 1m OHLCV (pump=0, vol_mom=0.3, slope=0, rec_mom=2, vol=0, cnt=0)
+            0.3, 1.0, 1.0, 0.0, 1.0, 8.0,   # idx 12-17: pair stats + source_channel
+            6.0, 4.0, 2.0,                   # idx 18-20: market_cap, liquidity, holder_count
+        ),
         live_trading=_mb_chart.get("live_trading", False),
     )
 

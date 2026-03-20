@@ -80,16 +80,20 @@ class MultiStrategyEngine:
             for r in runners:
                 if r.cfg.save_chart_data:  # score whenever chart data is saved, even if filter is off
                     training = r.cfg.ml_training_strategy or r.cfg.name
-                    if training not in self._ml_scorers:
-                        self._ml_scorers[training] = ChartMLScorer(
+                    scorer_key = f"{training}::{r.cfg.ml_training_label}"
+                    if scorer_key not in self._ml_scorers:
+                        self._ml_scorers[scorer_key] = ChartMLScorer(
                             db, strategy=training,
                             k=r.cfg.ml_k,
                             recency_halflife_days=r.cfg.ml_halflife_days,
                             score_low_pct=r.cfg.ml_score_low_pct,
                             score_high_pct=r.cfg.ml_score_high_pct,
+                            training_label=r.cfg.ml_training_label,
+                            feature_weights=list(r.cfg.ml_feature_weights)
+                                if r.cfg.ml_feature_weights else None,
                         )
                     if r.cfg.ml_prefer_moralis:
-                        self._ml_prefer_moralis.add(training)
+                        self._ml_prefer_moralis.add(scorer_key)
         logger.info(
             "[engine] Initialized — %d runner(s) | ml_scorers: %s | moralis_knn: %s",
             len(self._runners),
@@ -156,16 +160,20 @@ class MultiStrategyEngine:
             for r in self._runners:
                 if r.cfg.save_chart_data:  # score whenever chart data is saved, even if filter is off
                     training = r.cfg.ml_training_strategy or r.cfg.name
-                    if training not in self._ml_scorers:
-                        self._ml_scorers[training] = ChartMLScorer(
+                    scorer_key = f"{training}::{r.cfg.ml_training_label}"
+                    if scorer_key not in self._ml_scorers:
+                        self._ml_scorers[scorer_key] = ChartMLScorer(
                             self._db, strategy=training,
                             k=r.cfg.ml_k,
                             recency_halflife_days=r.cfg.ml_halflife_days,
                             score_low_pct=r.cfg.ml_score_low_pct,
                             score_high_pct=r.cfg.ml_score_high_pct,
+                            training_label=r.cfg.ml_training_label,
+                            feature_weights=list(r.cfg.ml_feature_weights)
+                                if r.cfg.ml_feature_weights else None,
                         )
                     if r.cfg.ml_prefer_moralis:
-                        self._ml_prefer_moralis.add(training)
+                        self._ml_prefer_moralis.add(scorer_key)
 
         logger.info(
             "[engine] Hot-reload complete — %d runner(s) active | ml_scorers: %s",
@@ -235,44 +243,46 @@ class MultiStrategyEngine:
         # to any supported resolution (10s, 30s, 1min, etc.).
         # ------------------------------------------------------------------
         # Fetch ML candles for any runner that scores OR saves chart data.
-        # save_chart_data runners need candles stored even without a scorer.
+        # Two separate sources are tracked for the dual-resolution feature vector:
+        #   moralis_candles — Moralis 10s (features 1-6, empty if Moralis fails)
+        #   candles         — Birdeye 1m (features 7-12, already fetched above)
+        # ml_candles is the primary candle list stored in signal_charts.candles_json:
+        #   Moralis 10s when available, else Birdeye 1m as storage fallback.
+        # ------------------------------------------------------------------
         needs_ml_candles = self._ml_scorers or any(r.cfg.save_chart_data for r in self._runners)
-        ml_candles = []
-        ml_source  = "none"
+        moralis_candles = []   # raw Moralis 10s (may be empty — used for features 1-6)
+        ml_candles      = []   # primary storage candles (Moralis 10s or Birdeye 1m fallback)
+        ml_source       = "none"
         if needs_ml_candles:
             if self._moralis:
                 try:
-                    ml_candles = await self._moralis.get_ohlcv(
+                    moralis_candles = await self._moralis.get_ohlcv(
                         signal.mint_address,
                         bars=MORALIS_OHLCV_BARS,
                         interval=MORALIS_OHLCV_INTERVAL,
                     )
-                    if ml_candles:
-                        ml_source = f"moralis/{MORALIS_OHLCV_INTERVAL}"
+                    if moralis_candles:
+                        ml_candles = moralis_candles
+                        ml_source  = f"moralis/{MORALIS_OHLCV_INTERVAL}"
                     else:
                         logger.warning(
-                            "[ML] Moralis returned no candles for %s — falling back to Birdeye 1m",
+                            "[ML] Moralis returned no candles for %s — 10s features will be neutral",
                             signal.symbol,
                         )
                 except Exception as exc:
                     logger.warning(
-                        "[ML] Moralis OHLCV error for %s — falling back to Birdeye 1m: %s",
+                        "[ML] Moralis OHLCV error for %s — 10s features will be neutral: %s",
                         signal.symbol, exc,
                     )
 
             if not ml_candles:
-                try:
-                    ml_candles = await self._birdeye.get_ohlcv(
-                        signal.mint_address,
-                        bars=ML_OHLCV_BARS,
-                        interval=ML_OHLCV_INTERVAL,
-                    )
-                    if ml_candles:
-                        ml_source = f"birdeye/{ML_OHLCV_INTERVAL}"
-                    else:
-                        logger.warning("[ML] Birdeye also returned no candles for %s", signal.symbol)
-                except Exception as exc:
-                    logger.warning("[ML] Birdeye OHLCV error for %s: %s", signal.symbol, exc)
+                # Storage fallback only — Birdeye 1m is also used as features 7-12,
+                # so no separate fetch is needed; `candles` already has 1m data.
+                if candles:
+                    ml_candles = candles
+                    ml_source  = "birdeye/1m (fallback)"
+                else:
+                    logger.warning("[ML] No candles available for %s", signal.symbol)
 
         # Moralis pair stats — completely optional, never blocks scoring.
         pair_stats = None
@@ -284,27 +294,55 @@ class MultiStrategyEngine:
             except Exception as exc:
                 logger.warning("[ML] Moralis pair stats error for %s: %s", signal.symbol, exc)
 
+        # Birdeye token overview — market cap, absolute liquidity, holder count.
+        # Merged into pair_stats so both are persisted together in pair_stats_json
+        # and flow through to ML features automatically.  Completely optional.
+        if needs_ml_candles:
+            try:
+                token_meta = await self._birdeye.get_token_overview(signal.mint_address)
+                if token_meta:
+                    pair_stats = {**(pair_stats or {}), **token_meta}
+                    logger.debug(
+                        "[TokenOverview] %s | mc=%.0f liq=%.0f holders=%s",
+                        signal.symbol,
+                        token_meta.get("market_cap_usd") or 0,
+                        token_meta.get("liquidity_usd") or 0,
+                        token_meta.get("holder_count"),
+                    )
+            except Exception as exc:
+                logger.warning("[TokenOverview] error for %s: %s", signal.symbol, exc)
+
         # ML confidence score — one score per unique training strategy.
         # Chart variants train on their base strategy's unfiltered outcomes.
         #
-        # Candle source is per-strategy:
-        #   ml_prefer_moralis=True  (quick_pop) → Moralis 10s when available, else Birdeye 1m.
-        #                                          10s resolution captures pump shape for fast scalps.
-        #   ml_prefer_moralis=False (trend/moonbag) → always Birdeye 1m.
-        #                                             Longer horizon; 10s adds noise, not signal.
+        # Dual-resolution scoring:
+        #   ml_prefer_moralis=True  (quick_pop) → candles_10s=moralis_candles (may be []),
+        #                                          candles_1m=candles (Birdeye 1m, always).
+        #   ml_prefer_moralis=False (trend/moonbag) → candles_10s=[], candles_1m=candles.
         ml_scores: dict[str, float | None] = {}
-        if self._ml_scorers and ml_candles:
-            for training_strategy, scorer in self._ml_scorers.items():
-                use_moralis = training_strategy in self._ml_prefer_moralis
-                score_candles = ml_candles if use_moralis else (candles or ml_candles)
-                score = scorer.score(score_candles, chart_ctx=chart_ctx, pair_stats=pair_stats, source_channel=signal.source_channel)
-                ml_scores[training_strategy] = score
+        if self._ml_scorers and (moralis_candles or candles):
+            for scorer_key, scorer in self._ml_scorers.items():
+                use_moralis = scorer_key in self._ml_prefer_moralis
+                score_10s   = moralis_candles if use_moralis else []
+                score_1m    = candles or None
+                score = scorer.score(
+                    score_10s,
+                    candles_1m=score_1m,
+                    chart_ctx=chart_ctx,
+                    pair_stats=pair_stats,
+                    source_channel=signal.source_channel,
+                )
+                ml_scores[scorer_key] = score
                 if score is not None:
-                    knn_src = ml_source if use_moralis else "birdeye/1m"
+                    knn_src = (
+                        f"dual(moralis/{MORALIS_OHLCV_INTERVAL}+birdeye/1m)"
+                        if use_moralis else "birdeye/1m"
+                    )
+                    training_name = scorer_key.split("::")[0]
                     logger.info(
                         "[ML] %s | confidence=%.1f/10 | knn_src=%s | pair_stats=%s | training=%s",
                         signal.symbol, score, knn_src, "yes" if pair_stats else "no",
-                        training_strategy,
+                        training_name,
                     )
 
         # Save signal_chart once (shared across all runners that save chart data).
@@ -326,9 +364,10 @@ class MultiStrategyEngine:
             )
 
         for runner in self._runners:
-            # Resolve this runner's ML score from its designated training strategy.
+            # Resolve this runner's ML score from its designated training strategy + label.
             training_strategy = runner.cfg.ml_training_strategy or runner.cfg.name
-            ml_score = ml_scores.get(training_strategy)
+            scorer_key = f"{training_strategy}::{runner.cfg.ml_training_label}"
+            ml_score = ml_scores.get(scorer_key)
 
             # ML filter — skip if score is below threshold.
             # If score is None (not enough training data yet), always allow through.
@@ -749,11 +788,12 @@ class MultiStrategyEngine:
                 pass
 
         training_strategy = runner.cfg.ml_training_strategy or runner.cfg.name
+        scorer_key = f"{training_strategy}::{runner.cfg.ml_training_label}"
         ml_score = None
-        if training_strategy in self._ml_scorers and ml_candles:
-            use_moralis = training_strategy in self._ml_prefer_moralis
+        if scorer_key in self._ml_scorers and ml_candles:
+            use_moralis = scorer_key in self._ml_prefer_moralis
             score_candles = ml_candles if use_moralis else (candles or ml_candles)
-            ml_score = self._ml_scorers[training_strategy].score(
+            ml_score = self._ml_scorers[scorer_key].score(
                 score_candles, chart_ctx=chart_ctx, pair_stats=pair_stats,
                 source_channel=signal.source_channel,
             )

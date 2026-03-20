@@ -258,7 +258,7 @@ async def test_live_scoring(mint: str) -> None:
         print(SEP)
 
         db = TradeDatabase(path=DB_PATH)
-        scorer = ChartMLScorer(db, strategy="quick_pop")
+        scorer = ChartMLScorer(db, strategy="quick_pop", training_label="position_peak_pnl_pct")
         score = scorer.score(active_candles, chart_ctx=None, pair_stats=None)
         db.close()
 

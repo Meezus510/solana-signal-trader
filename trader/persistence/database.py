@@ -183,7 +183,13 @@ CREATE TABLE IF NOT EXISTS strategy_outcomes (
     outcome_pnl_usd      REAL,
     outcome_sell_reason  TEXT,
     outcome_hold_secs    REAL,
-    outcome_max_gain_pct REAL,
+    outcome_max_gain_pct   REAL,
+    position_peak_price    REAL,
+    position_peak_ts       TEXT,
+    position_peak_pnl_pct  REAL,
+    position_trough_price  REAL,
+    position_trough_ts     TEXT,
+    position_trough_pnl_pct REAL,
     closed               INTEGER NOT NULL DEFAULT 0,
     is_live              INTEGER NOT NULL DEFAULT 0,
     source_channel       TEXT NOT NULL DEFAULT '',
@@ -284,7 +290,13 @@ class TradeDatabase:
             ("source_channel",  "TEXT NOT NULL DEFAULT ''"),
             ("ml_score",        "REAL"),
             ("is_ai_override",  "INTEGER NOT NULL DEFAULT 0"),
-            ("skip_reason",     "TEXT"),
+            ("skip_reason",           "TEXT"),
+            ("position_peak_price",   "REAL"),
+            ("position_peak_ts",      "TEXT"),
+            ("position_peak_pnl_pct", "REAL"),
+            ("position_trough_price",   "REAL"),
+            ("position_trough_ts",      "TEXT"),
+            ("position_trough_pnl_pct", "REAL"),
         ]:
             try:
                 c.execute(f"ALTER TABLE strategy_outcomes ADD COLUMN {col} {definition}")
@@ -491,6 +503,26 @@ class TradeDatabase:
         logger.info("[DB] Restored %d open position(s) for strategy '%s'", len(positions), strategy_name)
         return positions
 
+    def load_closed_positions(self, strategy_name: str = "default") -> list[Position]:
+        """Restore all CLOSED positions for a given strategy (for summary reporting)."""
+        rows = self._conn.execute(
+            """
+            SELECT strategy, mint, symbol, status,
+                   entry_price, initial_quantity, remaining_quantity, usd_size,
+                   highest_price, take_profit_price, stop_loss_price,
+                   trailing_active, trailing_stop_pct, trailing_stop_price,
+                   realized_pnl_usd, total_proceeds_usd, total_fees_usd,
+                   partial_take_profit_hit, tp2_hit, tp3_hit, tp4_hit,
+                   sell_reason, last_price, opened_at, closed_at,
+                   COALESCE(source_channel, '')
+            FROM positions WHERE status = 'CLOSED' AND strategy = ?
+            """,
+            (strategy_name,),
+        ).fetchall()
+        positions = [self._row_to_position(r) for r in rows]
+        logger.info("[DB] Restored %d closed position(s) for strategy '%s'", len(positions), strategy_name)
+        return positions
+
     @staticmethod
     def _row_to_position(row: tuple) -> Position:
         (
@@ -513,7 +545,9 @@ class TradeDatabase:
             remaining_quantity=remaining_quantity,
             usd_size=usd_size,
             highest_price=highest_price,
+            highest_price_ts=None,     # not persisted — reset on restore
             lowest_price=entry_price,  # not persisted — reset to entry on restore
+            lowest_price_ts=None,      # not persisted — reset on restore
             take_profit_price=take_profit_price,
             stop_loss_price=stop_loss_price,
             trailing_active=bool(trailing_active),
@@ -864,22 +898,64 @@ class TradeDatabase:
             "shadow_rejects":   _stats(shad_reject_pnls),
         }
 
-    def load_chart_snapshots(self, strategy: str) -> list[dict]:
+    _VALID_TRAINING_LABELS = frozenset({
+        "outcome_pnl_pct",
+        "position_peak_pnl_pct",
+        "signal_chart_peak_pnl_pct",
+    })
+
+    def load_chart_snapshots(
+        self, strategy: str, label_column: str = "outcome_pnl_pct"
+    ) -> list[dict]:
         """
-        Return all closed outcomes for a strategy as a list of dicts.
-        JOINs signal_charts + strategy_outcomes; returns the same dict shape as
-        the legacy chart_snapshots query for backward compatibility with ChartMLScorer.
+        Return training rows for a strategy as a list of dicts.
+        JOINs signal_charts + strategy_outcomes.
+
+        label_column controls the KNN training label:
+          "outcome_pnl_pct"          — final exit PnL% (default).
+                                        Requires so.closed=1.
+          "position_peak_pnl_pct"    — highest price % reached before sell
+                                        (bounded by hold window).
+                                        Falls back to outcome_pnl_pct for rows
+                                        that predate peak tracking.
+                                        Requires so.closed=1.
+          "signal_chart_peak_pnl_pct" — historical max from price_history.py --loop
+                                        (signal_charts.peak_pnl_pct). Not bounded
+                                        by sell time. Only rows where tracking is
+                                        fully complete (price_tracking_done=1) are
+                                        used — partial windows would understate the
+                                        true peak. Used by moonbag.
         """
+        if label_column not in self._VALID_TRAINING_LABELS:
+            raise ValueError(f"Invalid label_column: {label_column!r}")
+
+        if label_column == "position_peak_pnl_pct":
+            label_expr  = "COALESCE(so.position_peak_pnl_pct, so.outcome_pnl_pct)"
+            where_extra = "AND so.closed = 1 AND so.outcome_pnl_pct IS NOT NULL"
+        elif label_column == "signal_chart_peak_pnl_pct":
+            # Long-term historical peak captured by price_history.py --loop.
+            # Only rows where the full tracking window has completed are used —
+            # partial windows would understate the true peak and corrupt the label.
+            label_expr  = "sc.peak_pnl_pct"
+            where_extra = (
+                "AND so.entered = 1 "
+                "AND sc.price_tracking_done = 1 "
+                "AND sc.peak_pnl_pct IS NOT NULL"
+            )
+        else:
+            label_expr  = "so.outcome_pnl_pct"
+            where_extra = "AND so.closed = 1 AND so.outcome_pnl_pct IS NOT NULL"
+
         rows = self._conn.execute(
-            """
-            SELECT sc.ts, sc.candles_json, so.outcome_pnl_pct,
+            f"""
+            SELECT sc.ts, sc.candles_json, {label_expr},
                    sc.pump_ratio, sc.vol_trend, sc.pair_stats_json,
-                   COALESCE(so.source_channel, sc.source_channel, '')
+                   COALESCE(so.source_channel, sc.source_channel, ''),
+                   sc.candles_1m_json
               FROM strategy_outcomes so
               JOIN signal_charts sc ON so.signal_chart_id = sc.id
              WHERE so.strategy = ?
-               AND so.closed = 1
-               AND so.outcome_pnl_pct IS NOT NULL
+               {where_extra}
              ORDER BY sc.ts ASC
             """,
             (strategy,),
@@ -893,6 +969,7 @@ class TradeDatabase:
                 "vol_trend":       r[4],
                 "pair_stats_json": r[5],
                 "source_channel":  r[6],
+                "candles_1m_json": r[7],
             }
             for r in rows
         ]
@@ -905,16 +982,30 @@ class TradeDatabase:
         hold_secs: float,
         max_gain_pct: float,
         pnl_usd: Optional[float] = None,
+        position_peak_price: Optional[float] = None,
+        position_peak_ts: Optional[str] = None,
+        position_peak_pnl_pct: Optional[float] = None,
+        position_trough_price: Optional[float] = None,
+        position_trough_ts: Optional[str] = None,
+        position_trough_pnl_pct: Optional[float] = None,
     ) -> None:
         """Fill in outcome fields on a strategy_outcomes row once the position closes."""
         self._conn.execute(
             """
             UPDATE strategy_outcomes
                SET outcome_pnl_pct=?, outcome_pnl_usd=?, outcome_sell_reason=?,
-                   outcome_hold_secs=?, outcome_max_gain_pct=?, closed=1
+                   outcome_hold_secs=?, outcome_max_gain_pct=?,
+                   position_peak_price=?, position_peak_ts=?, position_peak_pnl_pct=?,
+                   position_trough_price=?, position_trough_ts=?, position_trough_pnl_pct=?,
+                   closed=1
              WHERE id=?
             """,
-            (pnl_pct, pnl_usd, sell_reason, hold_secs, max_gain_pct, outcome_id),
+            (
+                pnl_pct, pnl_usd, sell_reason, hold_secs, max_gain_pct,
+                position_peak_price, position_peak_ts, position_peak_pnl_pct,
+                position_trough_price, position_trough_ts, position_trough_pnl_pct,
+                outcome_id,
+            ),
         )
         self._conn.commit()
 
