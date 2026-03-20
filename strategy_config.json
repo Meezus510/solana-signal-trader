@@ -45,7 +45,7 @@
     "max_hold_minutes": 240.0,
     "use_chart_filter": false,
     "pump_ratio_max": 3.5,
-    "use_reanalyze": true,
+    "use_reanalyze": false,
     "reanalyze_pump_delay": 480.0,
     "reanalyze_vol_delay": 240.0,
     "reanalyze_both_delay": 600.0,
@@ -87,7 +87,8 @@
   },
   "quick_pop_managed": {
     "live_trading": true,
-    "use_ai_override": false,
+    "use_policy_agent": false,
+    "use_ai_override": true,
     "use_ai_override_shadow": true,
     "ml_training_strategy": "quick_pop",
     "ml_training_label": "position_peak_pnl_pct",
