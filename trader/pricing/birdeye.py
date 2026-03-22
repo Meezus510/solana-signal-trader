@@ -336,6 +336,8 @@ class BirdeyePriceClient:
             holder_count          — number of unique holders
             unique_wallet_5m      — distinct wallets that traded in last 5 min
             unique_wallet_hist_5m — distinct wallets that traded 5–10 min ago
+            unique_wallet_30m     — distinct wallets that traded in last 30 min
+            unique_wallet_hist_30m— distinct wallets that traded 30–60 min ago
             price_change_30m_pct  — price % change over last 30 min
             buy_volume_usd_5m     — buy-side USD volume in last 5 min
             sell_volume_usd_5m    — sell-side USD volume in last 5 min
@@ -364,28 +366,31 @@ class BirdeyePriceClient:
                     return None
 
                 data = (await resp.json()).get("data") or {}
-                mc   = data.get("marketCap") or data.get("realMc")
-                liq  = data.get("liquidity")
-                hld  = data.get("holder")
-                uw5  = data.get("uniqueWallet5m")
-                uwh5 = data.get("uniqueWalletHistory5m")
-                pc30 = data.get("priceChange30mPercent")
-                vb5  = data.get("vBuy5mUSD")
-                vs5  = data.get("vSell5mUSD")
-
+                mc    = data.get("marketCap") or data.get("realMc")
+                liq   = data.get("liquidity")
+                hld   = data.get("holder")
+                uw5   = data.get("uniqueWallet5m")
+                uwh5  = data.get("uniqueWalletHistory5m")
+                uw30  = data.get("uniqueWallet30m")
+                uwh30 = data.get("uniqueWalletHistory30m")
+                pc30  = data.get("priceChange30mPercent")
+                vb5   = data.get("vBuy5mUSD")
+                vs5   = data.get("vSell5mUSD")
                 if mc is None and liq is None and hld is None and uw5 is None:
                     logger.debug("[TokenOverview] no usable metadata for %s", mint_address)
                     return None
 
                 return {
-                    "market_cap_usd":        float(mc)   if mc   is not None else None,
-                    "liquidity_usd":         float(liq)  if liq  is not None else None,
-                    "holder_count":          int(hld)    if hld  is not None else None,
-                    "unique_wallet_5m":      int(uw5)    if uw5  is not None else None,
-                    "unique_wallet_hist_5m": int(uwh5)   if uwh5 is not None else None,
-                    "price_change_30m_pct":  float(pc30) if pc30 is not None else None,
-                    "buy_volume_usd_5m":     float(vb5)  if vb5  is not None else None,
-                    "sell_volume_usd_5m":    float(vs5)  if vs5  is not None else None,
+                    "market_cap_usd":         float(mc)    if mc    is not None else None,
+                    "liquidity_usd":          float(liq)   if liq   is not None else None,
+                    "holder_count":           int(hld)     if hld   is not None else None,
+                    "unique_wallet_5m":       int(uw5)     if uw5   is not None else None,
+                    "unique_wallet_hist_5m":  int(uwh5)    if uwh5  is not None else None,
+                    "unique_wallet_30m":      int(uw30)    if uw30  is not None else None,
+                    "unique_wallet_hist_30m": int(uwh30)   if uwh30 is not None else None,
+                    "price_change_30m_pct":   float(pc30)  if pc30  is not None else None,
+                    "buy_volume_usd_5m":      float(vb5)   if vb5   is not None else None,
+                    "sell_volume_usd_5m":     float(vs5)   if vs5   is not None else None,
                 }
 
         except asyncio.TimeoutError:
@@ -394,6 +399,88 @@ class BirdeyePriceClient:
             logger.warning("[TokenOverview] HTTP error for %s: %s", mint_address, exc)
         except Exception as exc:
             logger.error("[TokenOverview] unexpected error for %s: %s", mint_address, exc)
+
+        return None
+
+    async def get_token_security(
+        self,
+        mint_address: str,
+    ) -> Optional[dict]:
+        """
+        Fetch token security data from Birdeye's security endpoint.
+
+        Returns a flat dict merged into pair_stats for persistence and future ML use.
+        All fields are prefixed with 'security_' except top10_concentration which
+        is already an active ML feature (idx 26).
+
+        Fields returned:
+            top10_concentration       — fraction [0–1] of supply held by top 10 wallets (ML feature)
+            security_freezeable       — True if freeze authority exists (rug vector)
+            security_transfer_fee     — True if transfer tax is enabled (honeypot signal)
+            security_owner_pct        — fraction of supply held by current owner (None if renounced)
+            security_creator_pct      — fraction of supply still held by creator
+            security_mutable_metadata — True if token metadata can still be changed
+            security_jup_strict       — True if token is on Jupiter's strict verified list
+            security_is_token2022     — True if Token-2022 standard (supports hidden fees)
+            security_non_transferable — True if tokens cannot be transferred (honeypot)
+            security_pre_market_holders — number of wallets that held tokens pre-launch
+            security_token_age_hours  — age of token in hours at signal time
+
+        Returns None on any error so callers fall back gracefully.
+
+        Endpoint: GET /defi/token_security?address=<mint>
+        """
+        url = f"{self._cfg.birdeye_base_url}/defi/token_security"
+        params = {"address": mint_address}
+        try:
+            async with self._session.get(
+                url,
+                headers=self._headers(),
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=self._cfg.request_timeout_seconds),
+            ) as resp:
+                if resp.status == 401:
+                    logger.warning("[TokenSecurity] 401 Unauthorized for %s — skipping", mint_address)
+                    return None
+                if resp.status == 429:
+                    logger.warning("[TokenSecurity] 429 rate limit for %s — skipping", mint_address)
+                    return None
+                if resp.status != 200:
+                    logger.warning("[TokenSecurity] HTTP %d for %s — skipping", resp.status, mint_address)
+                    return None
+
+                data = (await resp.json()).get("data") or {}
+
+                top10 = data.get("top10HolderPercent")
+                owner_pct = data.get("ownerPercentage")
+                creator_pct = data.get("creatorPercentage")
+                creation_time = data.get("creationTime")
+                pre_market = data.get("preMarketHolder") or []
+
+                age_hours: Optional[float] = None
+                if creation_time:
+                    age_hours = (time.time() - float(creation_time)) / 3600.0
+
+                return {
+                    "top10_concentration":          max(0.0, min(1.0, float(top10))) if top10 is not None else None,
+                    "security_freezeable":          bool(data.get("freezeable"))      if data.get("freezeable") is not None else None,
+                    "security_transfer_fee":        bool(data.get("transferFeeEnable")) if data.get("transferFeeEnable") is not None else None,
+                    "security_owner_pct":           float(owner_pct)                  if owner_pct is not None else None,
+                    "security_creator_pct":         float(creator_pct)               if creator_pct is not None else None,
+                    "security_mutable_metadata":    bool(data.get("mutableMetadata")) if data.get("mutableMetadata") is not None else None,
+                    "security_jup_strict":          bool(data.get("jupStrictList"))   if data.get("jupStrictList") is not None else None,
+                    "security_is_token2022":        bool(data.get("isToken2022"))     if data.get("isToken2022") is not None else None,
+                    "security_non_transferable":    bool(data.get("nonTransferable")) if data.get("nonTransferable") is not None else None,
+                    "security_pre_market_holders":  len(pre_market),
+                    "security_token_age_hours":     round(age_hours, 1)              if age_hours is not None else None,
+                }
+
+        except asyncio.TimeoutError:
+            logger.warning("[TokenSecurity] timeout for %s", mint_address)
+        except aiohttp.ClientError as exc:
+            logger.warning("[TokenSecurity] HTTP error for %s: %s", mint_address, exc)
+        except Exception as exc:
+            logger.error("[TokenSecurity] unexpected error for %s: %s", mint_address, exc)
 
         return None
 

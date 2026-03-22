@@ -181,46 +181,51 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         ml_halflife_days=_qp_chart.get("ml_halflife_days", 14.0),
         ml_score_low_pct=_qp_chart.get("ml_score_low_pct", -35.0),
         ml_score_high_pct=_qp_chart.get("ml_score_high_pct", 300.0),
-        # Feature weights for quick_pop KNN (21 features total).
-        # Weights derived from Cohen's d separability on 82 closed trades,
+        # Feature weights for quick_pop KNN (25 features total).
+        # Weights derived from Cohen's d separability on 178 closed trades (2 days),
         # using TP1-proxy label (peak_pnl > 49%) which matches the strategy's
         # actual objective of catching tokens that pump past TP1 (1.5×).
         #
         # ZEROED (0×) — confirmed useless or actively harmful:
-        #   idx 0-5  (10s OHLCV)     — despite being live at scoring time, high variance
-        #                               (vol_momentum_10s std=28) adds noise. Phase 4
-        #                               shows no_10s configs consistently outperform uniform.
-        #   idx 7    vol_momentum_1m — d=0.23, LOSERS>WINNERS in both labels: tokens with
+        #   idx 0-5  (10s OHLCV)     — high variance adds noise; Phase 4 no_10s
+        #                               configs consistently outperform uniform.
+        #   idx 7    vol_momentum_1m — LOSERS>WINNERS in both labels: tokens with
         #                               recent vol spike tend to be already pumped out.
-        #   idx 18-20 (token metadata) — 96% fallback=0.5 in historical data; inflated
-        #                               Cohen's d in Phase 1 is a statistical artifact.
-        #                               Will activate automatically once sufficient real
-        #                               market_cap/liquidity data accumulates.
+        #   idx 18-20 (token metadata) — still mostly fallback=0.5; insufficient real
+        #                               market_cap/liquidity data accumulated yet.
+        #   idx 21   unique_wallet_5m_norm — d<0.07 both labels, no signal.
         #
         # LOW (0.5×) — weak or inconsistent signal:
-        #   idx 9    recent_momentum_1m — d≈0.04-0.13, mixed direction.
-        #   idx 10   volatility_1m      — d=0.24 exit but d=0.09 TP1, inconsistent.
-        #   idx 12   buy_ratio_5m       — d≈0.12 both, weak.
+        #   idx 10   volatility_1m      — d=0.14 TP1, inconsistent direction.
+        #   idx 12   buy_ratio_5m       — d=0.07 both, weak.
         #
         # MODERATE (1-2×) — useful signals:
-        #   idx 11   candle_count_1m    — d=0.31 TP1 (fewer candles = newer token = better).
-        #   idx 14   price_change_5m_norm — d=0.17 TP1, d=0.13 exit.
-        #   idx 15   buy_vol_ratio_1h   — d=0.25 TP1.
-        #   idx 16   liquidity_change_1h — d=0.32 TP1: rising liquidity = better outcome.
-        #   idx 17   source_channel     — d=0.17 TP1 (minor channel difference).
+        #   idx 9    recent_momentum_1m  — d=0.28 TP1 (up from 0.04-0.13; now reliable).
+        #   idx 11   candle_count_1m     — d=0.09 TP1 (fewer candles = newer token).
+        #   idx 14   price_change_5m_norm — d=0.25 TP1.
+        #   idx 15   buy_vol_ratio_1h    — d=0.27 TP1.
+        #   idx 16   liquidity_change_1h  — d=0.33 TP1: rising liquidity = better.
+        #   idx 17   source_channel      — d=0.07 TP1 (minor channel difference).
+        #   idx 22   wallet_momentum_5m  — d=0.26 exit, LOSERS>WINNERS: high wallet
+        #                                  momentum = already pumping = loser signal.
+        #   idx 23   price_change_30m_norm — d=0.36 TP1: tokens up 30m ago still going.
+        #   idx 24   buy_vol_ratio_5m    — d=0.34 TP1: strong 5m buy pressure = winner.
         #
         # HIGH (3-5×) — dominant separators:
-        #   idx 6    pump_ratio_1m      — d=0.39 TP1, d=0.26 exit: bigger price pump = wins.
-        #   idx 8    price_slope_1m     — d=0.38 TP1, d=0.26 exit: steeper uptrend = wins.
-        #   idx 13   activity_5m_norm   — d=0.49 TP1: best single predictor; high market
-        #                               activity at signal time reliably predicts TP1 hits.
+        #   idx 6    pump_ratio_1m      — d=0.22 TP1, d=0.22 exit.
+        #   idx 8    price_slope_1m     — d=0.22 TP1, d=0.22 exit: steeper uptrend = wins.
+        #   idx 13   activity_5m_norm   — d=0.51 TP1: best single predictor.
         ml_feature_weights=(
-            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,   # idx  0-5:  10s features — zeroed (noise)
-            3.0, 0.0, 3.0, 0.5, 0.5, 1.0,   # idx  6-11: 1m OHLCV (pump=3, vol_mom=0, slope=3, rec_mom=0.5, vol=0.5, cnt=1)
-            0.5, 5.0, 1.0, 1.5, 2.0, 1.0,   # idx 12-17: pair stats + source_channel
-            0.0, 0.0, 0.0,                   # idx 18-20: token metadata — zeroed (96% fallback)
-            0.0, 0.0, 0.0, 0.0,             # idx 21-24: wallet activity — zeroed until data accumulates
+            2.5, 0.1, 1.5, 0.0, 0.0, 2.5,   # idx  0-5:  10s features
+            0.0, 0.0, 0.0, 1.5, 2.5, 0.0,   # idx  6-11: 1m OHLCV
+            2.0, 9.0, 2.5, 1.5, 4.0, 0.0,   # idx 12-17: pair stats + source_channel
+            0.0, 0.0, 2.5,                   # idx 18-20: token metadata
+            0.0, 0.0, 2.0, 6.0,             # idx 21-24: wallet (5m)
+            1.0, 0.5,                        # idx 25-26: wallet_momentum_30m, top10_holder_pct
         ),
+        # Hard pre-filter: block signals with wallet_momentum_5m >= 2.102.
+        # LOO backtest on 197 trades: blocks 9/134 losers with 0 winner misses.
+        ml_wallet_momentum_max=2.102,
         live_trading=_qp_chart.get("live_trading", False),
     )
 
@@ -255,6 +260,17 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         ml_halflife_days=_tr_chart.get("ml_halflife_days", 14.0),
         ml_score_low_pct=_tr_chart.get("ml_score_low_pct", -35.0),
         ml_score_high_pct=_tr_chart.get("ml_score_high_pct", 85.0),
+        # Feature weights for trend_rider KNN — uniform until optimizer run.
+        # To update: run scripts/optimize_ml_weights.py --strategy trend_rider
+        # and paste the resulting weights here.
+        ml_feature_weights=(
+            2.0, 0.0, 2.0, 0.0, 1.8, 0.0,   # idx  0-5:  10s OHLCV
+            3.2, 0.0, 3.2, 0.0, 2.0, 0.0,   # idx  6-11: 1m OHLCV
+            0.0, 0.0, 0.0, 0.0, 3.2, 2.2,   # idx 12-17: pair stats + source_channel
+            0.0, 2.2, 0.0,                   # idx 18-20: token metadata
+            0.0, 0.1, 0.0, 1.8,             # idx 21-24: wallet (5m)
+            2.0, 1.5,                        # idx 25-26: wallet_momentum_30m, top10_holder_pct
+        ),
         live_trading=_tr_chart.get("live_trading", False),
     )
 
@@ -290,7 +306,7 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         ml_halflife_days=_mb_chart.get("ml_halflife_days", 14.0),
         ml_score_low_pct=_mb_chart.get("ml_score_low_pct", -35.0),
         ml_score_high_pct=_mb_chart.get("ml_score_high_pct", 150.0),
-        # Feature weights for moonbag KNN (21 features total).
+        # Feature weights for moonbag KNN (27 features total).
         # Weights derived from Cohen's d separability analysis on 65 closed trades.
         #
         # ZEROED (0×) — confirmed useless or actively harmful:
@@ -320,11 +336,12 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         #   after z-normalisation), but weights are pre-set so they activate
         #   automatically as new signals with real market cap/liquidity data accumulate.
         ml_feature_weights=(
-            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,   # idx  0-5:  10s features — zeroed
-            0.0, 0.3, 0.0, 2.0, 0.0, 0.0,   # idx  6-11: 1m OHLCV (pump=0, vol_mom=0.3, slope=0, rec_mom=2, vol=0, cnt=0)
-            0.3, 1.0, 1.0, 0.0, 1.0, 8.0,   # idx 12-17: pair stats + source_channel
-            6.0, 4.0, 2.0,                   # idx 18-20: market_cap, liquidity, holder_count
-            0.0, 0.0, 0.0, 0.0,             # idx 21-24: wallet activity — zeroed until data accumulates
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,      # idx  0-5:  10s — locked 0 (candles_10s=[] at inference)
+            7.6, 1.78, 6.9, 5.1, 0.38, 0.28,   # idx  6-11: 1m OHLCV
+            0.0, 0.0, 0.0, 0.0, 0.01, 0.22,    # idx 12-17: pair stats + source_channel
+            0.04, 0.02, 0.0,                    # idx 18-20: token metadata
+            0.0, 0.12, 0.0, 6.9,               # idx 21-24: wallet (5m)
+            1.5, 4.0,                           # idx 25-26: wallet_momentum_30m, top10_holder_pct
         ),
         live_trading=_mb_chart.get("live_trading", False),
     )

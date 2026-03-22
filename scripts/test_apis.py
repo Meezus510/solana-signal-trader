@@ -93,6 +93,38 @@ async def main() -> None:
             else:
                 print("  FAIL — no candles returned")
 
+        print()
+
+        # ------------------------------------------------------------------
+        # 4. Birdeye — token overview (incl. new 30m wallet fields)
+        # ------------------------------------------------------------------
+        print(SEP)
+        print("  BIRDEYE  token_overview  (incl. 30m wallet + supply)")
+        print(SEP)
+        overview = await birdeye.get_token_overview(TEST_MINT)
+        if overview:
+            print(f"  OK — fields returned:")
+            for k, v in overview.items():
+                print(f"    {k:<28} {v}")
+        else:
+            print("  FAIL — no overview returned")
+
+        print()
+
+        # ------------------------------------------------------------------
+        # 5. Birdeye — token security
+        # ------------------------------------------------------------------
+        print(SEP)
+        print("  BIRDEYE  token_security")
+        print(SEP)
+        security = await birdeye.get_token_security(TEST_MINT)
+        if security:
+            print("  OK — fields returned:")
+            for k, v in security.items():
+                print(f"    {k:<35} {v}")
+        else:
+            print("  FAIL — no security data returned")
+
         print(SEP)
 
 

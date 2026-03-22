@@ -72,22 +72,22 @@ class MockDB:
 # ---------------------------------------------------------------------------
 
 class TestExtractFeatures:
-    def test_returns_21_features_with_both_sources(self):
+    def test_returns_27_features_with_both_sources(self):
         feat = extract_features(_make_candles(10), candles_1m=_make_candles(8))
         assert feat is not None
-        assert len(feat) == 21
+        assert len(feat) == 27
 
-    def test_returns_21_features_with_10s_only(self):
-        # candles_1m absent → features 7-12 are neutral but vector is still 21
+    def test_returns_27_features_with_10s_only(self):
+        # candles_1m absent → features 7-12 are neutral but vector is still 27
         feat = extract_features(_make_candles(10))
         assert feat is not None
-        assert len(feat) == 21
+        assert len(feat) == 27
 
-    def test_returns_21_features_with_1m_only(self):
-        # candles_10s too short → features 1-6 are neutral but vector is still 21
+    def test_returns_27_features_with_1m_only(self):
+        # candles_10s too short → features 1-6 are neutral but vector is still 27
         feat = extract_features([], candles_1m=_make_candles(10))
         assert feat is not None
-        assert len(feat) == 21
+        assert len(feat) == 27
 
     def test_returns_none_when_both_sources_too_short(self):
         assert extract_features(_make_candles(2)) is None
@@ -159,6 +159,59 @@ class TestExtractFeatures:
         feat10 = extract_features([], candles_1m=_make_candles(10))
         feat20 = extract_features([], candles_1m=_make_candles(20))
         assert feat20[11] > feat10[11]  # candle_count_1m
+
+    # ------------------------------------------------------------------
+    # Features 25-26: wallet_momentum_30m, top10_holder_pct
+    # ------------------------------------------------------------------
+
+    def test_wallet_momentum_30m_fallback_when_absent(self):
+        # No pair_stats → neutral fallback 1.0
+        feat = extract_features(_make_candles(10))
+        assert feat[25] == pytest.approx(1.0)
+
+    def test_top10_holder_pct_fallback_when_absent(self):
+        # No pair_stats → neutral fallback 0.5
+        feat = extract_features(_make_candles(10))
+        assert feat[26] == pytest.approx(0.5)
+
+    def test_wallet_momentum_30m_growing(self):
+        # uw30=100 > uwh30=50 → ratio 2.0
+        ps = {"unique_wallet_30m": 100, "unique_wallet_hist_30m": 50}
+        feat = extract_features(_make_candles(10), pair_stats=ps)
+        assert feat[25] == pytest.approx(2.0)
+
+    def test_wallet_momentum_30m_shrinking(self):
+        # uw30=20, uwh30=100 → ratio 0.2
+        ps = {"unique_wallet_30m": 20, "unique_wallet_hist_30m": 100}
+        feat = extract_features(_make_candles(10), pair_stats=ps)
+        assert feat[25] == pytest.approx(0.2)
+
+    def test_wallet_momentum_30m_capped_at_five(self):
+        # ratio > 5 → capped at 5.0
+        ps = {"unique_wallet_30m": 600, "unique_wallet_hist_30m": 1}
+        feat = extract_features(_make_candles(10), pair_stats=ps)
+        assert feat[25] == pytest.approx(5.0)
+
+    def test_wallet_momentum_30m_zero_history_no_div_error(self):
+        # uwh30=0 → denominator clamped to 1
+        ps = {"unique_wallet_30m": 50, "unique_wallet_hist_30m": 0}
+        feat = extract_features(_make_candles(10), pair_stats=ps)
+        assert feat[25] == pytest.approx(min(50.0, 5.0))
+
+    def test_top10_holder_pct_exact(self):
+        ps = {"top10_concentration": 0.65}
+        feat = extract_features(_make_candles(10), pair_stats=ps)
+        assert feat[26] == pytest.approx(0.65)
+
+    def test_top10_holder_pct_clamped_above_one(self):
+        ps = {"top10_concentration": 1.5}
+        feat = extract_features(_make_candles(10), pair_stats=ps)
+        assert feat[26] == pytest.approx(1.0)
+
+    def test_top10_holder_pct_clamped_below_zero(self):
+        ps = {"top10_concentration": -0.1}
+        feat = extract_features(_make_candles(10), pair_stats=ps)
+        assert feat[26] == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------

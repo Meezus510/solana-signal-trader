@@ -294,7 +294,8 @@ class MultiStrategyEngine:
             except Exception as exc:
                 logger.warning("[ML] Moralis pair stats error for %s: %s", signal.symbol, exc)
 
-        # Birdeye token overview — market cap, absolute liquidity, holder count.
+        # Birdeye token overview — market cap, absolute liquidity, holder count,
+        # wallet activity (5m and 30m), and total supply for concentration calc.
         # Merged into pair_stats so both are persisted together in pair_stats_json
         # and flow through to ML features automatically.  Completely optional.
         if needs_ml_candles:
@@ -303,14 +304,35 @@ class MultiStrategyEngine:
                 if token_meta:
                     pair_stats = {**(pair_stats or {}), **token_meta}
                     logger.debug(
-                        "[TokenOverview] %s | mc=%.0f liq=%.0f holders=%s",
+                        "[TokenOverview] %s | mc=%.0f liq=%.0f holders=%s uw30=%s",
                         signal.symbol,
                         token_meta.get("market_cap_usd") or 0,
                         token_meta.get("liquidity_usd") or 0,
                         token_meta.get("holder_count"),
+                        token_meta.get("unique_wallet_30m"),
                     )
             except Exception as exc:
                 logger.warning("[TokenOverview] error for %s: %s", signal.symbol, exc)
+
+        # Token security — holder concentration, rug/honeypot signals, token age.
+        # Stored in pair_stats for persistence; not yet wired into ML or policy.
+        if needs_ml_candles and self._ml_scorers:
+            try:
+                security = await self._birdeye.get_token_security(signal.mint_address)
+                if security:
+                    pair_stats = {**(pair_stats or {}), **security}
+                    logger.debug(
+                        "[TokenSecurity] %s | top10=%.2f freeze=%s fee=%s owner_pct=%s age_h=%s jup=%s",
+                        signal.symbol,
+                        security.get("top10_concentration") or 0,
+                        security.get("security_freezeable"),
+                        security.get("security_transfer_fee"),
+                        security.get("security_owner_pct"),
+                        security.get("security_token_age_hours"),
+                        security.get("security_jup_strict"),
+                    )
+            except Exception as exc:
+                logger.warning("[TokenSecurity] error for %s: %s", signal.symbol, exc)
 
         # ML confidence score — one score per unique training strategy.
         # Chart variants train on their base strategy's unfiltered outcomes.
@@ -369,14 +391,37 @@ class MultiStrategyEngine:
             scorer_key = f"{training_strategy}::{runner.cfg.ml_training_label}"
             ml_score = ml_scores.get(scorer_key)
 
+            # Hard pre-filter: wallet momentum (unique_wallet_5m / hist) above threshold
+            # indicates the token is already being chased — LOO shows 0 winner misses.
+            wallet_momentum_blocked = False
+            if runner.cfg.use_ml_filter and runner.cfg.ml_wallet_momentum_max is not None and pair_stats:
+                uw5  = pair_stats.get("unique_wallet_5m")
+                uwh5 = pair_stats.get("unique_wallet_hist_5m")
+                if uw5 is not None and uwh5 is not None:
+                    wallet_momentum = min(uw5 / max(uwh5, 1), 5.0)
+                    if wallet_momentum >= runner.cfg.ml_wallet_momentum_max:
+                        wallet_momentum_blocked = True
+                        logger.info(
+                            "[ML_SKIP] [%-12s] %s | wallet_momentum=%.2f >= max=%.2f (pre-filter)",
+                            runner.name, signal.symbol, wallet_momentum,
+                            runner.cfg.ml_wallet_momentum_max,
+                        )
+                        signal_log.info(
+                            "ML_SKIP    | %-10s | %-44s | wallet_momentum=%.2f | strategy=%s",
+                            signal.symbol, signal.mint_address, wallet_momentum, runner.name,
+                        )
+
             # ML filter — skip if score is below threshold.
             # If score is None (not enough training data yet), always allow through.
             ml_blocked = (
-                runner.cfg.use_ml_filter
-                and ml_score is not None
-                and ml_score < runner.cfg.ml_min_score
+                wallet_momentum_blocked
+                or (
+                    runner.cfg.use_ml_filter
+                    and ml_score is not None
+                    and ml_score < runner.cfg.ml_min_score
+                )
             )
-            if ml_blocked:
+            if ml_blocked and not wallet_momentum_blocked:
                 logger.info(
                     "[ML_SKIP] [%-12s] %s | score=%.1f < threshold=%.1f | training=%s",
                     runner.name, signal.symbol, ml_score, runner.cfg.ml_min_score,
@@ -1035,29 +1080,59 @@ class MultiStrategyEngine:
 
         # Global aggregate (only printed when more than one strategy is running)
         if len(summaries) > 1:
-            total_start   = sum(s["starting_cash"]  for s in summaries)
-            total_cash    = sum(s["available_cash"]  for s in summaries)
-            total_mv      = sum(s["market_value"]    for s in summaries)
-            total_equity  = sum(s["equity"]          for s in summaries)
-            total_realized   = sum(s["realized_pnl"]   for s in summaries)
-            total_unrealized = sum(s["unrealized_pnl"]  for s in summaries)
-            total_net     = total_equity - total_start
-            total_net_pct = (total_net / total_start * 100) if total_start else 0.0
-            total_open    = sum(s["open_count"]   for s in summaries)
-            total_closed  = sum(s["closed_count"] for s in summaries)
+            def _is_managed(name: str) -> bool:
+                return "_managed" in name or "_chart" in name
 
-            logger.info(sep)
-            logger.info("[SUMMARY]  GLOBAL  (%d strategies)", len(self._runners))
-            logger.info(sep)
-            logger.info("  Total starting capital : $%.2f", total_start)
-            logger.info("  Total cash             : $%.2f", total_cash)
-            logger.info("  Total open value       : $%.4f", total_mv)
-            logger.info("  Total equity           : $%.4f", total_equity)
-            logger.info("  " + "-" * 52)
-            logger.info("  Total open positions   : %d", total_open)
-            logger.info("  Total closed positions : %d", total_closed)
-            logger.info("  " + "-" * 52)
-            logger.info("  Total realized PnL     : $%+.4f", total_realized)
-            logger.info("  Total unrealized PnL   : $%+.4f", total_unrealized)
-            logger.info("  Total net PnL          : $%+.4f  (%+.2f%%)", total_net, total_net_pct)
-            logger.info(sep)
+            managed = [s for s in summaries if _is_managed(s["name"])]
+            base    = [s for s in summaries if not _is_managed(s["name"])]
+
+            # ── Managed / variant strategies ──────────────────────────────
+            if managed:
+                m_start      = sum(s["starting_cash"]  for s in managed)
+                m_cash       = sum(s["available_cash"]  for s in managed)
+                m_mv         = sum(s["market_value"]    for s in managed)
+                m_equity     = sum(s["equity"]          for s in managed)
+                m_realized   = sum(s["realized_pnl"]   for s in managed)
+                m_unrealized = sum(s["unrealized_pnl"]  for s in managed)
+                m_net        = m_equity - m_start
+                m_net_pct    = (m_net / m_start * 100) if m_start else 0.0
+                m_open       = sum(s["open_count"]   for s in managed)
+                m_closed     = sum(s["closed_count"] for s in managed)
+
+                logger.info(sep)
+                logger.info("[SUMMARY]  MANAGED / VARIANTS  (%d strategies)", len(managed))
+                logger.info(sep)
+                logger.info("  Total starting capital : $%.2f", m_start)
+                logger.info("  Total cash             : $%.2f", m_cash)
+                logger.info("  Total open value       : $%.4f", m_mv)
+                logger.info("  Total equity           : $%.4f", m_equity)
+                logger.info("  " + "-" * 52)
+                logger.info("  Total open positions   : %d", m_open)
+                logger.info("  Total closed positions : %d", m_closed)
+                logger.info("  " + "-" * 52)
+                logger.info("  Total realized PnL     : $%+.4f", m_realized)
+                logger.info("  Total unrealized PnL   : $%+.4f", m_unrealized)
+                logger.info("  Total net PnL          : $%+.4f  (%+.2f%%)", m_net, m_net_pct)
+                logger.info(sep)
+
+            # ── Base strategies (PnL only — no capital tracking) ──────────
+            if base:
+                b_realized   = sum(s["realized_pnl"]   for s in base)
+                b_unrealized = sum(s["unrealized_pnl"]  for s in base)
+                b_start      = sum(s["starting_cash"]  for s in base)
+                b_equity     = sum(s["equity"]          for s in base)
+                b_net        = b_equity - b_start
+                b_net_pct    = (b_net / b_start * 100) if b_start else 0.0
+                b_open       = sum(s["open_count"]   for s in base)
+                b_closed     = sum(s["closed_count"] for s in base)
+
+                logger.info(sep)
+                logger.info("[SUMMARY]  BASE STRATEGIES  (%d strategies)", len(base))
+                logger.info(sep)
+                logger.info("  Total open positions   : %d", b_open)
+                logger.info("  Total closed positions : %d", b_closed)
+                logger.info("  " + "-" * 52)
+                logger.info("  Total realized PnL     : $%+.4f", b_realized)
+                logger.info("  Total unrealized PnL   : $%+.4f", b_unrealized)
+                logger.info("  Total net PnL          : $%+.4f  (%+.2f%%)", b_net, b_net_pct)
+                logger.info(sep)

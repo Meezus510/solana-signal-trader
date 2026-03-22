@@ -90,6 +90,14 @@ Wallet activity features (from Birdeye token overview — fallback 0.0/1.0/0.5 w
 25. buy_vol_ratio_5m      — buy_volume_usd_5m / (buy + sell volume usd 5m) [fallback 0.5]
                             5-minute buy pressure in USD. Complements buy_vol_ratio_1h
                             (idx 16) with a shorter, more immediate timeframe.
+26. wallet_momentum_30m   — min(unique_wallet_30m / max(unique_wallet_hist_30m, 1), 5.0) [fallback 1.0]
+                            30-minute wallet momentum ratio. Distinguishes sustained interest
+                            from a brief spike — more relevant for moonbag/trend_rider holds.
+                            >1 = wallet count grew over the last 30m window.
+27. top10_holder_pct      — fraction of supply held by top 10 wallets, clamped [0, 1] [fallback 0.5]
+                            High concentration (→1.0) = insider/team dump risk.
+                            Low concentration (→0.0) = organically distributed supply.
+                            Most predictive for moonbag (multi-hour hold, needs exit liquidity).
 """
 
 from __future__ import annotations
@@ -255,11 +263,14 @@ def extract_features(
     # Features 22-25: Wallet activity (from Birdeye token overview)
     # All fall back to neutral when unavailable.
     # ------------------------------------------------------------------
-    uw5  = ps.get("unique_wallet_5m")
-    uwh5 = ps.get("unique_wallet_hist_5m")
-    pc30 = ps.get("price_change_30m_pct")
-    vb5  = ps.get("buy_volume_usd_5m")
-    vs5  = ps.get("sell_volume_usd_5m")
+    uw5   = ps.get("unique_wallet_5m")
+    uwh5  = ps.get("unique_wallet_hist_5m")
+    uw30  = ps.get("unique_wallet_30m")
+    uwh30 = ps.get("unique_wallet_hist_30m")
+    pc30  = ps.get("price_change_30m_pct")
+    vb5   = ps.get("buy_volume_usd_5m")
+    vs5   = ps.get("sell_volume_usd_5m")
+    top10 = ps.get("top10_concentration")
 
     f_unique_wallet_5m   = min((uw5 or 0) / 50.0, 3.0) if uw5 is not None else 0.0
     f_wallet_momentum    = min((uw5 or 0) / max(uwh5 or 0, 1), 5.0) if uw5 is not None else 1.0
@@ -267,6 +278,9 @@ def extract_features(
     f_buy_vol_ratio_5m   = (vb5 / ((vb5 or 0.0) + (vs5 or 0.0) + 1e-9)
                             if (vb5 is not None and vs5 is not None and (vb5 + vs5) > 0)
                             else 0.5)
+    f_wallet_momentum_30m = (min((uw30 or 0) / max(uwh30 or 0, 1), 5.0)
+                             if uw30 is not None else 1.0)
+    f_top10_holder_pct    = max(0.0, min(1.0, top10)) if top10 is not None else 0.5
 
     return (
         feats_10s
@@ -277,6 +291,7 @@ def extract_features(
             f_channel,
             f_market_cap_norm, f_liquidity_norm, f_holder_norm,
             f_unique_wallet_5m, f_wallet_momentum, f_price_change_30m, f_buy_vol_ratio_5m,
+            f_wallet_momentum_30m, f_top10_holder_pct,
         ]
     )
 
