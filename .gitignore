@@ -37,3 +37,12 @@ Thumbs.db
 .coverage
 htmlcov/
 scripts/candle_cache.json
+
+# Claude Code memory
+.claude/
+
+# Generated reports
+reports/
+
+# Database backups
+*.db.bak*
