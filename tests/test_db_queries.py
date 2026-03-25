@@ -17,6 +17,7 @@ Run with: pytest tests/test_db_queries.py -v
 
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from trader.agents.base import (
     query_score_buckets,
     query_skipped_stats,
 )
+from trader.analysis.chart import OHLCVCandle
 from trader.persistence.database import TradeDatabase
 
 
@@ -288,3 +290,95 @@ class TestQuerySkippedStatsMlScore:
         db._conn.commit()
         result = query_skipped_stats(str(tmp_path / "trader.db"), "quick_pop_managed", "quick_pop")
         assert result["sample_outcomes"][0]["ml_score"] is None
+
+
+# ---------------------------------------------------------------------------
+# save_signal_chart — candles_1s_json persistence
+# ---------------------------------------------------------------------------
+
+def _make_candle(unix_time: int, price: float = 1.0) -> OHLCVCandle:
+    return OHLCVCandle(unix_time=unix_time, open=price, high=price*1.1,
+                       low=price*0.9, close=price, volume=100.0)
+
+
+class TestSaveSignalChartCandles1s:
+    def test_candles_1s_saved_and_readable(self, tmp_path):
+        db = TradeDatabase(str(tmp_path / "trader.db"))
+        candles_1s = [_make_candle(1_000_000 + i) for i in range(5)]
+        row_id = db.save_signal_chart(
+            symbol="TEST", mint="mint_test", entry_price=0.001,
+            candles=[_make_candle(999_999)],
+            chart_ctx=None,
+            candles_1s=candles_1s,
+        )
+        raw = db._conn.execute(
+            "SELECT candles_1s_json FROM signal_charts WHERE id=?", (row_id,)
+        ).fetchone()[0]
+        assert raw is not None
+        parsed = json.loads(raw)
+        assert len(parsed) == 5
+        assert parsed[0]["t"] == 1_000_000
+
+    def test_candles_1s_fields_serialised_correctly(self, tmp_path):
+        db = TradeDatabase(str(tmp_path / "trader.db"))
+        c = _make_candle(7777, price=2.5)
+        row_id = db.save_signal_chart(
+            symbol="TEST", mint="mint_test", entry_price=0.001,
+            candles=[_make_candle(7776)], chart_ctx=None, candles_1s=[c],
+        )
+        raw = json.loads(db._conn.execute(
+            "SELECT candles_1s_json FROM signal_charts WHERE id=?", (row_id,)
+        ).fetchone()[0])
+        item = raw[0]
+        assert item["t"] == 7777
+        assert item["o"] == pytest.approx(2.5)
+        assert item["h"] == pytest.approx(2.75)
+        assert item["l"] == pytest.approx(2.25)
+        assert item["c"] == pytest.approx(2.5)
+        assert item["v"] == pytest.approx(100.0)
+
+    def test_candles_1s_null_when_not_provided(self, tmp_path):
+        db = TradeDatabase(str(tmp_path / "trader.db"))
+        row_id = db.save_signal_chart(
+            symbol="TEST", mint="mint_test", entry_price=0.001,
+            candles=[_make_candle(1)], chart_ctx=None,
+        )
+        raw = db._conn.execute(
+            "SELECT candles_1s_json FROM signal_charts WHERE id=?", (row_id,)
+        ).fetchone()[0]
+        assert raw is None
+
+    def test_candles_1s_null_when_empty_list(self, tmp_path):
+        db = TradeDatabase(str(tmp_path / "trader.db"))
+        row_id = db.save_signal_chart(
+            symbol="TEST", mint="mint_test", entry_price=0.001,
+            candles=[_make_candle(1)], chart_ctx=None, candles_1s=[],
+        )
+        raw = db._conn.execute(
+            "SELECT candles_1s_json FROM signal_charts WHERE id=?", (row_id,)
+        ).fetchone()[0]
+        assert raw is None
+
+    def test_candles_1s_column_exists_after_migration(self, tmp_path):
+        """Opening a fresh DB should have candles_1s_json in the schema."""
+        db = TradeDatabase(str(tmp_path / "trader.db"))
+        cols = [r[1] for r in db._conn.execute(
+            "PRAGMA table_info(signal_charts)"
+        ).fetchall()]
+        assert "candles_1s_json" in cols
+
+    def test_existing_rows_have_null_candles_1s(self, tmp_path):
+        """Rows inserted before the migration should read back as NULL."""
+        db = TradeDatabase(str(tmp_path / "trader.db"))
+        # Insert without candles_1s_json (simulates pre-migration row)
+        cursor = db._conn.execute(
+            "INSERT INTO signal_charts (ts, symbol, mint, entry_price, candles_json)"
+            " VALUES (?, ?, ?, ?, ?)",
+            ("2025-01-01T00:00:00", "OLD", "mint_old", 0.001, "[]"),
+        )
+        db._conn.commit()
+        raw = db._conn.execute(
+            "SELECT candles_1s_json FROM signal_charts WHERE id=?",
+            (cursor.lastrowid,)
+        ).fetchone()[0]
+        assert raw is None

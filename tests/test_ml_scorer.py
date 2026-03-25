@@ -77,14 +77,14 @@ class TestExtractFeatures:
         assert feat is not None
         assert len(feat) == 27
 
-    def test_returns_27_features_with_10s_only(self):
+    def test_returns_27_features_with_15s_only(self):
         # candles_1m absent → features 7-12 are neutral but vector is still 27
         feat = extract_features(_make_candles(10))
         assert feat is not None
         assert len(feat) == 27
 
     def test_returns_27_features_with_1m_only(self):
-        # candles_10s too short → features 1-6 are neutral but vector is still 27
+        # candles_15s too short → features 1-6 are neutral but vector is still 27
         feat = extract_features([], candles_1m=_make_candles(10))
         assert feat is not None
         assert len(feat) == 27
@@ -94,9 +94,9 @@ class TestExtractFeatures:
         assert extract_features([]) is None
         assert extract_features(_make_candles(2), candles_1m=_make_candles(2)) is None
 
-    def test_pump_ratio_10s_flat_price_is_one(self):
+    def test_pump_ratio_15s_flat_price_is_one(self):
         feat = extract_features(_make_candles(10, price=2.0))
-        # features 1-6 from 10s candles; pump_ratio = feat[0]
+        # features 1-6 from 15s candles; pump_ratio = feat[0]
         assert feat[0] >= 1.0
 
     def test_pump_ratio_1m_flat_price_is_one(self):
@@ -104,8 +104,8 @@ class TestExtractFeatures:
         # features 7-12 from 1m candles; pump_ratio_1m = feat[6]
         assert feat[6] >= 1.0
 
-    def test_10s_neutral_when_short(self):
-        # candles_10s has <3 → features 1-6 should be neutral [1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    def test_15s_neutral_when_short(self):
+        # candles_15s has <3 → features 1-6 should be neutral [1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
         feat = extract_features([], candles_1m=_make_candles(10))
         assert feat[0] == pytest.approx(1.0)   # neutral pump_ratio
         assert feat[1] == pytest.approx(1.0)   # neutral vol_momentum
@@ -139,7 +139,7 @@ class TestExtractFeatures:
             for i in range(10)
         ]
         feat = extract_features(candles)
-        assert feat[2] > 0   # price_slope_10s
+        assert feat[2] > 0   # price_slope_15s
 
     def test_price_slope_positive_for_rising_1m_candles(self):
         candles = [
@@ -150,10 +150,10 @@ class TestExtractFeatures:
         feat = extract_features([], candles_1m=candles)
         assert feat[8] > 0   # price_slope_1m
 
-    def test_candle_count_norm_10s_scales_with_n(self):
+    def test_candle_count_norm_15s_scales_with_n(self):
         feat10 = extract_features(_make_candles(10))
         feat20 = extract_features(_make_candles(20))
-        assert feat20[5] > feat10[5]   # candle_count_10s
+        assert feat20[5] > feat10[5]   # candle_count_15s
 
     def test_candle_count_norm_1m_scales_with_n(self):
         feat10 = extract_features([], candles_1m=_make_candles(10))

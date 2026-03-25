@@ -29,8 +29,8 @@ from trader.analysis.ml_scorer import extract_features, zscore_normalize, euclid
 DB_PATH = "trader.db"
 
 FEAT_NAMES = [
-    "pump_ratio_10s", "vol_momentum_10s", "price_slope_10s",
-    "recent_momentum_10s", "volatility_10s", "candle_count_10s",
+    "pump_ratio_15s", "vol_momentum_15s", "price_slope_15s",
+    "recent_momentum_15s", "volatility_15s", "candle_count_15s",
     "pump_ratio_1m", "vol_momentum_1m", "price_slope_1m",
     "recent_momentum_1m", "volatility_1m", "candle_count_1m",
     "buy_ratio_5m", "activity_5m_norm", "price_change_5m_norm",
@@ -48,7 +48,7 @@ def load_data(db_path: str) -> list[dict]:
     conn = sqlite3.connect(db_path)
     rows = conn.execute("""
         SELECT so.outcome_pnl_pct, so.outcome_max_gain_pct, so.position_peak_pnl_pct,
-               sc.candles_json, sc.candles_1m_json, sc.pair_stats_json,
+               sc.candles_json, sc.candles_1m_json, sc.candles_1s_json, sc.pair_stats_json,
                sc.source_channel, sc.ts, sc.pump_ratio as raw_pump
         FROM strategy_outcomes so
         JOIN signal_charts sc ON sc.id = so.signal_chart_id
@@ -58,16 +58,18 @@ def load_data(db_path: str) -> list[dict]:
     conn.close()
     records = []
     for r in rows:
-        pnl, max_gain, peak_pnl, c10s_raw, c1m_raw, ps_raw, ch, ts, raw_pump = r
-        c10s = json.loads(c10s_raw) if c10s_raw else []
+        pnl, max_gain, peak_pnl, c15s_raw, c1m_raw, c1s_raw, ps_raw, ch, ts, raw_pump = r
+        c15s = json.loads(c15s_raw) if c15s_raw else []
         c1m  = json.loads(c1m_raw)  if c1m_raw and c1m_raw != "null" else None
+        c1s  = json.loads(c1s_raw)  if c1s_raw and c1s_raw != "null" else None
         ps   = json.loads(ps_raw)   if ps_raw  and ps_raw  != "null" else None
         records.append({
             "outcome_pnl_pct":       pnl or 0.0,
             "outcome_max_gain_pct":  max_gain or 0.0,
             "position_peak_pnl_pct": peak_pnl or 0.0,
-            "candles_10s":  c10s,
+            "candles_15s":  c15s,
             "candles_1m":   c1m,
+            "candles_1s":   c1s,
             "pair_stats":   ps,
             "source_channel": ch or "",
             "ts": ts,
@@ -79,7 +81,7 @@ def load_data(db_path: str) -> list[dict]:
 def precompute_features(records: list[dict]) -> list[list[float] | None]:
     return [
         extract_features(
-            r["candles_10s"], candles_1m=r["candles_1m"],
+            r["candles_15s"], candles_1m=r["candles_1m"], candles_1s=r["candles_1s"],
             pair_stats=r["pair_stats"], source_channel=r["source_channel"],
         )
         for r in records
@@ -390,33 +392,43 @@ def weighted_knn_search(records, all_feats, separability):
     print("PHASE 4: WEIGHTED KNN (emphasize top-separating features)")
     print("=" * 80)
 
-    # 21-element weight vectors
-    uniform_weights    = [1.0] * 21
-    boosted_weights    = [1.0] * 21
-    selective_weights  = [0.2] * 21
-    no10s_weights      = [1.0] * 21  # zero out 10s (test whether 10s adds noise)
+    n_feats = len(all_feats)
+    uniform_weights    = [1.0] * n_feats
+    boosted_weights    = [1.0] * n_feats
+    selective_weights  = [0.2] * n_feats
+    no15s_weights      = [1.0] * n_feats  # zero out 15s (test whether 15s adds noise)
     for j in range(6):
-        no10s_weights[j] = 0.0
+        no15s_weights[j] = 0.0
 
     for fi, name, wm, ws, lm, ls, d in separability[:4]:
         boosted_weights[fi] = 3.0
     for fi, name, wm, ws, lm, ls, d in separability[:6]:
         selective_weights[fi] = 3.0
 
+    # Proposed production weights derived from 178-trade / 2-day analysis
+    proposed_weights = [
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,   # idx  0-5:  10s features — noise
+        3.0, 0.0, 3.0, 1.0, 0.5, 1.0,   # idx  6-11: 1m OHLCV
+        0.5, 5.0, 1.0, 1.5, 2.0, 1.0,   # idx 12-17: pair stats + source_channel
+        0.0, 0.0, 0.0,                   # idx 18-20: token metadata (still mostly fallback)
+        0.0, 2.0, 2.0, 2.0,             # idx 21-24: wallet (momentum=2, 30m_chg=2, buy_vol_5m=2)
+    ]
+
     weight_configs = [
         ("uniform",    uniform_weights),
         ("top4_boost", boosted_weights),
         ("selective",  selective_weights),
-        ("no_10s",     no10s_weights),
+        ("no_15s",     no15s_weights),
+        ("proposed",   proposed_weights),
     ]
 
     best = []
     for wname, weights in weight_configs:
-        for label_key in ["outcome_pnl_pct", "position_peak_pnl_pct", "outcome_max_gain_pct"]:
+        for label_key in ["outcome_pnl_pct", "position_peak_pnl_pct"]:
             for k in [3, 5, 7]:
-                for hl in [3.0, 7.0, 14.0, 30.0]:
-                    for sl, sh in [(-45, 130), (-35, 150), (-45, 200), (-35, 300), (-50, 300)]:
-                        for ms in [1.5, 2.0, 2.5, 3.0, 4.0, 5.0]:
+                for hl in [7.0, 14.0, 30.0]:
+                    for sl, sh in [(-35, 300), (-45, 300), (-35, 150)]:
+                        for ms in [1.0, 1.5, 2.0, 2.5]:
                             wt, lb, wn, ln = weighted_knn_loo(
                                 records, all_feats, weights, label_key,
                                 k, hl, sl, sh, ms)

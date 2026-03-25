@@ -21,11 +21,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from trader.config import Config
 from trader.pricing.birdeye import BirdeyePriceClient
-from trader.pricing.moralis import MoralisOHLCVClient
 
 # WIF (dogwifhat) — major Solana token, always has live candle data
-TEST_MINT   = "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm"
-TEST_TIME   = None   # None = now
+TEST_MINT        = "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm"  # WIF — stable, 15s works
+TEST_MINT_PUMP   = "5RxYqEnX6bAFJ8Eh4TJSXhv6khrzc47d1kAc4jTDpump"   # recent pump — 1s works
+TEST_TIME        = None   # None = now
 SEP = "-" * 60
 
 
@@ -59,39 +59,36 @@ async def main() -> None:
         print()
 
         # ------------------------------------------------------------------
-        # 2. Jupiter pair resolution
+        # 2. Birdeye v3 — 100 × 15s candles
         # ------------------------------------------------------------------
         print(SEP)
-        print("  JUPITER  pair address resolution")
+        print("  BIRDEYE v3  100 × 15s  candles")
         print(SEP)
-        moralis = MoralisOHLCVClient(cfg, session)
-        pair = await moralis._resolve_pair_address(TEST_MINT)
-        if pair:
-            print(f"  OK — pair address: {pair}")
+        candles_15s = await birdeye.get_ohlcv_v3(TEST_MINT, bars=100, interval="15s")
+        if candles_15s:
+            first, last = candles_15s[0], candles_15s[-1]
+            print(f"  OK — {len(candles_15s)} bars returned")
+            print(f"  First: t={first.unix_time}  o={first.open:.8f}  c={first.close:.8f}")
+            print(f"  Last:  t={last.unix_time}  o={last.open:.8f}  c={last.close:.8f}")
         else:
-            print("  FAIL — could not resolve pair address")
+            print("  FAIL — no candles returned")
 
         print()
 
         # ------------------------------------------------------------------
-        # 3. Moralis — 100 × 10s candles
+        # 3. Birdeye v3 — 60 × 1s candles (pump token — WIF has no 1s data)
         # ------------------------------------------------------------------
         print(SEP)
-        print("  MORALIS  100 × 10s  candles")
+        print("  BIRDEYE v3  60 × 1s  candles  (pump token)")
         print(SEP)
-        if not cfg.moralis_api_key:
-            print("  SKIP — MORALIS_API_KEY not set in .env")
-        elif not pair:
-            print("  SKIP — pair resolution failed above")
+        candles_1s = await birdeye.get_ohlcv_v3(TEST_MINT_PUMP, bars=60, interval="1s")
+        if candles_1s:
+            first, last = candles_1s[0], candles_1s[-1]
+            print(f"  OK — {len(candles_1s)} bars returned")
+            print(f"  First: t={first.unix_time}  o={first.open:.8f}  c={first.close:.8f}")
+            print(f"  Last:  t={last.unix_time}  o={last.open:.8f}  c={last.close:.8f}")
         else:
-            candles = await moralis.get_ohlcv(TEST_MINT, bars=100, interval="10s", time_to=t)
-            if candles:
-                first, last = candles[0], candles[-1]
-                print(f"  OK — {len(candles)} bars returned")
-                print(f"  First: t={first.unix_time}  o={first.open:.8f}  c={first.close:.8f}")
-                print(f"  Last:  t={last.unix_time}  o={last.open:.8f}  c={last.close:.8f}")
-            else:
-                print("  FAIL — no candles returned")
+            print("  FAIL — no candles returned")
 
         print()
 

@@ -23,8 +23,8 @@ from trader.analysis.ml_scorer import extract_features, zscore_normalize, euclid
 DB_PATH = "trader.db"
 
 FEAT_NAMES = [
-    "pump_ratio_10s", "vol_momentum_10s", "price_slope_10s",
-    "recent_momentum_10s", "volatility_10s", "candle_count_10s",
+    "pump_ratio_15s", "vol_momentum_15s", "price_slope_15s",
+    "recent_momentum_15s", "volatility_15s", "candle_count_15s",
     "pump_ratio_1m", "vol_momentum_1m", "price_slope_1m",
     "recent_momentum_1m", "volatility_1m", "candle_count_1m",
     "buy_ratio_5m", "activity_5m_norm", "price_change_5m_norm",
@@ -59,7 +59,7 @@ def load_data(db_path: str) -> list[dict]:
             "outcome_pnl_pct":       pnl or 0.0,
             "outcome_max_gain_pct":  max_gain or 0.0,
             "position_peak_pnl_pct": peak_pnl or 0.0,
-            "candles_10s":  c10s,
+            "candles_15s":  c10s,
             "candles_1m":   c1m,
             "pair_stats":   ps,
             "source_channel": ch or "",
@@ -72,7 +72,7 @@ def load_data(db_path: str) -> list[dict]:
 def precompute_features(records: list[dict]) -> list[list[float] | None]:
     return [
         extract_features(
-            r["candles_10s"], candles_1m=r["candles_1m"],
+            r["candles_15s"], candles_1m=r["candles_1m"],
             pair_stats=r["pair_stats"], source_channel=r["source_channel"],
         )
         for r in records
@@ -344,16 +344,21 @@ def weighted_knn_search(records, all_feats, separability):
     print("PHASE 4: WEIGHTED KNN (emphasize top-separating features)")
     print("=" * 80)
 
+    # Use actual feature vector length (extract_features may return more than FEAT_NAMES)
+    sample_feat = next(f for f in all_feats if f is not None)
+    n_feats = len(sample_feat)
     # Build two weight vectors: uniform and top-4 boosted
-    uniform_weights = [1.0] * 18
-    boosted_weights = [1.0] * 18
+    uniform_weights = [1.0] * n_feats
+    boosted_weights = [1.0] * n_feats
     for fi, name, wm, ws, lm, ls, d in separability[:4]:
-        boosted_weights[fi] = 3.0  # 3x weight on top separators
+        if fi < n_feats:
+            boosted_weights[fi] = 3.0  # 3x weight on top separators
 
     # Only features that matter (zero out weakest)
-    selective_weights = [0.2] * 18
+    selective_weights = [0.2] * n_feats
     for fi, name, wm, ws, lm, ls, d in separability[:6]:
-        selective_weights[fi] = 3.0
+        if fi < n_feats:
+            selective_weights[fi] = 3.0
 
     weight_configs = [
         ("uniform",    uniform_weights),

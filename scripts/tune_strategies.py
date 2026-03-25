@@ -17,7 +17,7 @@ Usage
     python scripts/tune_strategies.py                          # tune all 5 now
     python scripts/tune_strategies.py --strategy trend_rider   # tune one strategy
     python scripts/tune_strategies.py --every 15               # trigger after 15 new signals
-    python scripts/tune_strategies.py --loop                   # poll every 60s
+    python scripts/tune_strategies.py --loop                   # poll every 300s (5 min)
     python scripts/tune_strategies.py --dry-run                # preview, no writes
 
 Environment
@@ -59,7 +59,7 @@ from trader.agents.strategy_tuner import (
 )
 
 DB_PATH = os.getenv("DB_PATH", "trader.db")
-POLL_INTERVAL_SECONDS = 60
+POLL_INTERVAL_SECONDS = 300
 MIN_EVERY = 5
 MAX_EVERY = 50
 SEP = "=" * 60
