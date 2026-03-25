@@ -16,6 +16,12 @@
     "ai_profit_target_usd": 300.0,
     "ai_deadline": "2026-04-10"
   },
+  "safe_bet": {
+    "live_trading": false,
+    "stop_loss_pct": 0.05,
+    "timeout_minutes": 60.0,
+    "timeout_min_gain_pct": 0.10
+  },
   "trend_rider": {
     "live_trading": false,
     "stop_loss_pct": 0.35,
@@ -88,18 +94,18 @@
   "quick_pop_managed": {
     "live_trading": true,
     "use_policy_agent": false,
-    "use_ai_override": true,
-    "use_ai_override_shadow": true,
+    "use_ai_override": false,
+    "use_ai_override_shadow": false,
     "ml_training_strategy": "quick_pop",
     "ml_training_label": "position_peak_pnl_pct",
-    "ml_min_score": 3.0,
+    "ml_min_score": 1.5,
     "ml_high_score_threshold": 6.0,
     "ml_max_score_threshold": 8.0,
     "ml_size_multiplier": 1.2,
     "ml_max_size_multiplier": 2.0,
-    "ml_k": 5,
-    "ml_halflife_days": 14.0,
-    "ml_score_low_pct": -35.0,
+    "ml_k": 3,
+    "ml_halflife_days": 7.0,
+    "ml_score_low_pct": -45.0,
     "ml_score_high_pct": 300.0
   },
   "moonbag_managed": {
