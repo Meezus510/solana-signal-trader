@@ -22,9 +22,11 @@ Pair resolution:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +47,10 @@ _WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 # Jupiter quote endpoint for pair-address resolution.
 _JUPITER_QUOTE_URL = "https://api.jup.ag/swap/v1/quote"
+
+# Retry config for the empty-candles case (Moralis indexing lag).
+_OHLCV_EMPTY_RETRIES = 2    # number of extra attempts after the first
+_OHLCV_EMPTY_DELAY   = 1.5  # seconds between retries
 
 # Seconds per bar for each Moralis timeframe string.
 _INTERVAL_SECONDS: dict[str, int] = {
@@ -105,6 +111,41 @@ class MoralisStats:
         except OSError as exc:
             logger.warning("[Moralis] Could not write fallback log: %s", exc)
 
+    def record_ohlcv_empty(
+        self,
+        mint: str,
+        pair_address: str,
+        url: str,
+        params: dict,
+        raw_body: str,
+        attempts: int,
+        from_iso: str,
+        to_iso: str,
+    ) -> None:
+        """
+        Record an OHLCV_EMPTY event with full diagnostic context.
+
+        Writes a structured multi-line block to moralis_fallback.log:
+            <ts> | OHLCV_EMPTY | <mint> | pair=<addr> | attempts=<n> | window=<from>→<to>
+              url:  <full URL with query string>
+              body: <raw JSON response>
+        """
+        self.ohlcv_empty += 1
+        ts       = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        full_url = url + "?" + urllib.parse.urlencode(params)
+        block = (
+            f"{ts} | OHLCV_EMPTY | {mint} | pair={pair_address}"
+            f" | attempts={attempts} | window={from_iso}→{to_iso}\n"
+            f"  url:  {full_url}\n"
+            f"  body: {raw_body}\n"
+        )
+        try:
+            _FALLBACK_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with _FALLBACK_LOG_PATH.open("a") as f:
+                f.write(block)
+        except OSError as exc:
+            logger.warning("[Moralis] Could not write fallback log: %s", exc)
+
     def log_summary(self) -> None:
         """Log a one-line counter summary — call on shutdown or periodically."""
         logger.info(
@@ -131,6 +172,9 @@ class MoralisOHLCVClient:
         self._cfg = cfg
         self._session = session
         self._pair_cache: dict[str, str] = {}
+        # All active Moralis candidates per mint, sorted by liquidity descending.
+        # Used to fall through to the next pool when the primary pair has no OHLCV.
+        self._pair_candidates: dict[str, list[str]] = {}
         self._jupiter_api_key: str = os.getenv("JUPITER_API_KEY", "").strip()
         self.stats = MoralisStats()
 
@@ -198,7 +242,9 @@ class MoralisOHLCVClient:
                     return None
 
                 sol_pairs.sort(key=lambda p: p.get("liquidityUsd") or 0, reverse=True)
-                return sol_pairs[0].get("pairAddress")
+                addrs = [p.get("pairAddress") for p in sol_pairs if p.get("pairAddress")]
+                self._pair_candidates[mint] = addrs
+                return addrs[0] if addrs else None
 
         except Exception as exc:
             logger.warning("[Moralis] pair resolution error for %s: %s", mint, exc)
@@ -335,6 +381,9 @@ class MoralisOHLCVClient:
         secs      = _INTERVAL_SECONDS.get(interval, 10)
         time_from = time_to - bars * secs
 
+        from_iso = datetime.fromtimestamp(time_from, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        to_iso   = datetime.fromtimestamp(time_to,   tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
         url = f"{self._cfg.moralis_base_url}/token/mainnet/pairs/{pair_address}/ohlcv"
         params = {
             "fromDate":  str(time_from),
@@ -345,67 +394,139 @@ class MoralisOHLCVClient:
         }
         headers = {"X-Api-Key": self._cfg.moralis_api_key}
 
-        try:
-            async with self._session.get(
-                url,
-                params=params,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status == 401:
-                    logger.error(
-                        "[Moralis] 401 Unauthorized for %s — check MORALIS_API_KEY", mint
-                    )
-                    return []
-                if resp.status == 429:
-                    logger.warning("[Moralis] 429 rate limit for %s", mint)
-                    return []
-                if resp.status != 200:
-                    logger.warning("[Moralis] HTTP %d for %s", resp.status, mint)
-                    return []
-
-                data  = await resp.json()
-                items = data.get("result") or []
-
-                candles: list[OHLCVCandle] = []
-                for item in items:
-                    ts = item.get("timestamp")
-                    if isinstance(ts, str):
-                        # ISO-8601 string, e.g. "2026-03-15T18:10:00.000Z"
-                        unix_time = int(
-                            datetime.fromisoformat(
-                                ts.replace("Z", "+00:00")
-                            ).timestamp()
+        raw_body = ""
+        for attempt in range(_OHLCV_EMPTY_RETRIES + 1):
+            try:
+                async with self._session.get(
+                    url,
+                    params=params,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status == 401:
+                        logger.error(
+                            "[Moralis] 401 Unauthorized for %s — check MORALIS_API_KEY", mint
                         )
-                    else:
-                        unix_time = int(ts)
+                        return []
+                    if resp.status == 429:
+                        logger.warning("[Moralis] 429 rate limit for %s", mint)
+                        return []
+                    if resp.status != 200:
+                        logger.warning("[Moralis] HTTP %d for %s", resp.status, mint)
+                        return []
 
-                    candles.append(OHLCVCandle(
-                        unix_time=unix_time,
-                        open=float(item.get("open",   0)),
-                        high=float(item.get("high",   0)),
-                        low=float(item.get("low",    0)),
-                        close=float(item.get("close",  0)),
-                        volume=float(item.get("volume", 0)),
-                    ))
+                    raw_body = await resp.text()
+                    data     = json.loads(raw_body)
+                    items    = data.get("result") or []
 
-                # Sort ascending and keep only the most recent `bars`
-                candles.sort(key=lambda c: c.unix_time)
-                if not candles:
-                    logger.warning("[Moralis] %s — pair found (%s) but OHLCV returned 0 candles", mint, pair_address)
-                    self.stats.record("OHLCV_EMPTY", mint, f"pair={pair_address}")
-                else:
-                    logger.debug("[Moralis] %s — %d × %s candles", mint, len(candles), interval)
-                return candles[-bars:]
+                    candles: list[OHLCVCandle] = []
+                    for item in items:
+                        ts = item.get("timestamp")
+                        if isinstance(ts, str):
+                            # ISO-8601 string, e.g. "2026-03-15T18:10:00.000Z"
+                            unix_time = int(
+                                datetime.fromisoformat(
+                                    ts.replace("Z", "+00:00")
+                                ).timestamp()
+                            )
+                        else:
+                            unix_time = int(ts)
 
-        except asyncio.TimeoutError:
-            logger.warning("[Moralis] Timeout for %s", mint)
-            self.stats.record("HTTP_ERROR", mint, "timeout")
-        except aiohttp.ClientError as exc:
-            logger.warning("[Moralis] HTTP error for %s: %s", mint, exc)
-            self.stats.record("HTTP_ERROR", mint, str(exc))
-        except Exception as exc:
-            logger.error("[Moralis] Unexpected error for %s: %s", mint, exc)
-            self.stats.record("HTTP_ERROR", mint, str(exc))
+                        candles.append(OHLCVCandle(
+                            unix_time=unix_time,
+                            open=float(item.get("open",   0)),
+                            high=float(item.get("high",   0)),
+                            low=float(item.get("low",    0)),
+                            close=float(item.get("close",  0)),
+                            volume=float(item.get("volume", 0)),
+                        ))
 
+                    # Sort ascending and keep only the most recent `bars`
+                    candles.sort(key=lambda c: c.unix_time)
+                    if candles:
+                        logger.debug("[Moralis] %s — %d × %s candles", mint, len(candles), interval)
+                        return candles[-bars:]
+
+                    # Empty candles — Moralis indexing lag; retry if attempts remain
+                    if attempt < _OHLCV_EMPTY_RETRIES:
+                        logger.debug(
+                            "[Moralis] %s — OHLCV empty on attempt %d/%d, retrying in %.1fs",
+                            mint, attempt + 1, _OHLCV_EMPTY_RETRIES + 1, _OHLCV_EMPTY_DELAY,
+                        )
+                        await asyncio.sleep(_OHLCV_EMPTY_DELAY)
+
+            except asyncio.TimeoutError:
+                logger.warning("[Moralis] Timeout for %s", mint)
+                self.stats.record("HTTP_ERROR", mint, "timeout")
+                return []
+            except aiohttp.ClientError as exc:
+                logger.warning("[Moralis] HTTP error for %s: %s", mint, exc)
+                self.stats.record("HTTP_ERROR", mint, str(exc))
+                return []
+            except Exception as exc:
+                logger.error("[Moralis] Unexpected error for %s: %s", mint, exc)
+                self.stats.record("HTTP_ERROR", mint, str(exc))
+                return []
+
+        # Primary pair exhausted — try remaining Moralis candidates (one attempt each).
+        # Handles token graduation (e.g. Pump.Fun → PumpSwap) and wrong-pool selection.
+        for alt_pair in self._pair_candidates.get(mint, []):
+            if alt_pair == pair_address:
+                continue
+            alt_url = f"{self._cfg.moralis_base_url}/token/mainnet/pairs/{alt_pair}/ohlcv"
+            try:
+                async with self._session.get(
+                    alt_url,
+                    params=params,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    alt_raw  = await resp.text()
+                    alt_data = json.loads(alt_raw)
+                    alt_items = alt_data.get("result") or []
+                    alt_candles: list[OHLCVCandle] = []
+                    for item in alt_items:
+                        ts = item.get("timestamp")
+                        if isinstance(ts, str):
+                            unix_time = int(
+                                datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+                            )
+                        else:
+                            unix_time = int(ts)
+                        alt_candles.append(OHLCVCandle(
+                            unix_time=unix_time,
+                            open=float(item.get("open",   0)),
+                            high=float(item.get("high",   0)),
+                            low=float(item.get("low",    0)),
+                            close=float(item.get("close",  0)),
+                            volume=float(item.get("volume", 0)),
+                        ))
+                    alt_candles.sort(key=lambda c: c.unix_time)
+                    if alt_candles:
+                        logger.info(
+                            "[Moralis] %s — primary pair %s empty; alt pair %s returned %d candles — promoting",
+                            mint, pair_address, alt_pair, len(alt_candles),
+                        )
+                        self._pair_cache[mint] = alt_pair  # promote for future calls
+                        return alt_candles[-bars:]
+            except Exception:
+                pass  # skip bad alt pairs silently
+
+        # All pairs failed — log enriched diagnostic entry
+        logger.warning(
+            "[Moralis] %s — pair found (%s) but OHLCV returned 0 candles after %d attempt(s)",
+            mint, pair_address, _OHLCV_EMPTY_RETRIES + 1,
+        )
+        self.stats.record_ohlcv_empty(
+            mint=mint,
+            pair_address=pair_address,
+            url=url,
+            params=params,
+            raw_body=raw_body,
+            attempts=_OHLCV_EMPTY_RETRIES + 1,
+            from_iso=from_iso,
+            to_iso=to_iso,
+        )
         return []

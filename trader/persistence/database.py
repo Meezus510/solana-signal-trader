@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS signal_charts (
     candle_count    INTEGER,
     candles_json    TEXT NOT NULL,
     candles_1m_json TEXT,
+    candles_1s_json TEXT,
     pair_stats_json TEXT,
     ml_score        REAL,
     source_channel  TEXT NOT NULL DEFAULT '',
@@ -151,7 +152,21 @@ CREATE TABLE IF NOT EXISTS signal_charts (
     fetch_attempts      INTEGER NOT NULL DEFAULT 0,
     price_tracking_done   INTEGER NOT NULL DEFAULT 0,
     price_stale_count     INTEGER NOT NULL DEFAULT 0,
-    price_checkpoint_price REAL
+    price_checkpoint_price REAL,
+    holder_count           INTEGER,
+    market_cap_usd         REAL,
+    liquidity_usd          REAL,
+    unique_wallet_5m       INTEGER,
+    unique_wallet_hist_5m  INTEGER,
+    price_change_30m_pct   REAL,
+    buy_volume_usd_5m      REAL,
+    sell_volume_usd_5m     REAL,
+    buys_5m                INTEGER,
+    sells_5m               INTEGER,
+    price_change_5m_pct    REAL,
+    buy_volume_1h          REAL,
+    total_volume_1h        REAL,
+    liquidity_change_1h_pct REAL
 )
 """
 
@@ -335,6 +350,21 @@ class TradeDatabase:
             ("price_tracking_done",    "INTEGER NOT NULL DEFAULT 0"),
             ("price_stale_count",      "INTEGER NOT NULL DEFAULT 0"),
             ("price_checkpoint_price", "REAL"),
+            ("holder_count",           "INTEGER"),
+            ("market_cap_usd",         "REAL"),
+            ("liquidity_usd",          "REAL"),
+            ("unique_wallet_5m",       "INTEGER"),
+            ("unique_wallet_hist_5m",  "INTEGER"),
+            ("price_change_30m_pct",   "REAL"),
+            ("buy_volume_usd_5m",      "REAL"),
+            ("sell_volume_usd_5m",     "REAL"),
+            ("buys_5m",                "INTEGER"),
+            ("sells_5m",               "INTEGER"),
+            ("price_change_5m_pct",    "REAL"),
+            ("buy_volume_1h",          "REAL"),
+            ("total_volume_1h",        "REAL"),
+            ("liquidity_change_1h_pct","REAL"),
+            ("candles_1s_json",        "TEXT"),
         ]:
             try:
                 c.execute(f"ALTER TABLE signal_charts ADD COLUMN {col} {definition}")
@@ -665,14 +695,16 @@ class TradeDatabase:
         ml_score: Optional[float] = None,
         pair_stats: Optional[dict] = None,
         candles_1m: Optional[list] = None,
+        candles_1s: Optional[list] = None,
         ts: Optional[str] = None,
         source_channel: str = "",
     ) -> int:
         """
         Persist OHLCV candles + signal metadata once per signal into signal_charts.
 
-        candles      — high-res candles used for ML (e.g. 10s × 100 bars)
-        candles_1m   — standard 1m Birdeye candles, saved for future strategy use
+        candles      — high-res candles used for ML (Birdeye v3 15s × 100 bars)
+        candles_1m   — standard 1m Birdeye candles
+        candles_1s   — ultra high-res 1s Birdeye v3 candles (2wk retention)
         ts           — ISO timestamp for the signal; defaults to now. Pass the
                        original entry time when backfilling so recency weighting
                        in the KNN reflects the true age of the trade.
@@ -688,15 +720,22 @@ class TradeDatabase:
 
         candles_json    = _serialise(candles)
         candles_1m_json = _serialise(candles_1m) if candles_1m else None
+        candles_1s_json = _serialise(candles_1s) if candles_1s else None
         row_ts = ts if ts else datetime.now(timezone.utc).isoformat()
 
+        ps = pair_stats or {}
         cursor = self._conn.execute(
             """
             INSERT INTO signal_charts
                 (ts, symbol, mint, entry_price,
                  pump_ratio, vol_trend, candle_count, candles_json,
-                 candles_1m_json, pair_stats_json, ml_score, source_channel)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                 candles_1m_json, candles_1s_json, pair_stats_json, ml_score, source_channel,
+                 holder_count, market_cap_usd, liquidity_usd,
+                 unique_wallet_5m, unique_wallet_hist_5m, price_change_30m_pct,
+                 buy_volume_usd_5m, sell_volume_usd_5m,
+                 buys_5m, sells_5m, price_change_5m_pct,
+                 buy_volume_1h, total_volume_1h, liquidity_change_1h_pct)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 row_ts,
@@ -708,9 +747,24 @@ class TradeDatabase:
                 chart_ctx.candle_count if chart_ctx else len(candles),
                 candles_json,
                 candles_1m_json,
+                candles_1s_json,
                 json.dumps(pair_stats) if pair_stats else None,
                 ml_score,
                 source_channel,
+                ps.get("holder_count"),
+                ps.get("market_cap_usd"),
+                ps.get("liquidity_usd"),
+                ps.get("unique_wallet_5m"),
+                ps.get("unique_wallet_hist_5m"),
+                ps.get("price_change_30m_pct"),
+                ps.get("buy_volume_usd_5m"),
+                ps.get("sell_volume_usd_5m"),
+                ps.get("buys_5m"),
+                ps.get("sells_5m"),
+                ps.get("price_change_5m_pct"),
+                ps.get("buy_volume_1h"),
+                ps.get("total_volume_1h"),
+                ps.get("liquidity_change_1h_pct"),
             ),
         )
         self._conn.commit()
@@ -951,7 +1005,7 @@ class TradeDatabase:
             SELECT sc.ts, sc.candles_json, {label_expr},
                    sc.pump_ratio, sc.vol_trend, sc.pair_stats_json,
                    COALESCE(so.source_channel, sc.source_channel, ''),
-                   sc.candles_1m_json
+                   sc.candles_1m_json, sc.candles_1s_json
               FROM strategy_outcomes so
               JOIN signal_charts sc ON so.signal_chart_id = sc.id
              WHERE so.strategy = ?
@@ -970,6 +1024,7 @@ class TradeDatabase:
                 "pair_stats_json": r[5],
                 "source_channel":  r[6],
                 "candles_1m_json": r[7],
+                "candles_1s_json": r[8],
             }
             for r in rows
         ]
