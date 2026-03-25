@@ -15,7 +15,7 @@ Adding a new strategy:
 Strategy groups
 ---------------
 Group A — no chart filter (enters every signal unconditionally):
-    quick_pop, trend_rider, infinite_moonbag
+    quick_pop, trend_rider, infinite_moonbag, safe_bet
 
 Group B — chart filter enabled (skips late pumps and dying volume):
     quick_pop_managed (+ ML filter), trend_rider_managed (+ reanalyze), moonbag_managed
@@ -41,6 +41,7 @@ _CONTROLLED = frozenset([
     "trend_rider", "trend_rider_managed",
     "infinite_moonbag", "moonbag_managed",
     "quick_pop_managed",
+    "safe_bet",
 ])
 
 _CONFIG_PATH = Path(__file__).parent.parent.parent / "strategy_config.json"
@@ -83,6 +84,11 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         Grace period 90s: −30% floor. After grace: −20% floor.
         TP ladder: 1.8×/20%, 2.5×/15%, 4.0×/15%, 6.0×/10% of original.
         Stop ladder: 1.8×→1.00× (breakeven), 2.5×→1.65×, 4.0×→2.60×, 6.0×→4.20×.
+
+    safe_bet (Group A, paper-only)
+        Clean risk/reward benchmark: single TP at 1.2× (sell 100%), hard SL at −5%.
+        Timeout 60 min if price never reaches 1.2× and gain < 10%.
+        No managed variant until enough trade data is collected.
     """
     overrides = _load_strategy_overrides()
 
@@ -102,12 +108,12 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
     quick_pop_cfg = StrategyConfig(
         name="quick_pop",
         buy_size_usd=30.0,
-        stop_loss_pct=0.20,
+        stop_loss_pct=0.06,
         take_profit_levels=(
-            TakeProfitLevel(multiple=1.5, sell_fraction_original=0.60),
-            TakeProfitLevel(multiple=2.0, sell_fraction_original=0.40),
+            TakeProfitLevel(multiple=1.26, sell_fraction_original=0.78),
+            TakeProfitLevel(multiple=1.98, sell_fraction_original=0.22),
         ),
-        trailing_stop_pct=0.22,
+        trailing_stop_pct=0.07,
         starting_cash_usd=cfg.starting_cash_usd,
         timeout_minutes=45.0,
         timeout_min_gain_pct=0.49,
@@ -133,17 +139,33 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
     moonbag_cfg = StrategyConfig(
         name="infinite_moonbag",
         buy_size_usd=5.0,
-        stop_loss_pct=_o("infinite_moonbag").get("stop_loss_pct", 0.30),
+        stop_loss_pct=_o("infinite_moonbag").get("stop_loss_pct", 0.12),
         take_profit_levels=_tp("infinite_moonbag", [
-            TakeProfitLevel(multiple=1.8, sell_fraction_original=0.20),
-            TakeProfitLevel(multiple=2.5, sell_fraction_original=0.15),
-            TakeProfitLevel(multiple=4.0, sell_fraction_original=0.15),
-            TakeProfitLevel(multiple=6.0, sell_fraction_original=0.10),
+            TakeProfitLevel(multiple=2.0, sell_fraction_original=0.35),
+            TakeProfitLevel(multiple=4.3, sell_fraction_original=0.12),
+            TakeProfitLevel(multiple=6.8, sell_fraction_original=0.38),
+            TakeProfitLevel(multiple=8.0, sell_fraction_original=0.10),
         ]),
         trailing_stop_pct=_o("infinite_moonbag").get("trailing_stop_pct", 0.30),
         starting_cash_usd=cfg.starting_cash_usd,
         save_chart_data=True,
         live_trading=_o("infinite_moonbag").get("live_trading", False),
+    )
+
+    safe_bet_cfg = StrategyConfig(
+        name="safe_bet",
+        buy_size_usd=30.0,
+        stop_loss_pct=_o("safe_bet").get("stop_loss_pct", 0.05),
+        take_profit_levels=(
+            TakeProfitLevel(multiple=1.2, sell_fraction_original=1.0),
+        ),
+        trailing_stop_pct=0.05,   # unused (100% exits at TP), required field
+        starting_cash_usd=cfg.starting_cash_usd,
+        timeout_minutes=_o("safe_bet").get("timeout_minutes", 60.0),
+        timeout_min_gain_pct=_o("safe_bet").get("timeout_min_gain_pct", 0.10),
+        save_chart_data=True,
+        live_trading=_o("safe_bet").get("live_trading", False),
+        use_real_exit_price=True,
     )
 
     # ------------------------------------------------------------------
@@ -154,12 +176,12 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
     quick_pop_chart_cfg = StrategyConfig(
         name="quick_pop_managed",
         buy_size_usd=30.0,
-        stop_loss_pct=0.20,       # fixed — not agent-controlled
+        stop_loss_pct=0.06,       # fixed — not agent-controlled
         take_profit_levels=(      # fixed — not agent-controlled
-            TakeProfitLevel(multiple=1.5, sell_fraction_original=0.60),
-            TakeProfitLevel(multiple=2.0, sell_fraction_original=0.40),
+            TakeProfitLevel(multiple=1.26, sell_fraction_original=0.78),
+            TakeProfitLevel(multiple=1.98, sell_fraction_original=0.22),
         ),
-        trailing_stop_pct=0.22,   # fixed — not agent-controlled
+        trailing_stop_pct=0.07,   # fixed — not agent-controlled
         starting_cash_usd=cfg.starting_cash_usd,
         timeout_minutes=45.0,     # fixed — not agent-controlled
         timeout_min_gain_pct=0.49,  # fixed — not agent-controlled
@@ -171,7 +193,7 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         use_ai_override_shadow=_qp_chart.get("use_ai_override_shadow", False),
         ml_training_strategy="quick_pop",  # train on unfiltered base outcomes
         ml_training_label="position_peak_pnl_pct",  # predict peak pump, not exit PnL
-        ml_prefer_moralis=True,      # use 10s candles for KNN — fast-scalp pump shape
+        ml_use_subminute=True,       # use Birdeye v3 15s candles for KNN — fast-scalp pump shape
         ml_min_score=_qp_chart.get("ml_min_score", 3.0),
         ml_high_score_threshold=_qp_chart.get("ml_high_score_threshold", 6.0),
         ml_max_score_threshold=_qp_chart.get("ml_max_score_threshold", 8.0),
@@ -181,47 +203,20 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         ml_halflife_days=_qp_chart.get("ml_halflife_days", 14.0),
         ml_score_low_pct=_qp_chart.get("ml_score_low_pct", -35.0),
         ml_score_high_pct=_qp_chart.get("ml_score_high_pct", 300.0),
-        # Feature weights for quick_pop KNN (25 features total).
-        # Weights derived from Cohen's d separability on 178 closed trades (2 days),
-        # using TP1-proxy label (peak_pnl > 49%) which matches the strategy's
-        # actual objective of catching tokens that pump past TP1 (1.5×).
-        #
-        # ZEROED (0×) — confirmed useless or actively harmful:
-        #   idx 0-5  (10s OHLCV)     — high variance adds noise; Phase 4 no_10s
-        #                               configs consistently outperform uniform.
-        #   idx 7    vol_momentum_1m — LOSERS>WINNERS in both labels: tokens with
-        #                               recent vol spike tend to be already pumped out.
-        #   idx 18-20 (token metadata) — still mostly fallback=0.5; insufficient real
-        #                               market_cap/liquidity data accumulated yet.
-        #   idx 21   unique_wallet_5m_norm — d<0.07 both labels, no signal.
-        #
-        # LOW (0.5×) — weak or inconsistent signal:
-        #   idx 10   volatility_1m      — d=0.14 TP1, inconsistent direction.
-        #   idx 12   buy_ratio_5m       — d=0.07 both, weak.
-        #
-        # MODERATE (1-2×) — useful signals:
-        #   idx 9    recent_momentum_1m  — d=0.28 TP1 (up from 0.04-0.13; now reliable).
-        #   idx 11   candle_count_1m     — d=0.09 TP1 (fewer candles = newer token).
-        #   idx 14   price_change_5m_norm — d=0.25 TP1.
-        #   idx 15   buy_vol_ratio_1h    — d=0.27 TP1.
-        #   idx 16   liquidity_change_1h  — d=0.33 TP1: rising liquidity = better.
-        #   idx 17   source_channel      — d=0.07 TP1 (minor channel difference).
-        #   idx 22   wallet_momentum_5m  — d=0.26 exit, LOSERS>WINNERS: high wallet
-        #                                  momentum = already pumping = loser signal.
-        #   idx 23   price_change_30m_norm — d=0.36 TP1: tokens up 30m ago still going.
-        #   idx 24   buy_vol_ratio_5m    — d=0.34 TP1: strong 5m buy pressure = winner.
-        #
-        # HIGH (3-5×) — dominant separators:
-        #   idx 6    pump_ratio_1m      — d=0.22 TP1, d=0.22 exit.
-        #   idx 8    price_slope_1m     — d=0.22 TP1, d=0.22 exit: steeper uptrend = wins.
-        #   idx 13   activity_5m_norm   — d=0.51 TP1: best single predictor.
+        # Feature weights for quick_pop KNN (63 features total).
+        # Weights from AI optimizer r8_s4: net_pnl=$+320.75 (saved=$408.92, missed=$88.17),
+        # 107/123 winners through (13% miss), 59/267 losers blocked. 2026-03-23.
         ml_feature_weights=(
-            2.5, 0.1, 1.5, 0.0, 0.0, 2.5,   # idx  0-5:  10s features
-            0.0, 0.0, 0.0, 1.5, 2.5, 0.0,   # idx  6-11: 1m OHLCV
-            2.0, 9.0, 2.5, 1.5, 4.0, 0.0,   # idx 12-17: pair stats + source_channel
-            0.0, 0.0, 2.5,                   # idx 18-20: token metadata
-            0.0, 0.0, 2.0, 6.0,             # idx 21-24: wallet (5m)
-            1.0, 0.5,                        # idx 25-26: wallet_momentum_30m, top10_holder_pct
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,            # idx  0-5:  15s OHLCV
+            10.0, 0.0, 0.0, 0.0, 0.0, 0.0,           # idx  6-11: 1m OHLCV
+            0.0, 8.0, 4.0, 3.0, 0.0, 0.0,            # idx 12-17: pair stats + source_channel
+            0.0, 0.0, 0.0,                            # idx 18-20: token metadata
+            0.0, 0.0, 0.0, 3.0,                      # idx 21-24: wallet (5m)
+            0.0, 1.0,                                 # idx 25-26: wallet_momentum_30m, top10_holder_pct
+            0.0, 0.0, 0.0, 4.0, 0.0, 0.0,            # idx 27-32: 1s OHLCV
+            0.0, 1.0, 2.0, 0.0, 2.5, 0.5, 1.5, 0.0, 0.0, 0.0,  # idx 33-42: 15s shape
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # idx 43-52: 1m shape
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 2.5, 0.0, 0.0,  # idx 53-62: 1s shape
         ),
         # Hard pre-filter: block signals with wallet_momentum_5m >= 2.102.
         # LOO backtest on 197 trades: blocks 9/134 losers with 0 winner misses.
@@ -260,16 +255,21 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         ml_halflife_days=_tr_chart.get("ml_halflife_days", 14.0),
         ml_score_low_pct=_tr_chart.get("ml_score_low_pct", -35.0),
         ml_score_high_pct=_tr_chart.get("ml_score_high_pct", 85.0),
-        # Feature weights for trend_rider KNN — uniform until optimizer run.
+        # Feature weights for trend_rider KNN (63 features total).
+        # trend_rider is ml_use_subminute=False → candles_15s=[] and candles_1s=None at inference.
+        # Locked to 0: idx 0-5 (15s OHLCV), 27-42 (1s OHLCV + 15s shape), 53-62 (1s shape).
         # To update: run scripts/optimize_ml_weights.py --strategy trend_rider
-        # and paste the resulting weights here.
         ml_feature_weights=(
-            2.0, 0.0, 2.0, 0.0, 1.8, 0.0,   # idx  0-5:  10s OHLCV
-            3.2, 0.0, 3.2, 0.0, 2.0, 0.0,   # idx  6-11: 1m OHLCV
-            0.0, 0.0, 0.0, 0.0, 3.2, 2.2,   # idx 12-17: pair stats + source_channel
-            0.0, 2.2, 0.0,                   # idx 18-20: token metadata
-            0.0, 0.1, 0.0, 1.8,             # idx 21-24: wallet (5m)
-            2.0, 1.5,                        # idx 25-26: wallet_momentum_30m, top10_holder_pct
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,            # idx  0-5:  15s OHLCV — locked (not fetched at inference)
+            3.2, 0.0, 3.2, 0.0, 2.0, 0.0,            # idx  6-11: 1m OHLCV
+            0.0, 0.0, 0.0, 0.0, 3.2, 2.2,            # idx 12-17: pair stats + source_channel
+            0.0, 2.2, 0.0,                            # idx 18-20: token metadata
+            0.0, 0.1, 0.0, 1.8,                      # idx 21-24: wallet (5m)
+            2.0, 1.5,                                 # idx 25-26: wallet_momentum_30m, top10_holder_pct
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,            # idx 27-32: 1s OHLCV — locked
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # idx 33-42: 15s shape — locked
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,  # idx 43-52: 1m shape
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # idx 53-62: 1s shape — locked
         ),
         live_trading=_tr_chart.get("live_trading", False),
     )
@@ -278,12 +278,12 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
     moonbag_chart_cfg = StrategyConfig(
         name="moonbag_managed",
         buy_size_usd=5.0,
-        stop_loss_pct=_mb_chart.get("stop_loss_pct", 0.30),
+        stop_loss_pct=_mb_chart.get("stop_loss_pct", 0.12),
         take_profit_levels=_tp("moonbag_managed", [
-            TakeProfitLevel(multiple=1.8, sell_fraction_original=0.20),
-            TakeProfitLevel(multiple=2.5, sell_fraction_original=0.15),
-            TakeProfitLevel(multiple=4.0, sell_fraction_original=0.15),
-            TakeProfitLevel(multiple=6.0, sell_fraction_original=0.10),
+            TakeProfitLevel(multiple=2.0, sell_fraction_original=0.35),
+            TakeProfitLevel(multiple=4.3, sell_fraction_original=0.12),
+            TakeProfitLevel(multiple=6.8, sell_fraction_original=0.38),
+            TakeProfitLevel(multiple=8.0, sell_fraction_original=0.10),
         ]),
         trailing_stop_pct=_mb_chart.get("trailing_stop_pct", 0.30),
         starting_cash_usd=cfg.starting_cash_usd,
@@ -304,14 +304,16 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         ml_max_size_multiplier=_mb_chart.get("ml_max_size_multiplier", 3.0),
         ml_k=int(_mb_chart.get("ml_k", 3)),
         ml_halflife_days=_mb_chart.get("ml_halflife_days", 14.0),
-        ml_score_low_pct=_mb_chart.get("ml_score_low_pct", -35.0),
-        ml_score_high_pct=_mb_chart.get("ml_score_high_pct", 150.0),
+        ml_use_subminute=True,       # 15s candles already fetched; top-3 features by Cohen's d are 15s
+        ml_score_low_pct=_mb_chart.get("ml_score_low_pct", 0.0),
+        ml_score_high_pct=_mb_chart.get("ml_score_high_pct", 200.0),
         # Feature weights for moonbag KNN (27 features total).
         # Weights derived from Cohen's d separability analysis on 65 closed trades.
         #
         # ZEROED (0×) — confirmed useless or actively harmful:
-        #   idx 0-5  (10s OHLCV)     — moonbag passes candles_10s=[] at scoring time;
-        #                               always neutral constants, weighting them adds noise.
+        #   idx 0-5  (15s OHLCV)     — NOW UNLOCKED: top-3 separating features are 15s
+        #                               (pump_ratio_15s d=0.36, price_slope_15s d=0.36,
+        #                               volatility_15s d=0.31 — all LOSERS > WINNERS).
         #   idx 6    pump_ratio_1m   — d=0.08, LOSERS>WINNERS: near-zero signal.
         #   idx 8    price_slope_1m  — d=0.08, LOSERS>WINNERS: near-zero signal.
         #   idx 10   volatility_1m   — d=0.01: pure noise, winners/losers identical.
@@ -336,7 +338,7 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         #   after z-normalisation), but weights are pre-set so they activate
         #   automatically as new signals with real market cap/liquidity data accumulate.
         ml_feature_weights=(
-            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,      # idx  0-5:  10s — locked 0 (candles_10s=[] at inference)
+            3.0, 1.0, 3.0, 1.0, 3.0, 1.0,      # idx  0-5:  15s OHLCV — top-3 separators unlocked
             7.6, 1.78, 6.9, 5.1, 0.38, 0.28,   # idx  6-11: 1m OHLCV
             0.0, 0.0, 0.0, 0.0, 0.01, 0.22,    # idx 12-17: pair stats + source_channel
             0.04, 0.02, 0.0,                    # idx 18-20: token metadata
@@ -350,6 +352,7 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         StrategyRunner(cfg=quick_pop_cfg, db=db),
         StrategyRunner(cfg=trend_rider_cfg, db=db),
         InfiniteMoonbagRunner(cfg=moonbag_cfg, db=db),
+        StrategyRunner(cfg=safe_bet_cfg, db=db),
         StrategyRunner(cfg=quick_pop_chart_cfg, db=db),
         StrategyRunner(cfg=trend_rider_chart_cfg, db=db),
         InfiniteMoonbagRunner(cfg=moonbag_chart_cfg, db=db),

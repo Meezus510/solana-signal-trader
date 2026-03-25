@@ -75,6 +75,9 @@ class Position:
     total_proceeds_usd: float     # gross USD received from all sells
     total_fees_usd: float         # reserved for fee modelling (0.0 for now)
 
+    # Token metadata
+    token_decimals: int = 6   # SPL token decimals — used for Jupiter quote amount calculation
+
     # Flags
     partial_take_profit_hit: bool = False   # True after TP1 sell fires
     tp2_hit: bool = False                   # True after TP2 sell fires

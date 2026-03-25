@@ -1,6 +1,12 @@
+import logging
 import os
 import requests
 import time
+from typing import Optional
+
+import aiohttp
+
+logger = logging.getLogger(__name__)
 
 class RestClient():
 
@@ -51,10 +57,55 @@ SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
 COIN_GECKO_HOST = "https://api.coingecko.com"
 
 def jupiter_quote_api(input_mint, output_mint, amount, slippage):
-    url = f"{JUPITER_HOST_LIMIT}//swap/v1/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage}"
+    url = f"{JUPITER_HOST_QUOTE}/v6/quote?inputMint={input_mint}&outputMint={output_mint}&amount={amount}&slippageBps={slippage}"
     headers = {"x-api-key": JUPITER_API_KEY}
-    
+
     return restClient.get(url, headers=headers)
+
+
+_USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+_DEFAULT_SLIPPAGE_BPS = 300   # 3% — reasonable for meme coins
+
+
+async def jupiter_quote_exit_price(
+    session: aiohttp.ClientSession,
+    input_mint: str,
+    quantity: float,
+    token_decimals: int = 6,
+    slippage_bps: int = _DEFAULT_SLIPPAGE_BPS,
+) -> Optional[float]:
+    """
+    Query Jupiter v6 for the effective USD exit price when selling `quantity` tokens.
+
+    Returns USD-per-token (i.e. the simulated fill price including AMM slippage),
+    or None if the quote fails. Used as the source-of-truth exit price for
+    strategies with use_real_exit_price=True.
+
+    The output mint is USDC so the quote reflects real on-chain liquidity.
+    """
+    amount = int(quantity * 10 ** token_decimals)
+    if amount <= 0:
+        return None
+    url = (
+        f"{JUPITER_HOST_QUOTE}/v6/quote"
+        f"?inputMint={input_mint}&outputMint={_USDC_MINT}"
+        f"&amount={amount}&slippageBps={slippage_bps}"
+    )
+    headers = {"x-api-key": JUPITER_API_KEY} if JUPITER_API_KEY else {}
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status != 200:
+                logger.warning("[JUPITER] Quote HTTP %d for %s", resp.status, input_mint)
+                return None
+            data = await resp.json()
+            out_amount = data.get("outAmount")
+            if out_amount is None:
+                return None
+            usdc_received = int(out_amount) / 1_000_000  # USDC has 6 decimals
+            return usdc_received / quantity
+    except Exception as exc:
+        logger.warning("[JUPITER] Quote failed for %s: %s", input_mint, exc)
+        return None
 
 def jupiter_swap_api(quote_response, wallet_id, prioritization_fee_lamports):
     url = f"{JUPITER_HOST}/v6/swap"
@@ -131,6 +182,42 @@ def solana_get_signature_statuses(signature):
     params = [[signature]]
 
     return solana_rpc_api("getSignatureStatuses", params)
+
+async def fetch_token_decimals_async(
+    session: aiohttp.ClientSession,
+    mint_address: str,
+    default: int = 6,
+) -> int:
+    """
+    Fetch SPL token decimals from Solana RPC getTokenSupply.
+
+    Returns `default` on any failure so callers never block on bad RPC responses.
+    Results should be cached by the caller — this makes one RPC call per invocation.
+    """
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTokenSupply",
+        "params": [mint_address],
+    }
+    try:
+        async with session.post(
+            SOLANA_RPC_URL,
+            json=body,
+            timeout=aiohttp.ClientTimeout(total=5),
+        ) as resp:
+            if resp.status != 200:
+                logger.warning("[DECIMALS] RPC HTTP %d for %s", resp.status, mint_address)
+                return default
+            data = await resp.json()
+            decimals = (data.get("result") or {}).get("value", {}).get("decimals")
+            if decimals is None:
+                return default
+            return int(decimals)
+    except Exception as exc:
+        logger.warning("[DECIMALS] Failed to fetch decimals for %s: %s", mint_address, exc)
+        return default
+
 
 def coin_gecko_price(ids="solana",vs_currencies="usd"):
     url = f"{COIN_GECKO_HOST}/api/v3/simple/price?ids={ids}&vs_currencies={vs_currencies}"

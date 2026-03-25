@@ -38,7 +38,6 @@ from trader.config import Config
 from trader.listener.client import TelegramListener
 from trader.persistence.database import TradeDatabase
 from trader.pricing.birdeye import BirdeyePriceClient
-from trader.pricing.moralis import MoralisOHLCVClient
 from trader.strategies.registry import build_runners
 from trader.trading.engine import MultiStrategyEngine
 from trader.trading.models import TokenSignal
@@ -79,11 +78,8 @@ async def run_live(cfg: Config) -> None:
 
     async with aiohttp.ClientSession() as http:
         birdeye  = BirdeyePriceClient(cfg=cfg, session=http)
-        moralis  = MoralisOHLCVClient(cfg=cfg, session=http) if cfg.moralis_api_key else None
-        if moralis:
-            logger.info("[MORALIS] High-res OHLCV enabled (10s candles + pair stats)")
         engine = MultiStrategyEngine(
-            cfg=cfg, runners=runners, birdeye_client=birdeye, db=db, moralis_client=moralis,
+            cfg=cfg, runners=runners, birdeye_client=birdeye, db=db, http_session=http,
         )
 
         async def consume_signals() -> None:
@@ -110,6 +106,7 @@ async def run_live(cfg: Config) -> None:
                 consume_signals(),
                 engine.monitor_positions(cycles=None),
                 listener.run_until_disconnected(),
+                engine.daily_report_loop(),
             )
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass

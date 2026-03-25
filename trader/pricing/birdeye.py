@@ -25,9 +25,10 @@ Swap point:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
-from typing import Optional
+from typing import Callable, Coroutine, Optional
 
 import aiohttp
 
@@ -239,8 +240,8 @@ class BirdeyePriceClient:
         return {m: None for m in mint_addresses}
 
     # Seconds per bar for each supported interval type.
-    # Birdeye's OHLCV endpoint minimum granularity is 1m — sub-minute
-    # intervals (1s, 5s, 15s, 30s) return 400 "type invalid format".
+    # Birdeye's v1 OHLCV endpoint minimum granularity is 1m.
+    # Sub-minute candles are available via the v3 endpoint (see get_ohlcv_v3).
     _INTERVAL_SECONDS: dict[str, int] = {
         "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
         "1h": 3600, "2h": 7200, "4h": 14400,
@@ -320,6 +321,85 @@ class BirdeyePriceClient:
             logger.warning("[OHLCV] HTTP error for %s: %s — skipping chart filter", mint_address, exc)
         except Exception as exc:
             logger.error("[OHLCV] Unexpected error for %s: %s", mint_address, exc)
+
+        return []
+
+    # Seconds per bar for sub-minute intervals supported by the v3 OHLCV endpoint.
+    # Data retention: 1s = 2 weeks, 15s/30s = 3 months.
+    _V3_INTERVAL_SECONDS: dict[str, int] = {"1s": 1, "15s": 15, "30s": 30}
+
+    async def get_ohlcv_v3(
+        self,
+        mint_address: str,
+        bars: int = 100,
+        interval: str = "15s",
+        time_to: Optional[int] = None,
+    ) -> list[OHLCVCandle]:
+        """
+        Fetch the last `bars` sub-minute OHLCV candles via Birdeye's v3 endpoint.
+
+        Replaces Moralis for sub-minute ML feature extraction (features 1-6).
+        Supported intervals: "1s" (2wk retention), "15s" (3mo retention),
+        "30s" (3mo retention).
+
+        Endpoint: GET /defi/v3/ohlcv
+        Response items have unix_time (not unixTime), o, h, l, c, v fields.
+
+        Returns an empty list on any error so callers can safely fall back to
+        neutral ML features rather than blocking the signal.
+        """
+        if time_to is None:
+            time_to = int(time.time())
+        secs = self._V3_INTERVAL_SECONDS.get(interval, 15)
+        time_from = time_to - (bars + 5) * secs
+        url = f"{self._cfg.birdeye_base_url}/defi/v3/ohlcv"
+        params = {
+            "address": mint_address,
+            "type": interval,
+            "time_from": time_from,
+            "time_to": time_to,
+        }
+
+        try:
+            async with self._session.get(
+                url,
+                headers=self._headers(),
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=self._cfg.request_timeout_seconds),
+            ) as resp:
+                if resp.status == 401:
+                    logger.warning("[OHLCVv3] 401 Unauthorized for %s — sub-minute features will be neutral", mint_address)
+                    return []
+                if resp.status == 429:
+                    logger.warning("[OHLCVv3] 429 rate limit for %s — sub-minute features will be neutral", mint_address)
+                    return []
+                if resp.status != 200:
+                    logger.warning("[OHLCVv3] HTTP %d for %s — sub-minute features will be neutral", resp.status, mint_address)
+                    return []
+
+                data = await resp.json()
+                items = (data.get("data") or {}).get("items") or []
+                candles = [
+                    OHLCVCandle(
+                        unix_time=int(item.get("unix_time", 0)),
+                        open=float(item.get("o", 0)),
+                        high=float(item.get("h", 0)),
+                        low=float(item.get("l", 0)),
+                        close=float(item.get("c", 0)),
+                        volume=float(item.get("v", 0)),
+                    )
+                    for item in items
+                    if item.get("l") is not None
+                ]
+                logger.debug("[OHLCVv3] %s — %d candles fetched (%s)", mint_address, len(candles), interval)
+                return candles[-bars:]
+
+        except asyncio.TimeoutError:
+            logger.warning("[OHLCVv3] Timeout for %s — sub-minute features will be neutral", mint_address)
+        except aiohttp.ClientError as exc:
+            logger.warning("[OHLCVv3] HTTP error for %s: %s — sub-minute features will be neutral", mint_address, exc)
+        except Exception as exc:
+            logger.error("[OHLCVv3] Unexpected error for %s: %s", mint_address, exc)
 
         return []
 
@@ -504,3 +584,91 @@ class BirdeyePriceClient:
             if len(mint_addresses) > 1:
                 await asyncio.sleep(1.0)
         return result
+
+
+# ---------------------------------------------------------------------------
+# WebSocket client — real-time price streaming
+# ---------------------------------------------------------------------------
+
+PriceCallback = Callable[[str, float], Coroutine]
+
+
+class BirdeyeWebSocketClient:
+    """
+    Birdeye WebSocket client for real-time token price streaming.
+
+    Replaces the REST polling loop in TradingEngine.monitor_positions_ws():
+        client = BirdeyeWebSocketClient(api_key)
+        asyncio.create_task(client.run())          # start connection loop
+        await client.subscribe(mint, callback)     # callback(mint, price) coroutine
+        await client.unsubscribe(mint)             # when position closes
+
+    Auto-reconnects on disconnect and re-subscribes all active mints.
+    Each price update is dispatched as a new asyncio task so slow callbacks
+    (e.g. Jupiter quote fetch) never block the WebSocket reader.
+    """
+
+    _WS_URL = "wss://public-api.birdeye.so/socket"
+    _RECONNECT_DELAY = 5.0
+
+    def __init__(self, api_key: str) -> None:
+        self._api_key = api_key
+        self._callbacks: dict[str, PriceCallback] = {}
+        self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
+
+    async def subscribe(self, mint: str, callback: PriceCallback) -> None:
+        """Subscribe to price updates for a mint. Safe to call before run()."""
+        self._callbacks[mint] = callback
+        if self._ws and not self._ws.closed:
+            await self._send_subscribe(mint)
+
+    async def unsubscribe(self, mint: str) -> None:
+        """Stop receiving price updates for a mint."""
+        self._callbacks.pop(mint, None)
+        if self._ws and not self._ws.closed:
+            await self._ws.send_json({"type": "UNSUBSCRIBE_PRICE", "data": {"address": mint}})
+
+    async def run(self) -> None:
+        """Maintain WebSocket connection. Run as an asyncio task."""
+        headers = {
+            "X-API-KEY": self._api_key,
+            "x-chain": "solana",
+        }
+        async with aiohttp.ClientSession() as session:
+            while True:
+                try:
+                    async with session.ws_connect(self._WS_URL, headers=headers, heartbeat=30) as ws:
+                        self._ws = ws
+                        logger.info("[WS] Birdeye WebSocket connected (%d subscriptions)", len(self._callbacks))
+                        for mint in list(self._callbacks):
+                            await self._send_subscribe(mint)
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                await self._dispatch(msg.data)
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                logger.warning("[WS] Birdeye WebSocket %s", msg.type.name)
+                                break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.error("[WS] Birdeye WebSocket error: %s — reconnecting in %.0fs", exc, self._RECONNECT_DELAY)
+                    await asyncio.sleep(self._RECONNECT_DELAY)
+
+    async def _send_subscribe(self, mint: str) -> None:
+        await self._ws.send_json({
+            "type": "SUBSCRIBE_PRICE",
+            "data": {"chartType": "1s", "address": mint, "currency": "usd"},
+        })
+
+    async def _dispatch(self, raw: str) -> None:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        if data.get("type") != "PRICE_DATA":
+            return
+        payload = data.get("data") or {}
+        mint: Optional[str] = payload.get("address")
+        value = payload.get("value")
+        if mint and value is not None and mint in self._callbacks:
+            asyncio.create_task(self._callbacks[mint](mint, float(value)))

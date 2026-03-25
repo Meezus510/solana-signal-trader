@@ -17,17 +17,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import sqlite3
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
+
+import aiohttp
 
 from trader.analysis.chart import OHLCV_BARS, compute_chart_context
 from trader.analysis.ml_scorer import (
     ChartMLScorer, ML_OHLCV_BARS, ML_OHLCV_INTERVAL,
-    MORALIS_OHLCV_BARS, MORALIS_OHLCV_INTERVAL,
+    SUBMINUTE_OHLCV_BARS, SUBMINUTE_OHLCV_INTERVAL,
+    FEATURE_NAMES,
 )
 from trader.config import Config
-from trader.pricing.birdeye import BirdeyePriceClient
-from trader.pricing.moralis import MoralisOHLCVClient
+from trader.pricing.birdeye import BirdeyePriceClient, BirdeyeWebSocketClient
+from trader.pricing.jupiter import fetch_token_decimals, jupiter_quote_exit_price
 from trader.trading.models import TokenSignal
 from trader.trading.strategy import StrategyRunner
 
@@ -59,13 +65,15 @@ class MultiStrategyEngine:
         runners: list[StrategyRunner],
         birdeye_client: BirdeyePriceClient,
         db=None,
-        moralis_client: MoralisOHLCVClient | None = None,
+        http_session: Optional[aiohttp.ClientSession] = None,
     ) -> None:
         self._cfg = cfg
         self._runners = runners
         self._birdeye = birdeye_client
-        self._moralis = moralis_client
         self._db = db
+        self._http_session = http_session
+        # mint → decimals — populated lazily after each buy via _fetch_and_cache_decimals
+        self._token_decimals_cache: dict[str, int] = {}
         # Mints currently awaiting reanalysis — prevents duplicate scheduling
         self._pending_reanalysis: set[str] = set()
         # "(mint:runner_name)" keys awaiting AI override re-check
@@ -73,9 +81,9 @@ class MultiStrategyEngine:
         # One ML scorer per unique training strategy, keyed by training strategy name.
         # Chart variants point to their base strategy so they train on unbiased data.
         self._ml_scorers: dict[str, ChartMLScorer] = {}
-        # Strategies that prefer Moralis 10s candles for KNN scoring (fast-scalp only).
+        # Strategies that use Birdeye v3 sub-minute candles for KNN scoring (fast-scalp only).
         # All others fall back to Birdeye 1m so features match their longer-horizon data.
-        self._ml_prefer_moralis: set[str] = set()
+        self._ml_use_subminute: set[str] = set()
         if db:
             for r in runners:
                 if r.cfg.save_chart_data:  # score whenever chart data is saved, even if filter is off
@@ -92,13 +100,13 @@ class MultiStrategyEngine:
                             feature_weights=list(r.cfg.ml_feature_weights)
                                 if r.cfg.ml_feature_weights else None,
                         )
-                    if r.cfg.ml_prefer_moralis:
-                        self._ml_prefer_moralis.add(scorer_key)
+                    if r.cfg.ml_use_subminute:
+                        self._ml_use_subminute.add(scorer_key)
         logger.info(
-            "[engine] Initialized — %d runner(s) | ml_scorers: %s | moralis_knn: %s",
+            "[engine] Initialized — %d runner(s) | ml_scorers: %s | subminute_knn: %s",
             len(self._runners),
             list(self._ml_scorers.keys()) or "none",
-            list(self._ml_prefer_moralis) or "none",
+            list(self._ml_use_subminute) or "none",
         )
         # Track strategy_config.json mtime for hot-reload
         self._config_mtime: float = self._get_config_mtime()
@@ -155,7 +163,7 @@ class MultiStrategyEngine:
 
         # Rebuild ML scorers to reflect any use_ml_filter or hyperparameter changes
         self._ml_scorers = {}
-        self._ml_prefer_moralis = set()
+        self._ml_use_subminute = set()
         if self._db:
             for r in self._runners:
                 if r.cfg.save_chart_data:  # score whenever chart data is saved, even if filter is off
@@ -172,8 +180,8 @@ class MultiStrategyEngine:
                             feature_weights=list(r.cfg.ml_feature_weights)
                                 if r.cfg.ml_feature_weights else None,
                         )
-                    if r.cfg.ml_prefer_moralis:
-                        self._ml_prefer_moralis.add(scorer_key)
+                    if r.cfg.ml_use_subminute:
+                        self._ml_use_subminute.add(scorer_key)
 
         logger.info(
             "[engine] Hot-reload complete — %d runner(s) active | ml_scorers: %s",
@@ -236,46 +244,43 @@ class MultiStrategyEngine:
                 )
 
         # ------------------------------------------------------------------
-        # ML candles — try Moralis (high-res) first, fall back to Birdeye.
-        # Any Moralis failure is caught silently; Birdeye is always the safety net.
-        # The interval/bars are controlled by MORALIS_OHLCV_INTERVAL /
-        # MORALIS_OHLCV_BARS in ml_scorer.py — change those constants to switch
-        # to any supported resolution (10s, 30s, 1min, etc.).
+        # ML candles — Birdeye v3 sub-minute (high-res) + Birdeye 1m (context).
+        # The interval/bars are controlled by SUBMINUTE_OHLCV_INTERVAL /
+        # SUBMINUTE_OHLCV_BARS in ml_scorer.py.
         # ------------------------------------------------------------------
         # Fetch ML candles for any runner that scores OR saves chart data.
         # Two separate sources are tracked for the dual-resolution feature vector:
-        #   moralis_candles — Moralis 10s (features 1-6, empty if Moralis fails)
-        #   candles         — Birdeye 1m (features 7-12, already fetched above)
+        #   subminute_candles — Birdeye v3 15s (features 1-6, empty on API failure)
+        #   candles           — Birdeye 1m (features 7-12, already fetched above)
         # ml_candles is the primary candle list stored in signal_charts.candles_json:
-        #   Moralis 10s when available, else Birdeye 1m as storage fallback.
+        #   Birdeye v3 15s when available, else Birdeye 1m as storage fallback.
         # ------------------------------------------------------------------
         needs_ml_candles = self._ml_scorers or any(r.cfg.save_chart_data for r in self._runners)
-        moralis_candles = []   # raw Moralis 10s (may be empty — used for features 1-6)
-        ml_candles      = []   # primary storage candles (Moralis 10s or Birdeye 1m fallback)
-        ml_source       = "none"
+        subminute_candles = []   # Birdeye v3 15s (may be empty — used for features 1-6)
+        candles_1s        = []   # Birdeye v3 1s  (stored only — 2wk retention)
+        ml_candles        = []   # primary storage candles (15s or Birdeye 1m fallback)
+        ml_source         = "none"
         if needs_ml_candles:
-            if self._moralis:
-                try:
-                    moralis_candles = await self._moralis.get_ohlcv(
-                        signal.mint_address,
-                        bars=MORALIS_OHLCV_BARS,
-                        interval=MORALIS_OHLCV_INTERVAL,
-                    )
-                    if moralis_candles:
-                        ml_candles = moralis_candles
-                        ml_source  = f"moralis/{MORALIS_OHLCV_INTERVAL}"
-                    else:
-                        logger.warning(
-                            "[ML] Moralis returned no candles for %s — 10s features will be neutral",
-                            signal.symbol,
-                        )
-                except Exception as exc:
-                    logger.warning(
-                        "[ML] Moralis OHLCV error for %s — 10s features will be neutral: %s",
-                        signal.symbol, exc,
-                    )
-
-            if not ml_candles:
+            subminute_candles, candles_1s = await asyncio.gather(
+                self._birdeye.get_ohlcv_v3(
+                    signal.mint_address,
+                    bars=SUBMINUTE_OHLCV_BARS,
+                    interval=SUBMINUTE_OHLCV_INTERVAL,
+                ),
+                self._birdeye.get_ohlcv_v3(
+                    signal.mint_address,
+                    bars=60,
+                    interval="1s",
+                ),
+            )
+            if subminute_candles:
+                ml_candles = subminute_candles
+                ml_source  = f"birdeye_v3/{SUBMINUTE_OHLCV_INTERVAL}"
+            else:
+                logger.warning(
+                    "[ML] Birdeye v3 returned no candles for %s — sub-minute features will be neutral",
+                    signal.symbol,
+                )
                 # Storage fallback only — Birdeye 1m is also used as features 7-12,
                 # so no separate fetch is needed; `candles` already has 1m data.
                 if candles:
@@ -284,15 +289,8 @@ class MultiStrategyEngine:
                 else:
                     logger.warning("[ML] No candles available for %s", signal.symbol)
 
-        # Moralis pair stats — completely optional, never blocks scoring.
-        pair_stats = None
-        if needs_ml_candles and self._moralis:
-            try:
-                pair_stats = await self._moralis.get_pair_stats(signal.mint_address)
-                if pair_stats is None:
-                    logger.warning("[ML] Moralis pair stats returned nothing for %s", signal.symbol)
-            except Exception as exc:
-                logger.warning("[ML] Moralis pair stats error for %s: %s", signal.symbol, exc)
+        # pair_stats starts empty; Birdeye token overview is merged in below.
+        pair_stats: dict | None = {}
 
         # Birdeye token overview — market cap, absolute liquidity, holder count,
         # wallet activity (5m and 30m), and total supply for concentration calc.
@@ -338,18 +336,19 @@ class MultiStrategyEngine:
         # Chart variants train on their base strategy's unfiltered outcomes.
         #
         # Dual-resolution scoring:
-        #   ml_prefer_moralis=True  (quick_pop) → candles_10s=moralis_candles (may be []),
-        #                                          candles_1m=candles (Birdeye 1m, always).
-        #   ml_prefer_moralis=False (trend/moonbag) → candles_10s=[], candles_1m=candles.
+        #   ml_use_subminute=True  (quick_pop) → candles_15s=subminute_candles (may be []),
+        #                                         candles_1m=candles (Birdeye 1m, always).
+        #   ml_use_subminute=False (trend/moonbag) → candles_15s=[], candles_1m=candles.
         ml_scores: dict[str, float | None] = {}
-        if self._ml_scorers and (moralis_candles or candles):
+        if self._ml_scorers and (subminute_candles or candles):
             for scorer_key, scorer in self._ml_scorers.items():
-                use_moralis = scorer_key in self._ml_prefer_moralis
-                score_10s   = moralis_candles if use_moralis else []
-                score_1m    = candles or None
+                use_subminute = scorer_key in self._ml_use_subminute
+                score_15s     = subminute_candles if use_subminute else []
+                score_1m      = candles or None
                 score = scorer.score(
-                    score_10s,
+                    score_15s,
                     candles_1m=score_1m,
+                    candles_1s=candles_1s if use_subminute else None,
                     chart_ctx=chart_ctx,
                     pair_stats=pair_stats,
                     source_channel=signal.source_channel,
@@ -357,8 +356,8 @@ class MultiStrategyEngine:
                 ml_scores[scorer_key] = score
                 if score is not None:
                     knn_src = (
-                        f"dual(moralis/{MORALIS_OHLCV_INTERVAL}+birdeye/1m)"
-                        if use_moralis else "birdeye/1m"
+                        f"triple(birdeye_v3/1s+birdeye_v3/{SUBMINUTE_OHLCV_INTERVAL}+birdeye/1m)"
+                        if use_subminute else "birdeye/1m"
                     )
                     training_name = scorer_key.split("::")[0]
                     logger.info(
@@ -382,6 +381,7 @@ class MultiStrategyEngine:
                 ml_score=chart_ml_score,
                 pair_stats=pair_stats,
                 candles_1m=candles if candles else None,
+                candles_1s=candles_1s if candles_1s else None,
                 source_channel=signal.source_channel,
             )
 
@@ -461,8 +461,8 @@ class MultiStrategyEngine:
                 signal_context = {
                     "ml_score":              ml_score,
                     "ml_min_score":          runner.cfg.ml_min_score,
-                    "used_moralis_10s":      ml_source.startswith("moralis"),
-                    "used_birdeye_fallback": ml_source.startswith("birdeye"),
+                    "used_subminute_v3":     ml_source.startswith("birdeye_v3"),
+                    "used_birdeye_fallback": ml_source.startswith("birdeye/1m"),
                     "pair_stats_available":  pair_stats is not None,
                     # liquidity_usd / slippage_bps not yet in pair_stats — pass None
                     # so the policy agent skips hard-floor checks for unknown values.
@@ -533,6 +533,8 @@ class MultiStrategyEngine:
             if not effective_blocked:
                 try:
                     position = runner.enter_position(signal, entry_price, chart_ctx, buy_size_override)
+                    if position is not None:
+                        asyncio.create_task(self._fetch_and_cache_decimals(signal.mint_address))
                 except Exception:
                     logger.exception(
                         "[ERROR] %s: enter_position failed for %s", runner.name, signal.symbol
@@ -624,6 +626,7 @@ class MultiStrategyEngine:
                         if _ai_decision["override"]:
                             position = runner.enter_position(signal, entry_price, None, buy_size_override)
                             if position is not None:
+                                asyncio.create_task(self._fetch_and_cache_decimals(signal.mint_address))
                                 _ai_overrode = True
                                 signal_log.info(
                                     "AI_OVERRIDE_BUY | %-10s | %-44s | skip_was=%-10s | %s",
@@ -765,7 +768,9 @@ class MultiStrategyEngine:
             if not (runner.cfg.use_chart_filter and runner.cfg.use_reanalyze):
                 continue
             try:
-                runner.enter_position(signal, entry_price, ctx)
+                pos = runner.enter_position(signal, entry_price, ctx)
+                if pos is not None:
+                    asyncio.create_task(self._fetch_and_cache_decimals(signal.mint_address))
             except Exception:
                 logger.exception(
                     "[ERROR] %s: reanalysis enter_position failed for %s",
@@ -804,18 +809,15 @@ class MultiStrategyEngine:
         candles = await self._birdeye.get_ohlcv(signal.mint_address, bars=OHLCV_BARS)
         chart_ctx = compute_chart_context(candles, entry_price)
 
+        subminute_candles = await self._birdeye.get_ohlcv_v3(
+            signal.mint_address, bars=SUBMINUTE_OHLCV_BARS, interval=SUBMINUTE_OHLCV_INTERVAL,
+        )
         ml_candles: list = []
         ml_source = "none"
-        if self._moralis:
-            try:
-                ml_candles = await self._moralis.get_ohlcv(
-                    signal.mint_address, bars=MORALIS_OHLCV_BARS, interval=MORALIS_OHLCV_INTERVAL,
-                )
-                if ml_candles:
-                    ml_source = f"moralis/{MORALIS_OHLCV_INTERVAL}"
-            except Exception:
-                pass
-        if not ml_candles:
+        if subminute_candles:
+            ml_candles = subminute_candles
+            ml_source = f"birdeye_v3/{SUBMINUTE_OHLCV_INTERVAL}"
+        else:
             try:
                 ml_candles = await self._birdeye.get_ohlcv(
                     signal.mint_address, bars=ML_OHLCV_BARS, interval=ML_OHLCV_INTERVAL,
@@ -825,19 +827,14 @@ class MultiStrategyEngine:
             except Exception:
                 pass
 
-        pair_stats = None
-        if self._moralis:
-            try:
-                pair_stats = await self._moralis.get_pair_stats(signal.mint_address)
-            except Exception:
-                pass
+        pair_stats: dict | None = {}
 
         training_strategy = runner.cfg.ml_training_strategy or runner.cfg.name
         scorer_key = f"{training_strategy}::{runner.cfg.ml_training_label}"
         ml_score = None
         if scorer_key in self._ml_scorers and ml_candles:
-            use_moralis = scorer_key in self._ml_prefer_moralis
-            score_candles = ml_candles if use_moralis else (candles or ml_candles)
+            use_subminute = scorer_key in self._ml_use_subminute
+            score_candles = subminute_candles if use_subminute else (candles or ml_candles)
             ml_score = self._ml_scorers[scorer_key].score(
                 score_candles, chart_ctx=chart_ctx, pair_stats=pair_stats,
                 source_channel=signal.source_channel,
@@ -959,8 +956,136 @@ class MultiStrategyEngine:
             )
 
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Token decimals cache
+    # ------------------------------------------------------------------
+
+    async def _fetch_and_cache_decimals(self, mint: str) -> None:
+        """
+        Fetch SPL token decimals from Solana RPC and store in cache + all open positions.
+
+        Runs as a fire-and-forget task after every successful enter_position so the
+        Jupiter quote in monitor_positions_ws always has the correct base-unit amount.
+        """
+        if not self._http_session or mint in self._token_decimals_cache:
+            return
+        decimals = await fetch_token_decimals(self._http_session, mint)
+        self._token_decimals_cache[mint] = decimals
+        # Propagate to any open positions with this mint
+        for runner in self._runners:
+            pos = runner.get_position(mint)
+            if pos is not None and pos.status == "OPEN":
+                pos.token_decimals = decimals
+        logger.info("[DECIMALS] %s → %d decimals (cached)", mint, decimals)
+
+    # ------------------------------------------------------------------
     # Monitoring loop
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _would_exit(pos, price: float) -> bool:
+        """Quick check: would this price trigger a price-driven exit in evaluate_position?"""
+        current_stop = (
+            pos.trailing_stop_price
+            if pos.trailing_active and pos.trailing_stop_price is not None
+            else pos.stop_loss_price
+        )
+        return price <= current_stop or price >= pos.take_profit_price
+
+    async def monitor_positions_ws(self, cycles: Optional[int] = None) -> None:
+        """
+        WebSocket-based monitoring loop for production-accurate exit simulation.
+
+        Replaces the REST polling loop for strategies with use_real_exit_price=True.
+        Price updates are pushed by Birdeye WebSocket (sub-second latency) instead
+        of being polled every second.  When a price-triggered exit fires, a Jupiter
+        v6 quote is fetched first and used as the execution price, reflecting real
+        AMM slippage and on-chain liquidity depth.
+
+        All other strategies share the same WebSocket price feed but continue to
+        execute at the raw Birdeye price (exit_quote_price=None).
+
+        Subscription management runs in a 1s background loop — subscriptions are
+        added when new positions open and removed when all runners have exited a mint.
+        """
+        if self._cfg.dry_run:
+            logger.info("[DRY_RUN] WebSocket monitor disabled — outcomes simulated by price_history.py")
+            return
+
+        ws_client = BirdeyeWebSocketClient(self._cfg.birdeye_api_key)
+        subscribed_mints: set[str] = set()
+
+        async def on_price(mint: str, price: float) -> None:
+            for runner in self._runners:
+                pos = runner.get_position(mint)
+                if pos is None or pos.status == "CLOSED":
+                    continue
+                pos.last_price = price
+                logger.info(
+                    "[WS_PRICE] [%-12s] %-10s | $%.8f | tp=$%.8f | sl=$%.8f",
+                    runner.name, pos.symbol, price,
+                    pos.take_profit_price, pos.stop_loss_price,
+                )
+
+                exit_quote_price: Optional[float] = None
+                if (
+                    runner.cfg.use_real_exit_price
+                    and self._http_session
+                    and self._would_exit(pos, price)
+                ):
+                    exit_quote_price = await jupiter_quote_exit_price(
+                        self._http_session,
+                        pos.mint_address,
+                        pos.remaining_quantity,
+                        pos.token_decimals,
+                    )
+                    if exit_quote_price is not None:
+                        logger.info(
+                            "[JUPITER] %-10s jupiter=$%.8f  market=$%.8f  diff=%+.2f%%",
+                            pos.symbol, exit_quote_price, price,
+                            (exit_quote_price / price - 1) * 100,
+                        )
+
+                try:
+                    runner.evaluate_position(pos, price, exit_quote_price=exit_quote_price)
+                except Exception:
+                    logger.exception(
+                        "[ERROR] %s: evaluate_position failed for %s", runner.name, pos.symbol
+                    )
+
+        ws_task = asyncio.create_task(ws_client.run())
+        mode = f"{cycles} cycles" if cycles is not None else "live (∞)"
+        logger.info("[WS_MONITOR] Starting | strategies=%d | mode=%s", len(self._runners), mode)
+
+        tick = 0
+        try:
+            while cycles is None or tick < cycles:
+                tick += 1
+
+                current_mints: set[str] = set()
+                for runner in self._runners:
+                    for pos in runner.get_open_positions():
+                        current_mints.add(pos.mint_address)
+
+                for mint in current_mints - subscribed_mints:
+                    await ws_client.subscribe(mint, on_price)
+                    subscribed_mints.add(mint)
+                    logger.info("[WS_MONITOR] Subscribed %s", mint)
+
+                for mint in subscribed_mints - current_mints:
+                    await ws_client.unsubscribe(mint)
+                    subscribed_mints.discard(mint)
+                    logger.info("[WS_MONITOR] Unsubscribed %s", mint)
+
+                await asyncio.sleep(1.0)
+        finally:
+            ws_task.cancel()
+            try:
+                await ws_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("[WS_MONITOR] Complete after %d ticks", tick)
+            self.print_summary()
 
     async def monitor_positions(self, cycles: Optional[int] = None) -> None:
         """
@@ -1023,8 +1148,30 @@ class MultiStrategyEngine:
                         f" | trail_stop=${pos.trailing_stop_price:.8f}" if pos.trailing_stop_price else "",
                     )
 
+                    # For strategies with use_real_exit_price, fetch a Jupiter
+                    # quote when a price-driven exit is about to fire so the
+                    # execution price reflects real AMM slippage.
+                    exit_quote_price: Optional[float] = None
+                    if (
+                        runner.cfg.use_real_exit_price
+                        and self._http_session
+                        and self._would_exit(pos, price)
+                    ):
+                        exit_quote_price = await jupiter_quote_exit_price(
+                            self._http_session,
+                            pos.mint_address,
+                            pos.remaining_quantity,
+                            pos.token_decimals,
+                        )
+                        if exit_quote_price is not None:
+                            logger.info(
+                                "[JUPITER] %-10s jupiter=$%.8f  market=$%.8f  diff=%+.2f%%",
+                                pos.symbol, exit_quote_price, price,
+                                (exit_quote_price / price - 1) * 100,
+                            )
+
                     try:
-                        runner.evaluate_position(pos, price)
+                        runner.evaluate_position(pos, price, exit_quote_price=exit_quote_price)
                     except Exception:
                         logger.exception(
                             "[ERROR] %s: evaluate_position failed for %s",
@@ -1136,3 +1283,317 @@ class MultiStrategyEngine:
                 logger.info("  Total unrealized PnL   : $%+.4f", b_unrealized)
                 logger.info("  Total net PnL          : $%+.4f  (%+.2f%%)", b_net, b_net_pct)
                 logger.info(sep)
+
+    # ------------------------------------------------------------------
+    # Daily report
+    # ------------------------------------------------------------------
+
+    _SOL_MINT = "So11111111111111111111111111111111111111112"
+    _AI_START  = 1000.0
+    _AI_TARGET = 300.0
+    _AI_DEADLINE = "2026-04-10"
+    _SEP = "=" * 72
+
+    async def _fetch_sol_price(self) -> Optional[float]:
+        """Fetch current SOL/USD price from Birdeye. Returns None on any failure."""
+        api_key = self._cfg.birdeye_api_key
+        url     = f"{self._cfg.birdeye_base_url}/defi/price?address={self._SOL_MINT}"
+        headers = {"X-API-KEY": api_key, "x-chain": "solana", "accept": "application/json"}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get("data", {}).get("value")
+        except Exception:
+            logger.debug("[DAILY_REPORT] SOL price fetch failed", exc_info=True)
+        return None
+
+    async def _send_telegram_report(self, text: str) -> None:
+        """Send report to Telegram bot if TG_BOT_TOKEN + TG_REPORT_CHAT_ID are set."""
+        bot_token = os.getenv("TG_BOT_TOKEN", "").strip()
+        chat_id   = os.getenv("TG_REPORT_CHAT_ID", "").strip()
+        if not bot_token or not chat_id:
+            return
+        url   = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        chunk = 4000
+        parts = [text[i : i + chunk] for i in range(0, len(text), chunk)]
+        try:
+            async with aiohttp.ClientSession() as session:
+                for part in parts:
+                    payload = {"chat_id": chat_id, "text": part}
+                    async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status != 200:
+                            body = await resp.text()
+                            logger.warning("[DAILY_REPORT] Telegram send failed %d: %s", resp.status, body)
+        except Exception:
+            logger.warning("[DAILY_REPORT] Telegram send error", exc_info=True)
+
+    def _build_daily_report(self, date_str: str, sol_price: Optional[float]) -> str:
+        """
+        Build the full daily report string. Reads the DB directly via a
+        read-only SQLite connection (WAL mode — safe while the bot is running).
+        """
+        if self._db is None:
+            return "[DAILY_REPORT] No database available."
+
+        db_path = self._db.path
+        conn = sqlite3.connect(f"file:{Path(db_path).resolve()}?mode=ro", uri=True)
+
+        date_end = (
+            datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc) + timedelta(days=1)
+        ).strftime("%Y-%m-%d")
+
+        # ── Closed positions today ─────────────────────────────────────
+        rows = conn.execute(
+            """
+            SELECT so.strategy, sc.symbol, sc.entry_price,
+                   so.outcome_pnl_pct, so.outcome_pnl_usd,
+                   so.outcome_sell_reason, so.outcome_hold_secs,
+                   sc.peak_pnl_pct, so.is_live
+              FROM strategy_outcomes so
+              JOIN signal_charts sc ON sc.id = so.signal_chart_id
+             WHERE so.entered = 1 AND so.closed = 1
+               AND so.outcome_pnl_pct IS NOT NULL
+               AND sc.ts >= ? AND sc.ts < ?
+             ORDER BY so.strategy, sc.ts
+            """,
+            (date_str, date_end),
+        ).fetchall()
+
+        # ── Per-strategy daily totals ──────────────────────────────────
+        totals = conn.execute(
+            """
+            SELECT so.strategy,
+                   COUNT(*),
+                   SUM(CASE WHEN so.outcome_pnl_pct > 0 THEN 1 ELSE 0 END),
+                   SUM(CASE WHEN so.outcome_pnl_pct <= 0 THEN 1 ELSE 0 END),
+                   ROUND(AVG(so.outcome_pnl_pct), 2),
+                   COALESCE(SUM(so.outcome_pnl_usd), 0.0),
+                   SUM(CASE WHEN so.is_live = 1 THEN 1 ELSE 0 END)
+              FROM strategy_outcomes so
+              JOIN signal_charts sc ON sc.id = so.signal_chart_id
+             WHERE so.entered = 1 AND so.closed = 1
+               AND so.outcome_pnl_pct IS NOT NULL
+               AND sc.ts >= ? AND sc.ts < ?
+             GROUP BY so.strategy ORDER BY so.strategy
+            """,
+            (date_str, date_end),
+        ).fetchall()
+
+        # ── Grand daily total ──────────────────────────────────────────
+        grand = conn.execute(
+            """
+            SELECT COUNT(*),
+                   SUM(CASE WHEN so.outcome_pnl_pct > 0 THEN 1 ELSE 0 END),
+                   ROUND(AVG(so.outcome_pnl_pct), 2),
+                   COALESCE(SUM(so.outcome_pnl_usd), 0.0)
+              FROM strategy_outcomes so
+              JOIN signal_charts sc ON sc.id = so.signal_chart_id
+             WHERE so.entered = 1 AND so.closed = 1
+               AND so.outcome_pnl_pct IS NOT NULL
+               AND sc.ts >= ? AND sc.ts < ?
+            """,
+            (date_str, date_end),
+        ).fetchone()
+
+        # ── Open position counts ───────────────────────────────────────
+        open_counts = {
+            r[0]: r[1]
+            for r in conn.execute(
+                "SELECT so.strategy, COUNT(*) FROM strategy_outcomes so"
+                " WHERE so.entered=1 AND so.closed=0 GROUP BY so.strategy"
+            ).fetchall()
+        }
+
+        # ── AI balance (live trades only) ──────────────────────────────
+        ai_pnl = conn.execute(
+            """
+            SELECT COALESCE(SUM(outcome_pnl_usd), 0.0)
+              FROM strategy_outcomes
+             WHERE is_live=1 AND closed=1 AND entered=1
+               AND outcome_pnl_usd IS NOT NULL
+            """
+        ).fetchone()[0]
+
+        live_strats = [
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT strategy FROM strategy_outcomes WHERE is_live=1 AND entered=1"
+            ).fetchall()
+        ]
+
+        conn.close()
+
+        lines: list[str] = []
+        SEP = self._SEP
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        sol_str = f"   SOL: ${sol_price:,.2f}" if sol_price else ""
+
+        # ── Header ──────────────────────────────────────────────────────
+        lines += [SEP,
+                  f"  DAILY REPORT  —  {date_str} (UTC)",
+                  f"  Generated:  {now_str}{sol_str}",
+                  SEP, ""]
+
+        # ── AI balance ──────────────────────────────────────────────────
+        balance = self._AI_START + ai_pnl
+        needed  = max(0.0, self._AI_TARGET - ai_pnl)
+        pct     = (ai_pnl / self._AI_TARGET * 100) if self._AI_TARGET else 0.0
+        lines += [SEP, "  AI BALANCE", SEP,
+                  f"  Balance:       ${balance:.2f}  (started at ${self._AI_START:.2f})",
+                  f"  Profit so far: ${ai_pnl:+.2f}",
+                  f"  Target:        ${self._AI_TARGET:.2f} by {self._AI_DEADLINE}",
+                  f"  Still needed:  ${needed:.2f}  ({pct:.1f}% of target reached)",
+                  f"  Live strats:   {', '.join(live_strats) if live_strats else 'none (paper trading)'}",
+                  SEP, ""]
+
+        # ── In-memory open positions (from runners) ────────────────────
+        lines += [SEP, "  OPEN POSITIONS  (in-memory, last known price)", SEP]
+        any_open = False
+        for runner in self._runners:
+            open_pos = runner.get_open_positions()
+            if not open_pos:
+                continue
+            any_open = True
+            lines.append(f"\n  [{runner.name}]")
+            for pos in open_pos:
+                unreal = 0.0
+                if pos.last_price:
+                    unreal = (pos.last_price - pos.entry_price) * pos.remaining_quantity
+                lines.append(
+                    f"    {str(pos.symbol):<10}  entry=${pos.entry_price:.8f}"
+                    f"  last=${pos.last_price or 0:.8f}"
+                    f"  unrealized=${unreal:+.2f}"
+                    f"  trail={'Y' if pos.trailing_active else 'N'}"
+                )
+        if not any_open:
+            lines.append("  (no open positions)")
+        lines.append("")
+
+        # ── Closed positions today ─────────────────────────────────────
+        lines += [SEP, f"  CLOSED POSITIONS  —  {date_str}", SEP]
+        if not rows:
+            lines.append("  (none closed today)")
+        else:
+            cur_strat = None
+            for strategy, symbol, entry_price, pnl_pct, pnl_usd, reason, hold_secs, peak_pct, is_live in rows:
+                if strategy != cur_strat:
+                    cur_strat = strategy
+                    lines.append(f"\n  [{strategy}]")
+                hold_str = f"{hold_secs/60:.0f}m" if hold_secs else "—"
+                peak_str = f"peak={peak_pct:+.1f}%" if peak_pct is not None else ""
+                usd_str  = f"${pnl_usd:+.2f}" if pnl_usd is not None else "n/a"
+                live_tag = " [LIVE]" if is_live else ""
+                lines.append(
+                    f"    {str(symbol):<10}  entry={entry_price:.8f}"
+                    f"  pnl={pnl_pct:+.1f}% ({usd_str})"
+                    f"  exit={str(reason or '—'):<12}  hold={hold_str:<6}  {peak_str}{live_tag}"
+                )
+        lines.append("")
+
+        # ── Daily summary by strategy ──────────────────────────────────
+        if totals:
+            lines += [SEP, f"  DAILY SUMMARY BY STRATEGY  —  {date_str}", SEP]
+            for strategy, total, wins, losses, avg_pnl, total_usd, live_count in totals:
+                win_rate   = (wins / total * 100) if total else 0.0
+                still_open = open_counts.get(strategy, 0)
+                live_tag   = f"  live={live_count}" if live_count else ""
+                lines.append(
+                    f"  [{strategy:<28}]"
+                    f"  closed={total:>3}  open={still_open:>3}"
+                    f"  W/L={wins}/{losses}  win%={win_rate:>5.1f}"
+                    f"  avg={avg_pnl:>+6.1f}%  realized={total_usd:>+8.2f}{live_tag}"
+                )
+            total_count, total_wins, avg_pnl, total_usd = grand
+            total_losses   = (total_count or 0) - (total_wins or 0)
+            total_win_rate = (total_wins / total_count * 100) if total_count else 0.0
+            lines += [SEP,
+                      f"  {'DAILY TOTAL':<30}"
+                      f"  closed={total_count:>3}"
+                      f"  W/L={total_wins}/{total_losses}  win%={total_win_rate:>5.1f}"
+                      f"  avg={avg_pnl:>+6.1f}%  realized={total_usd:>+8.2f}",
+                      SEP, ""]
+
+        # ── ML model weights ───────────────────────────────────────────
+        ml_runners = [r for r in self._runners if r.cfg.ml_feature_weights]
+        if ml_runners:
+            lines += [SEP, "  ML MODEL WEIGHTS  (non-zero features)", SEP]
+            seen_keys: set[str] = set()
+            for runner in ml_runners:
+                training = runner.cfg.ml_training_strategy or runner.cfg.name
+                label    = runner.cfg.ml_training_label
+                key      = f"{training}::{label}"
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+
+                scorer    = self._ml_scorers.get(key)
+                n_samples = "?" if scorer is None else "?"
+                # Get training sample count from DB
+                try:
+                    c2 = sqlite3.connect(f"file:{Path(db_path).resolve()}?mode=ro", uri=True)
+                    n_samples = c2.execute(
+                        "SELECT COUNT(*) FROM strategy_outcomes"
+                        " WHERE strategy=? AND entered=1 AND closed=1 AND outcome_pnl_pct IS NOT NULL",
+                        (training,),
+                    ).fetchone()[0]
+                    c2.close()
+                except Exception:
+                    n_samples = "?"
+
+                weights = list(runner.cfg.ml_feature_weights)
+                lines.append(
+                    f"\n  [{runner.name}]"
+                    f"  training={training}  label={label}"
+                    f"  k={runner.cfg.ml_k}  halflife={runner.cfg.ml_halflife_days}d"
+                    f"  score=[{runner.cfg.ml_score_low_pct:.0f}%→{runner.cfg.ml_score_high_pct:.0f}%]"
+                    f"  min_score={runner.cfg.ml_min_score}"
+                    f"  samples={n_samples}"
+                )
+                non_zero = [(i, w) for i, w in enumerate(weights) if w != 0.0]
+                for i, w in non_zero:
+                    name = FEATURE_NAMES[i] if i < len(FEATURE_NAMES) else f"feat_{i}"
+                    lines.append(f"    [{i:>2}] {name:<28}  {w:.3f}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    async def daily_report_loop(self, report_hour_utc: int = 8) -> None:
+        """
+        Coroutine that fires a daily report at report_hour_utc (UTC, default 08:00).
+
+        Safe to run inside asyncio.gather alongside signal handling and position
+        monitoring — exceptions are caught internally and never propagate to the
+        caller, so a report failure cannot crash the bot.
+        """
+        while True:
+            now      = datetime.now(timezone.utc)
+            next_run = now.replace(hour=report_hour_utc, minute=0, second=0, microsecond=0)
+            if now >= next_run:
+                next_run += timedelta(days=1)
+            sleep_secs = (next_run - now).total_seconds()
+            logger.info(
+                "[DAILY_REPORT] Next report scheduled at %s UTC (%.1f h from now)",
+                next_run.strftime("%Y-%m-%d %H:%M"),
+                sleep_secs / 3600,
+            )
+            await asyncio.sleep(sleep_secs)
+
+            date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            try:
+                sol_price = await self._fetch_sol_price()
+                report    = self._build_daily_report(date_str, sol_price)
+
+                # Save to reports/YYYY-MM-DD.txt
+                reports_dir = Path(self._db.path).parent / "reports"
+                reports_dir.mkdir(exist_ok=True)
+                report_file = reports_dir / f"{date_str}.txt"
+                report_file.write_text(report, encoding="utf-8")
+                logger.info("[DAILY_REPORT] Saved to %s", report_file)
+
+                for line in report.splitlines():
+                    logger.info("%s", line)
+                await self._send_telegram_report(report)
+            except Exception:
+                logger.exception("[DAILY_REPORT] Failed to generate report for %s", date_str)

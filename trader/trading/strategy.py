@@ -115,6 +115,12 @@ class StrategyConfig:
     use_ml_filter: bool = False
     ml_min_score: float = 5.0
 
+    # Hard pre-filter: block signals where wallet_momentum_5m >= this value.
+    # wallet_momentum = unique_wallet_5m / unique_wallet_hist_5m; >1 means wallet
+    # count is growing fast (already pumping). None = disabled.
+    # LOO analysis: threshold=2.102 blocks 9/134 losers with 0 winner misses.
+    ml_wallet_momentum_max: Optional[float] = None
+
     # High-confidence size multiplier — when score >= ml_high_score_threshold,
     # buy size is scaled by ml_size_multiplier (e.g. 2× the normal position).
     # Only applied when use_ml_filter=True.
@@ -140,11 +146,11 @@ class StrategyConfig:
     # rather than "did our exit happen to be profitable?"
     ml_training_label: str = "outcome_pnl_pct"
 
-    # When True, the KNN scorer uses Moralis 10s candles (if available) instead
+    # When True, the KNN scorer uses Birdeye v3 sub-minute candles (15s) instead
     # of Birdeye 1m.  Enable only for fast-scalp strategies (quick_pop) where
     # short-term pump shape matters most.  Trend/moonbag strategies should leave
     # this False — their longer horizon is better captured by 1m candles.
-    ml_prefer_moralis: bool = False
+    ml_use_subminute: bool = False
 
     # KNN algorithm hyperparameters — tunable by the strategy agent.
     # ml_k: number of nearest neighbours (higher = smoother, slower to adapt)
@@ -188,6 +194,12 @@ class StrategyConfig:
     # Decisions are recorded as SHADOW_OVERRIDE / SHADOW_REJECT / SHADOW_REANALYZE
     # in ai_override_decisions so you can evaluate agent quality before enabling it.
     use_ai_override_shadow: bool = False
+
+    # When True, price-triggered exits (SL and TP) use a Jupiter v6 quote as the
+    # execution price instead of the raw Birdeye price.  The quote reflects real
+    # AMM slippage and liquidity depth — the most production-accurate simulation.
+    # Requires the engine to be started with monitor_positions_ws() and an http session.
+    use_real_exit_price: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +406,12 @@ class StrategyRunner:
     # Strategy evaluation
     # ------------------------------------------------------------------
 
-    def evaluate_position(self, position: Position, current_price: float) -> None:
+    def evaluate_position(
+        self,
+        position: Position,
+        current_price: float,
+        exit_quote_price: Optional[float] = None,
+    ) -> None:
         """
         Standard evaluation used by quick_pop and trend_rider.
 
@@ -404,6 +421,11 @@ class StrategyRunner:
         Key ordering rule: check existing stop BEFORE updating the trailing
         stop, so that same-tick trailing tightening cannot cause same-tick
         unexpected exits. TPs are processed first, trailing state updated after.
+
+        exit_quote_price — when provided (Jupiter v6 quote), price-triggered exits
+            (SL and TP) execute at this price instead of current_price, reflecting
+            real AMM slippage. Time-based exits (TIMEOUT, MAX_HOLD) always use
+            current_price since no trigger order would be in effect.
         """
         if position.status == "CLOSED":
             return
@@ -432,14 +454,15 @@ class StrategyRunner:
         )
         if current_price <= current_stop:
             reason = "TRAILING_STOP" if position.trailing_active else "STOP_LOSS"
+            exec_price = exit_quote_price if exit_quote_price is not None else current_price
             logger.info(
-                "[%s] [%s] %s | price=$%.8f | stop=$%.8f",
-                self.name, reason, position.symbol, current_price, current_stop,
+                "[%s] [%s] %s | market=$%.8f | exec=$%.8f | stop=$%.8f",
+                self.name, reason, position.symbol, current_price, exec_price, current_stop,
             )
-            self._close_position(position, current_price, reason, now)
+            self._close_position(position, exec_price, reason, now)
             return
 
-        # 3. Max hold (unconditional)
+        # 3. Max hold (unconditional — time-based, no trigger order, use market price)
         if cfg.max_hold_minutes is not None and age_minutes >= cfg.max_hold_minutes:
             logger.info(
                 "[%s] [MAX_HOLD] %s | age=%.0fmin >= %.0fmin",
@@ -448,7 +471,7 @@ class StrategyRunner:
             self._close_position(position, current_price, "MAX_HOLD", now)
             return
 
-        # 4. Timeout (position not gaining enough)
+        # 4. Timeout (position not gaining enough — time-based, use market price)
         if (
             cfg.timeout_minutes is not None
             and age_minutes >= cfg.timeout_minutes
@@ -467,6 +490,7 @@ class StrategyRunner:
         # 5. Process TP milestones in ascending order (config must be sorted ASC)
         #    Each fires when price >= entry * level.multiple and the flag is not yet set.
         #    Sells sell_fraction_original of ORIGINAL quantity (clamped to remaining).
+        exec_price = exit_quote_price if exit_quote_price is not None else current_price
         for i, tp_level in enumerate(cfg.take_profit_levels):
             if i > 1:
                 break  # Position model supports up to 2 TP flags
@@ -486,9 +510,9 @@ class StrategyRunner:
                 continue
 
             fraction = tp_qty / position.remaining_quantity
-            pnl = (current_price - position.entry_price) * tp_qty
+            pnl = (exec_price - position.entry_price) * tp_qty
             label = f"TP{i + 1}"
-            self._exchange.sell_partial(position, fraction, current_price, label)
+            self._exchange.sell_partial(position, fraction, exec_price, label)
 
             if i == 0:
                 position.partial_take_profit_hit = True
@@ -506,12 +530,12 @@ class StrategyRunner:
             trade_log.info(
                 "%-13s | %-10s | %-44s | price=$%.8f | qty=%.4f | pnl=$%+.4f | strategy=%s",
                 label, position.symbol, position.mint_address,
-                current_price, tp_qty, pnl, self.name,
+                exec_price, tp_qty, pnl, self.name,
             )
             if self._db:
                 self._db.upsert_position(position)
                 self._db.save_portfolio(self._exchange.portfolio, self.name)
-                self._db.log_trade(label, position, current_price, tp_qty, pnl)
+                self._db.log_trade(label, position, exec_price, tp_qty, pnl)
 
             if position.remaining_quantity < _EPSILON:
                 self._force_close(position, f"{label}_FULL", now)
@@ -620,11 +644,9 @@ class StrategyRunner:
     def summary(self, current_prices: dict[str, float] | None = None) -> dict:
         """Per-strategy stats dict consumed by MultiStrategyEngine.print_summary()."""
         port = self._exchange.portfolio
-        all_pos = self._portfolio.all_positions()
         open_pos = self._portfolio.get_open_positions()
         closed_pos = self._portfolio.get_closed_positions()
 
-        realized = sum(p.realized_pnl_usd for p in all_pos)
         unrealized = 0.0
         market_value = 0.0
         for p in open_pos:
@@ -636,6 +658,10 @@ class StrategyRunner:
 
         equity = port.available_cash_usd + market_value
         net_pnl = equity - port.starting_cash_usd
+        # Derive realized from equity rather than summing position records —
+        # closed positions from prior sessions aren't loaded into memory, so
+        # summing p.realized_pnl_usd would undercount historical PnL.
+        realized = net_pnl - unrealized
         net_pnl_pct = (net_pnl / port.starting_cash_usd * 100) if port.starting_cash_usd else 0.0
         wins = [p for p in closed_pos if p.realized_pnl_usd > 0]
         win_rate = (len(wins) / len(closed_pos) * 100) if closed_pos else 0.0
@@ -653,7 +679,7 @@ class StrategyRunner:
             "open_count": self._portfolio.open_count,
             "closed_count": self._portfolio.closed_count,
             "win_rate": win_rate,
-            "positions": all_pos,
+            "positions": open_pos,
         }
 
 
@@ -689,27 +715,23 @@ class InfiniteMoonbagRunner(StrategyRunner):
     """
 
     _GRACE_SECONDS = 90.0
-    _GRACE_FLOOR      = 0.70  # entry × 0.70 during grace  (−30%)
-    _POST_GRACE_FLOOR = 0.80  # entry × 0.80 after grace   (−20%)
-    # Tightened from −22% → −20%: big winners (PIXELS/DOOLYSAURUS/CHIBELON/MOCHI/CHUCK)
-    # never dipped below −16.4% from entry, so −20% cuts losers 2% faster with no winner risk.
+    _GRACE_FLOOR      = 0.85  # entry × 0.85 during grace  (−15%)
+    _POST_GRACE_FLOOR = 0.88  # entry × 0.88 after grace   (−12%)
+    # Tightened from −20% → −12%: simulate_tp_sl over 381 trades found tighter
+    # floor significantly improves PnL by cutting losers faster.  Grace floor kept
+    # at −15% to absorb entry-tick spread noise in the first 90 seconds.
 
     # Fixed floor milestones — (highest_multiple, stop_floor_multiple_of_entry)
-    # Data-driven update 2026-03-20 based on 59-trade analysis:
-    #   • 1.8× rung REMOVED: the old 1.35× lock-in caused MOCHI to exit at +34%
-    #     on a 1.8×→entry retrace — token then pumped to +436%. MOCHI's retrace
-    #     went to −4.1% from entry (0.959×), which is above the −20% after-grace
-    #     floor (0.80×). Removing this rung keeps the floor at 0.80× after a 1.8×
-    #     hit, letting MOCHI-type tokens survive the retrace and continue.
-    #     Cost: tokens that peak at ~1.8× and crash now exit at −20% instead of
-    #     +35%. Given TP1 already sold 20% at 1.8×, blended exit is still ~breakeven.
-    #   • 2.5× rung lowered 1.90→1.65: more room for retracements at this level.
-    #   • 4.0× rung lowered 2.80→2.60: slight loosening, still locks +160%.
-    #   • 6.0× rung raised 3.50→4.20: tighten at the top — lock in more at 6×.
+    # Data-driven update 2026-03-23 via optimize_tp_sl.py simulation (381 trades):
+    #   • First rung at 1.7×: once price hits +70%, lock stop at 2.2× (+120%).
+    #     Captures early pumpers aggressively — largest single PnL improvement.
+    #   • Second rung at 4.0×: lock stop at 3.8× (+280%).
+    #   • Third rung at 6.5×: lock stop at 5.3× (+430%) for big runners.
+    #   Simulated PnL: $+441 vs $+168 production (at $5/trade, 381 trades).
     _STOP_MILESTONES: tuple[tuple[float, float], ...] = (
-        (2.5, 1.65),   # highest ≥ 2.5× → stop ≥ entry × 1.65  (+65% locked)
-        (4.0, 2.60),   # highest ≥ 4.0× → stop ≥ entry × 2.60  (+160% locked)
-        (6.0, 4.20),   # highest ≥ 6.0× → stop ≥ entry × 4.20  (+320% locked)
+        (1.7, 2.20),   # highest ≥ 1.7× → stop ≥ entry × 2.20  (+120% locked)
+        (4.0, 3.80),   # highest ≥ 4.0× → stop ≥ entry × 3.80  (+280% locked)
+        (6.5, 5.30),   # highest ≥ 6.5× → stop ≥ entry × 5.30  (+430% locked)
     )
 
     # Maps TP index → Position flag attribute name
@@ -720,7 +742,12 @@ class InfiniteMoonbagRunner(StrategyRunner):
         "tp4_hit",
     )
 
-    def evaluate_position(self, position: Position, current_price: float) -> None:
+    def evaluate_position(
+        self,
+        position: Position,
+        current_price: float,
+        exit_quote_price: Optional[float] = None,
+    ) -> None:
         if position.status == "CLOSED":
             return
 
@@ -734,17 +761,19 @@ class InfiniteMoonbagRunner(StrategyRunner):
 
         # 2. Check existing stop (ladder value from PREVIOUS tick — monotonic)
         if current_price <= position.stop_loss_price:
+            exec_price = exit_quote_price if exit_quote_price is not None else current_price
             multiple = current_price / entry if entry > 0 else 0
             logger.info(
-                "[%s] [STOP_LADDER] %s | price=$%.8f (%.2f×) | stop=$%.8f (%.2f×)",
+                "[%s] [STOP_LADDER] %s | market=$%.8f (%.2f×) | exec=$%.8f | stop=$%.8f (%.2f×)",
                 self.name, position.symbol,
-                current_price, multiple,
+                current_price, multiple, exec_price,
                 position.stop_loss_price, position.stop_loss_price / entry,
             )
-            self._close_position(position, current_price, "STOP_LADDER_EXIT", now)
+            self._close_position(position, exec_price, "STOP_LADDER_EXIT", now)
             return
 
         # 3. Process TP milestones in ascending order (sell % of ORIGINAL qty)
+        exec_price = exit_quote_price if exit_quote_price is not None else current_price
         for i, tp_level in enumerate(self._cfg.take_profit_levels):
             if i >= len(self._TP_FLAG_ATTRS):
                 break
@@ -763,9 +792,9 @@ class InfiniteMoonbagRunner(StrategyRunner):
                 continue
 
             fraction = tp_qty / position.remaining_quantity
-            pnl = (current_price - entry) * tp_qty
+            pnl = (exec_price - entry) * tp_qty
             label = f"TP{i + 1}"
-            self._exchange.sell_partial(position, fraction, current_price, label)
+            self._exchange.sell_partial(position, fraction, exec_price, label)
             setattr(position, flag_attr, True)
 
             logger.info(
@@ -778,12 +807,12 @@ class InfiniteMoonbagRunner(StrategyRunner):
             trade_log.info(
                 "%-13s | %-10s | %-44s | price=$%.8f | qty=%.4f | pnl=$%+.4f | strategy=%s",
                 label, position.symbol, position.mint_address,
-                current_price, tp_qty, pnl, self.name,
+                exec_price, tp_qty, pnl, self.name,
             )
             if self._db:
                 self._db.upsert_position(position)
                 self._db.save_portfolio(self._exchange.portfolio, self.name)
-                self._db.log_trade(label, position, current_price, tp_qty, pnl)
+                self._db.log_trade(label, position, exec_price, tp_qty, pnl)
 
             if position.remaining_quantity < _EPSILON:
                 self._force_close(position, f"{label}_FULL", now)
