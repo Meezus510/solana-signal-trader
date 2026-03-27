@@ -144,6 +144,19 @@
     "ml_score_low_pct": -45.0,
     "ml_score_high_pct": 300.0
   },
+  "anthropic_managed": {
+    "base_strategy": "quick_pop",
+    "mode": "balanced",
+    "live_trading": false,
+    "peak_drop_exit_pct": 0.12,
+    "early_timeout_minutes": 12.0,
+    "early_timeout_max_gain_pct": 0.02,
+    "early_timeout_min_range_pct": 0.06,
+    "ml_k": 3,
+    "ml_halflife_days": 7.0,
+    "ml_score_low_pct": -45.0,
+    "ml_score_high_pct": 300.0
+  },
   "moonbag_managed": {
     "live_trading": false,
     "stop_loss_pct": 0.35,

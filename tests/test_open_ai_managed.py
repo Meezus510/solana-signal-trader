@@ -31,16 +31,28 @@ def test_build_runners_includes_open_ai_managed():
     by_name = {runner.name: runner for runner in runners}
 
     assert "open_ai_managed" in by_name
+    assert "anthropic_managed" in by_name
 
     cfg = by_name["open_ai_managed"].cfg
     assert cfg.ml_training_strategy == "quick_pop"
     assert cfg.use_ml_filter is True
     assert cfg.use_chart_filter is False
 
+    anthropic_cfg = by_name["anthropic_managed"].cfg
+    assert anthropic_cfg.ml_training_strategy == "quick_pop"
+    assert anthropic_cfg.use_ml_filter is True
+    assert anthropic_cfg.use_chart_filter is False
+
 
 def test_open_ai_managed_defaults_to_standard_runner():
     runners = build_runners(_cfg(), db=None)
     runner = next(r for r in runners if r.name == "open_ai_managed")
+    assert not isinstance(runner, InfiniteMoonbagRunner)
+
+
+def test_anthropic_managed_defaults_to_standard_runner():
+    runners = build_runners(_cfg(), db=None)
+    runner = next(r for r in runners if r.name == "anthropic_managed")
     assert not isinstance(runner, InfiniteMoonbagRunner)
 
 
