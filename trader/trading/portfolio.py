@@ -9,6 +9,7 @@ and retrieves positions. All strategy decisions live in TradingEngine.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 from trader.trading.models import Position
@@ -33,6 +34,7 @@ class PortfolioManager:
     def __init__(self) -> None:
         self._all: list[Position] = []                   # full trade history
         self._open_by_mint: dict[str, Position] = {}     # fast open-position lookup
+        self._closed_at: dict[str, float] = {}           # mint → monotonic close time
 
     # ------------------------------------------------------------------
     # Writes
@@ -58,6 +60,7 @@ class PortfolioManager:
         """
         removed = self._open_by_mint.pop(mint_address, None)
         if removed:
+            self._closed_at[mint_address] = time.monotonic()
             logger.debug("Position removed from open index: %s", mint_address)
 
     # ------------------------------------------------------------------
@@ -70,6 +73,11 @@ class PortfolioManager:
 
     def has_open_position(self, mint_address: str) -> bool:
         return mint_address in self._open_by_mint
+
+    def closed_within_seconds(self, mint_address: str, seconds: float) -> bool:
+        """Return True if this mint was closed within the last `seconds` seconds."""
+        closed_at = self._closed_at.get(mint_address)
+        return closed_at is not None and (time.monotonic() - closed_at) < seconds
 
     def get_open_positions(self) -> list[Position]:
         return list(self._open_by_mint.values())

@@ -68,8 +68,8 @@ async def run_live(cfg: Config) -> None:
     for runner in runners:
         saved = db.load_portfolio(runner.name)
         if saved:
-            available_cash, starting_cash = saved
-            runner.restore_cash(available_cash, starting_cash)
+            available_cash, starting_cash, total_reloads = saved
+            runner.restore_cash(available_cash, starting_cash, total_reloads)
             logger.info("[RESTORE] Strategy '%s' | cash=$%.2f", runner.name, available_cash)
         runner.restore_positions(db.load_open_positions(runner.name))
 

@@ -65,12 +65,14 @@ class PaperExchange:
             if not self._cfg.live_trading:
                 # Paper strategy: reload cash so data collection is never interrupted.
                 self.portfolio.available_cash_usd += _PAPER_RELOAD_USD
+                self.portfolio.total_reloads_usd += _PAPER_RELOAD_USD
                 logger.warning(
                     "[RELOAD] %s paper cash below trade size — injecting $%.0f "
-                    "(available now $%.2f)",
+                    "(available now $%.2f | total reloaded $%.0f)",
                     self._cfg.name,
                     _PAPER_RELOAD_USD,
                     self.portfolio.available_cash_usd,
+                    self.portfolio.total_reloads_usd,
                 )
             else:
                 logger.warning(

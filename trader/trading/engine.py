@@ -25,7 +25,7 @@ from typing import Optional
 
 import aiohttp
 
-from trader.analysis.chart import OHLCV_BARS, compute_chart_context
+from trader.analysis.chart import OHLCV_BARS, OHLCVCandle, compute_chart_context
 from trader.analysis.ml_scorer import (
     ChartMLScorer, ML_OHLCV_BARS, ML_OHLCV_INTERVAL,
     SUBMINUTE_OHLCV_BARS, SUBMINUTE_OHLCV_INTERVAL,
@@ -41,6 +41,32 @@ _STRATEGY_CONFIG_PATH = Path(__file__).parent.parent.parent / "strategy_config.j
 
 logger = logging.getLogger(__name__)
 signal_log = logging.getLogger("signals")
+
+
+def _aggregate_15s_to_1m(candles_15s: list[OHLCVCandle]) -> list[OHLCVCandle]:
+    """Aggregate 15s candles into 1m candles by grouping on minute boundaries.
+
+    Used as a fallback when the standard Birdeye 1m endpoint returns nothing
+    for very new tokens that haven't accumulated full-minute history yet.
+    """
+    if not candles_15s:
+        return []
+    by_minute: dict[int, list[OHLCVCandle]] = {}
+    for c in candles_15s:
+        minute_ts = (c.unix_time // 60) * 60
+        by_minute.setdefault(minute_ts, []).append(c)
+    result = []
+    for ts in sorted(by_minute):
+        group = by_minute[ts]
+        result.append(OHLCVCandle(
+            unix_time=ts,
+            open=group[0].open,
+            high=max(c.high for c in group),
+            low=min(c.low for c in group),
+            close=group[-1].close,
+            volume=sum(c.volume for c in group),
+        ))
+    return result
 
 
 class MultiStrategyEngine:
@@ -151,7 +177,7 @@ class MultiStrategyEngine:
                 continue
             # Restore cash balance
             ps = old.portfolio_state
-            new_runner.restore_cash(ps.available_cash_usd, ps.starting_cash_usd)
+            new_runner.restore_cash(ps.available_cash_usd, ps.starting_cash_usd, ps.total_reloads_usd)
             # Restore open positions (they keep their original entry/stop/TP prices)
             open_positions = old.get_open_positions()
             if open_positions:
@@ -273,6 +299,18 @@ class MultiStrategyEngine:
                     interval="1s",
                 ),
             )
+            # If standard 1m endpoint returned nothing (common for very new tokens)
+            # but 15s v3 data is available, derive 1m candles by aggregation so
+            # candles_1m_json is always populated for ML training and inference.
+            if not candles and subminute_candles:
+                candles = _aggregate_15s_to_1m(subminute_candles)
+                if candles:
+                    chart_ctx = compute_chart_context(candles, entry_price)
+                    logger.debug(
+                        "[CHART] %s | 1m candles derived from 15s aggregation (%d bars)",
+                        signal.symbol, len(candles),
+                    )
+
             if subminute_candles:
                 ml_candles = subminute_candles
                 ml_source  = f"birdeye_v3/{SUBMINUTE_OHLCV_INTERVAL}"
@@ -411,6 +449,82 @@ class MultiStrategyEngine:
                             signal.symbol, signal.mint_address, wallet_momentum, runner.name,
                         )
 
+            # Hard entry filters — run regardless of use_ml_filter.
+            # Block tokens in late-distribution or high-holder-count danger zones.
+            hard_blocked = False
+            _hard_reason = None
+
+            if not hard_blocked and runner.cfg.holder_count_max is not None and pair_stats:
+                hc = pair_stats.get("holder_count")
+                if hc is not None and hc > runner.cfg.holder_count_max:
+                    hard_blocked = True
+                    _hard_reason = f"holder_count={hc} > max={runner.cfg.holder_count_max}"
+                    logger.info(
+                        "[HARD_SKIP] [%-12s] %s | %s",
+                        runner.name, signal.symbol, _hard_reason,
+                    )
+                    signal_log.info(
+                        "HARD_SKIP  | %-10s | %-44s | %s | strategy=%s",
+                        signal.symbol, signal.mint_address, _hard_reason, runner.name,
+                    )
+
+            if (
+                not hard_blocked
+                and runner.cfg.late_entry_price_chg_30m_max is not None
+                and runner.cfg.late_entry_pump_ratio_min is not None
+                and pair_stats
+                and chart_ctx is not None
+            ):
+                pc30 = pair_stats.get("price_change_30m_pct")
+                pr   = chart_ctx.pump_ratio
+                if (
+                    pc30 is not None
+                    and pc30 > runner.cfg.late_entry_price_chg_30m_max
+                    and pr > runner.cfg.late_entry_pump_ratio_min
+                ):
+                    hard_blocked = True
+                    _hard_reason = (
+                        f"late_entry: 30m_chg={pc30:.0f}% > "
+                        f"{runner.cfg.late_entry_price_chg_30m_max:.0f}%"
+                        f" AND pump_ratio={pr:.1f}x > {runner.cfg.late_entry_pump_ratio_min:.0f}x"
+                    )
+                    logger.info(
+                        "[HARD_SKIP] [%-12s] %s | %s",
+                        runner.name, signal.symbol, _hard_reason,
+                    )
+                    signal_log.info(
+                        "HARD_SKIP  | %-10s | %-44s | %s | strategy=%s",
+                        signal.symbol, signal.mint_address, _hard_reason, runner.name,
+                    )
+
+            if not hard_blocked and runner.cfg.buy_vol_ratio_1h_max is not None and pair_stats:
+                buy_v  = pair_stats.get("buy_volume_1h",   0.0) or 0.0
+                total_v = pair_stats.get("total_volume_1h", 0.0) or 0.0
+                bvr = buy_v / (total_v + 1e-9) if total_v > 0 else None
+                if bvr is not None and bvr > runner.cfg.buy_vol_ratio_1h_max:
+                    hard_blocked = True
+                    _hard_reason = (
+                        f"buy_vol_ratio_1h={bvr:.4f} > max={runner.cfg.buy_vol_ratio_1h_max:.4f}"
+                    )
+                    logger.info("[HARD_SKIP] [%-12s] %s | %s", runner.name, signal.symbol, _hard_reason)
+                    signal_log.info(
+                        "HARD_SKIP  | %-10s | %-44s | %s | strategy=%s",
+                        signal.symbol, signal.mint_address, _hard_reason, runner.name,
+                    )
+
+            if not hard_blocked and runner.cfg.market_cap_usd_min is not None and pair_stats:
+                mc = pair_stats.get("market_cap_usd")
+                if mc is not None and mc < runner.cfg.market_cap_usd_min:
+                    hard_blocked = True
+                    _hard_reason = (
+                        f"market_cap_usd=${mc:,.0f} < min=${runner.cfg.market_cap_usd_min:,.0f}"
+                    )
+                    logger.info("[HARD_SKIP] [%-12s] %s | %s", runner.name, signal.symbol, _hard_reason)
+                    signal_log.info(
+                        "HARD_SKIP  | %-10s | %-44s | %s | strategy=%s",
+                        signal.symbol, signal.mint_address, _hard_reason, runner.name,
+                    )
+
             # ML filter — skip if score is below threshold.
             # If score is None (not enough training data yet), always allow through.
             ml_blocked = (
@@ -518,11 +632,13 @@ class MultiStrategyEngine:
                         "[POLICY] Agent A call failed for %s — proceeding with defaults", signal.symbol,
                     )
 
-            effective_blocked = ml_blocked or policy_blocked
+            effective_blocked = hard_blocked or ml_blocked or policy_blocked
 
             # Track skip reason for AI override (set before enter_position).
             _skip_reason: str | None = None
-            if ml_blocked:
+            if hard_blocked:
+                _skip_reason = "HARD_SKIP"
+            elif ml_blocked:
                 _skip_reason = "ML_SKIP"
             elif policy_blocked:
                 _skip_reason = "POLICY_BLK"
@@ -1241,7 +1357,7 @@ class MultiStrategyEngine:
                 m_equity     = sum(s["equity"]          for s in managed)
                 m_realized   = sum(s["realized_pnl"]   for s in managed)
                 m_unrealized = sum(s["unrealized_pnl"]  for s in managed)
-                m_net        = m_equity - m_start
+                m_net        = sum(s["net_pnl"]         for s in managed)
                 m_net_pct    = (m_net / m_start * 100) if m_start else 0.0
                 m_open       = sum(s["open_count"]   for s in managed)
                 m_closed     = sum(s["closed_count"] for s in managed)
@@ -1268,7 +1384,7 @@ class MultiStrategyEngine:
                 b_unrealized = sum(s["unrealized_pnl"]  for s in base)
                 b_start      = sum(s["starting_cash"]  for s in base)
                 b_equity     = sum(s["equity"]          for s in base)
-                b_net        = b_equity - b_start
+                b_net        = sum(s["net_pnl"]         for s in base)
                 b_net_pct    = (b_net / b_start * 100) if b_start else 0.0
                 b_open       = sum(s["open_count"]   for s in base)
                 b_closed     = sum(s["closed_count"] for s in base)

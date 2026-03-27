@@ -80,6 +80,12 @@ class StrategyConfig:
     timeout_min_gain_pct: Optional[float] = None
     max_hold_minutes: Optional[float] = None
 
+    # Cooldown after closing a position on a mint (optional).
+    # If set, signals for the same mint are rejected for this many minutes after
+    # the previous position closes — prevents re-entering on a second channel call
+    # for a token we just stopped out of.  None = disabled (re-entry always allowed).
+    recently_closed_cooldown_minutes: Optional[float] = None
+
     # Chart-based entry filter (optional — set True for chart-enabled strategies)
     use_chart_filter: bool = False
 
@@ -120,6 +126,36 @@ class StrategyConfig:
     # count is growing fast (already pumping). None = disabled.
     # LOO analysis: threshold=2.102 blocks 9/134 losers with 0 winner misses.
     ml_wallet_momentum_max: Optional[float] = None
+
+    # Hard entry filters — applied to all strategies regardless of use_ml_filter.
+    # These are data-derived absolute cuts, not soft ML weights.
+    # None = disabled (filter not applied).
+
+    # Reject signals where holder_count > this value.
+    # Backtest on 617 entered signals: >1000 holders → 16% heavy-loss rate,
+    # >2000 holders → 46% heavy-loss rate vs 4% baseline (<600 holders).
+    holder_count_max: Optional[int] = None
+
+    # Late-entry combined filter: reject when BOTH hold simultaneously —
+    #   price_change_30m_pct > late_entry_price_chg_30m_max
+    #   AND chart_ctx.pump_ratio > late_entry_pump_ratio_min
+    # Catches tokens deep into a pump-dump cycle (30m already +500% AND
+    # 15-bar pump ratio > 20×). Each alone is too noisy; together they are
+    # the clearest late-distribution signature in the dataset.
+    # If chart_ctx is unavailable the filter is skipped (fail-open).
+    late_entry_price_chg_30m_max: Optional[float] = None
+    late_entry_pump_ratio_min: Optional[float] = None
+
+    # Reject signals where 1h buy-volume ratio > this value.
+    # buy_vol_ratio_1h = buy_volume_1h / total_volume_1h (0–1).
+    # High values mean buying pressure is already exhausted / late-stage.
+    # Backtest on 687 trend_rider trades: ratio < 0.016 → 60% win rate at 95% block.
+    buy_vol_ratio_1h_max: Optional[float] = None
+
+    # Reject signals where market cap (USD) < this value.
+    # Low market cap tokens are highly vulnerable to rug pulls and wash trading.
+    # Backtest on 687 trend_rider trades: mc > $314k → 60% win rate at 95% block.
+    market_cap_usd_min: Optional[float] = None
 
     # High-confidence size multiplier — when score >= ml_high_score_threshold,
     # buy size is scaled by ml_size_multiplier (e.g. 2× the normal position).
@@ -201,6 +237,39 @@ class StrategyConfig:
     # Requires the engine to be started with monitor_positions_ws() and an http session.
     use_real_exit_price: bool = False
 
+    # Pre-TP1 reversal guard (optional).
+    # When set, if the current price drops more than this fraction below the
+    # highest price seen since entry — even BEFORE TP1 activates the trailing
+    # stop — the position is closed immediately with reason PEAK_DROP.
+    # e.g. 0.18 → exit if price falls 18% from its highest point.
+    # Only fires while trailing_active is False (i.e., before TP1 is hit).
+    # After TP1 the normal trailing_stop_pct takes over.
+    peak_drop_exit_pct: Optional[float] = None
+
+    # Early stagnation timeout (optional).
+    # Exit early if the coin is truly dead — no meaningful price movement in
+    # either direction after a short window.
+    #
+    # Fires only when ALL three conditions hold simultaneously:
+    #   age >= early_timeout_minutes
+    #   AND highest_price < entry * (1 + early_timeout_max_gain_pct)  — never pumped above threshold
+    #   AND (highest_price - lowest_price) / entry_price < early_timeout_min_range_pct — barely oscillated
+    #
+    # The range check (high - low) / entry is the key volume proxy: a coin being
+    # actively bought and sold will oscillate and produce a large range even if
+    # the net move is small (e.g. -5%, +2%, -7%, +1% → range ≈ 9%).
+    # Only a genuinely dead coin stays flat on both measures.
+    #
+    # Only fires while trailing_active is False (TP1 not yet hit).
+    early_timeout_minutes: Optional[float] = None
+    early_timeout_max_gain_pct: Optional[float] = None
+    early_timeout_min_range_pct: Optional[float] = None  # default None = range check disabled
+
+    # Operator / agent emergency gate.
+    # When True, the strategy will reject all new entries but continue managing
+    # any already-open positions normally.
+    block_new_entries: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Base runner
@@ -262,9 +331,10 @@ class StrategyRunner:
         """Called by the engine after saving a signal_charts row for an entered position."""
         self._signal_chart_ids[mint] = signal_chart_id
 
-    def restore_cash(self, available_cash: float, starting_cash: float) -> None:
+    def restore_cash(self, available_cash: float, starting_cash: float, total_reloads: float = 0.0) -> None:
         self._exchange.portfolio.available_cash_usd = available_cash
         self._exchange.portfolio.starting_cash_usd = starting_cash
+        self._exchange.portfolio.total_reloads_usd = total_reloads
 
     def restore_positions(self, positions: list[Position]) -> None:
         for pos in positions:
@@ -316,6 +386,20 @@ class StrategyRunner:
         buy_size_override — if provided, overrides cfg.buy_size_usd for this entry
             (used by the engine to scale up on high ML confidence scores).
         """
+        if self._cfg.block_new_entries:
+            logger.info("[%s] [BLOCK_ALL] %s — new entries disabled by config", self.name, signal.symbol)
+            signal_log.info(
+                "BLOCK_ALL  | %-10s | %-44s | ch=%-20s | strategy=%s",
+                signal.symbol, signal.mint_address, signal.source_channel, self.name,
+            )
+            if self._db:
+                self._db.log_signal(
+                    "BLOCK_ALL", symbol=signal.symbol,
+                    mint=signal.mint_address, strategy=self.name,
+                    source_channel=signal.source_channel,
+                )
+            return None
+
         # Chart filter (only for chart-enabled strategies).
         # Re-evaluated per-runner using this runner's own pump_ratio_max threshold
         # so each strategy can have independent chart filter sensitivity.
@@ -363,6 +447,25 @@ class StrategyRunner:
                     source_channel=signal.source_channel,
                 )
             return None
+
+        if self._cfg.recently_closed_cooldown_minutes is not None:
+            cooldown_secs = self._cfg.recently_closed_cooldown_minutes * 60.0
+            if self._portfolio.closed_within_seconds(signal.mint_address, cooldown_secs):
+                logger.info(
+                    "[%s] [SKIP] %s closed recently — cooldown %.0fm, signal ignored",
+                    self.name, signal.symbol, self._cfg.recently_closed_cooldown_minutes,
+                )
+                signal_log.info(
+                    "COOLDOWN   | %-10s | %-44s | ch=%-20s | strategy=%s",
+                    signal.symbol, signal.mint_address, signal.source_channel, self.name,
+                )
+                if self._db:
+                    self._db.log_signal(
+                        "COOLDOWN", symbol=signal.symbol,
+                        mint=signal.mint_address, strategy=self.name,
+                        source_channel=signal.source_channel,
+                    )
+                return None
 
         buy_size = buy_size_override if buy_size_override is not None else self._cfg.buy_size_usd
         position = self._exchange.buy(signal, entry_price, buy_size)
@@ -462,6 +565,23 @@ class StrategyRunner:
             self._close_position(position, exec_price, reason, now)
             return
 
+        # 2b. Pre-TP1 peak-drop exit — fires before trailing stop is active.
+        #     Catches coins that pump then reverse without hitting TP1.
+        if (
+            cfg.peak_drop_exit_pct is not None
+            and not position.trailing_active
+            and current_price <= position.highest_price * (1.0 - cfg.peak_drop_exit_pct)
+        ):
+            exec_price = exit_quote_price if exit_quote_price is not None else current_price
+            logger.info(
+                "[%s] [PEAK_DROP] %s | market=$%.8f | exec=$%.8f | high=$%.8f | drop=%.1f%%",
+                self.name, position.symbol, current_price, exec_price,
+                position.highest_price,
+                (1.0 - current_price / position.highest_price) * 100,
+            )
+            self._close_position(position, exec_price, "PEAK_DROP", now)
+            return
+
         # 3. Max hold (unconditional — time-based, no trigger order, use market price)
         if cfg.max_hold_minutes is not None and age_minutes >= cfg.max_hold_minutes:
             logger.info(
@@ -470,6 +590,31 @@ class StrategyRunner:
             )
             self._close_position(position, current_price, "MAX_HOLD", now)
             return
+
+        # 3b. Early stagnation timeout — exit sooner if coin is truly dead.
+        #     Only fires before TP1 (trailing not yet active).
+        #     Two guards must both pass:
+        #       1. highest_price < threshold  — coin never pumped meaningfully
+        #       2. price range (high-low)/entry < min_range  — coin barely oscillated
+        #          (range is a volume proxy: active coins move in both directions
+        #          even if net result is small; new lows/highs expand it each tick)
+        if (
+            cfg.early_timeout_minutes is not None
+            and cfg.early_timeout_max_gain_pct is not None
+            and not position.trailing_active
+            and age_minutes >= cfg.early_timeout_minutes
+            and position.highest_price < position.entry_price * (1.0 + cfg.early_timeout_max_gain_pct)
+        ):
+            price_range_pct = (position.highest_price - position.lowest_price) / position.entry_price
+            if cfg.early_timeout_min_range_pct is None or price_range_pct < cfg.early_timeout_min_range_pct:
+                logger.info(
+                    "[%s] [EARLY_STALL] %s | age=%.0fmin | peak_gain=%.1f%% | range=%.1f%%",
+                    self.name, position.symbol, age_minutes,
+                    (position.highest_price / position.entry_price - 1.0) * 100,
+                    price_range_pct * 100,
+                )
+                self._close_position(position, current_price, "EARLY_STALL", now)
+                return
 
         # 4. Timeout (position not gaining enough — time-based, use market price)
         if (
@@ -657,7 +802,9 @@ class StrategyRunner:
                 unrealized += mv - (p.remaining_quantity * p.entry_price)
 
         equity = port.available_cash_usd + market_value
-        net_pnl = equity - port.starting_cash_usd
+        # Subtract any paper cash reloads so they don't inflate PnL.
+        # Each reload injects $1000 into available_cash but represents no real gain.
+        net_pnl = equity - port.starting_cash_usd - port.total_reloads_usd
         # Derive realized from equity rather than summing position records —
         # closed positions from prior sessions aren't loaded into memory, so
         # summing p.realized_pnl_usd would undercount historical PnL.

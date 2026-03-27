@@ -91,7 +91,8 @@ _CREATE_PORTFOLIO = """
 CREATE TABLE IF NOT EXISTS portfolio (
     strategy           TEXT PRIMARY KEY,
     available_cash_usd REAL NOT NULL,
-    starting_cash_usd  REAL NOT NULL
+    starting_cash_usd  REAL NOT NULL,
+    total_reloads_usd  REAL NOT NULL DEFAULT 0.0
 )
 """
 
@@ -321,6 +322,13 @@ class TradeDatabase:
                     logger.info("[DB] Backfilled strategy_outcomes.source_channel = '%s'", _LEGACY_CHANNEL)
             except sqlite3.OperationalError:
                 pass  # column already exists
+
+        # portfolio columns added after initial release
+        try:
+            c.execute("ALTER TABLE portfolio ADD COLUMN total_reloads_usd REAL NOT NULL DEFAULT 0.0")
+            logger.info("[DB] Migrated: added column total_reloads_usd to portfolio")
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
         # chart_snapshots columns added after initial release
         for col, definition in [
@@ -603,18 +611,18 @@ class TradeDatabase:
 
     def save_portfolio(self, state: PortfolioState, strategy_name: str = "default") -> None:
         self._conn.execute(
-            "INSERT OR REPLACE INTO portfolio VALUES (?, ?, ?)",
-            (strategy_name, state.available_cash_usd, state.starting_cash_usd),
+            "INSERT OR REPLACE INTO portfolio VALUES (?, ?, ?, ?)",
+            (strategy_name, state.available_cash_usd, state.starting_cash_usd, state.total_reloads_usd),
         )
         self._conn.commit()
 
-    def load_portfolio(self, strategy_name: str = "default") -> Optional[tuple[float, float]]:
-        """Returns (available_cash_usd, starting_cash_usd) or None if no prior session."""
+    def load_portfolio(self, strategy_name: str = "default") -> Optional[tuple[float, float, float]]:
+        """Returns (available_cash_usd, starting_cash_usd, total_reloads_usd) or None if no prior session."""
         row = self._conn.execute(
-            "SELECT available_cash_usd, starting_cash_usd FROM portfolio WHERE strategy = ?",
+            "SELECT available_cash_usd, starting_cash_usd, COALESCE(total_reloads_usd, 0.0) FROM portfolio WHERE strategy = ?",
             (strategy_name,),
         ).fetchone()
-        return row  # (available, starting) or None
+        return row  # (available, starting, reloads) or None
 
     # ------------------------------------------------------------------
     # Trade event log

@@ -170,6 +170,7 @@ _SCORE_HIGH_PCT: float =  85.0   # maps to score 10
 _CHANNEL_ENC: dict[str, float] = {
     "WizzyTrades": 1.0,
     "WizzyCasino": 2.0,
+    "wedegentheyaped": 3.0,
 }
 
 # Human-readable names for all 63 features (indexed 0–62).

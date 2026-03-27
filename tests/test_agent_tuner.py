@@ -27,8 +27,10 @@ from trader.agents.strategy_tuner import (
     _apply_delta,
     _parse_response,
     _validate_strategy_delta,
+    assert_owned_config_changes,
     load_config,
     save_config,
+    save_owned_config,
 )
 
 
@@ -335,6 +337,71 @@ class TestConfigIO:
         save_config({"x": 1}, path=cfg_path)
         tmp_files = list(tmp_path.glob("*.tmp"))
         assert tmp_files == []
+
+    def test_save_owned_config_allows_owned_strategy_and_namespaced_meta(self, tmp_path):
+        cfg_path = tmp_path / "strategy_config.json"
+        before = {
+            "_meta": {"version": 1, "deepseek_manager_last_run_at": "2026-03-27T00:00:00+00:00"},
+            "open_ai_managed": {"mode": "balanced"},
+            "deep_seek_managed": {"mode": "strict"},
+        }
+        after = {
+            "_meta": {
+                "version": 1,
+                "deepseek_manager_last_run_at": "2026-03-27T00:00:00+00:00",
+                "openai_manager_last_run_at": "2026-03-27T01:00:00+00:00",
+            },
+            "open_ai_managed": {"mode": "lenient"},
+            "deep_seek_managed": {"mode": "strict"},
+        }
+        save_owned_config(
+            before,
+            after,
+            owned_strategy="open_ai_managed",
+            allowed_meta_prefixes=("openai_manager_",),
+            path=cfg_path,
+        )
+        assert load_config(path=cfg_path) == after
+
+    def test_save_owned_config_rejects_other_strategy_changes(self, tmp_path):
+        cfg_path = tmp_path / "strategy_config.json"
+        before = {
+            "_meta": {"version": 1},
+            "open_ai_managed": {"mode": "balanced"},
+            "deep_seek_managed": {"mode": "strict"},
+        }
+        after = {
+            "_meta": {"version": 1, "openai_manager_last_run_at": "2026-03-27T01:00:00+00:00"},
+            "open_ai_managed": {"mode": "lenient"},
+            "deep_seek_managed": {"mode": "allow_all"},
+        }
+        with pytest.raises(ValueError, match="non-owned config section"):
+            save_owned_config(
+                before,
+                after,
+                owned_strategy="open_ai_managed",
+                allowed_meta_prefixes=("openai_manager_",),
+                path=cfg_path,
+            )
+
+    def test_save_owned_config_rejects_non_namespaced_meta_changes(self, tmp_path):
+        cfg_path = tmp_path / "strategy_config.json"
+        before = {
+            "_meta": {"version": 1, "last_tuned_at": "2026-03-20T19:43:20+00:00"},
+            "open_ai_managed": {"mode": "balanced"},
+        }
+        after = {
+            "_meta": {"version": 1, "last_tuned_at": "2026-03-27T01:00:00+00:00"},
+            "open_ai_managed": {"mode": "lenient"},
+        }
+        with pytest.raises(ValueError, match="non-owned _meta key"):
+            save_owned_config(
+                before,
+                after,
+                owned_strategy="open_ai_managed",
+                allowed_meta_prefixes=("openai_manager_",),
+                path=cfg_path,
+            )
 
 
 # ---------------------------------------------------------------------------

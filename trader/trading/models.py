@@ -96,3 +96,4 @@ class PortfolioState:
     """Tracks the aggregate mock cash balance across all trades."""
     starting_cash_usd: float
     available_cash_usd: float
+    total_reloads_usd: float = 0.0  # cumulative paper cash injected via reloads

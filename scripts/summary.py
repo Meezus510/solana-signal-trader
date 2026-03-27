@@ -251,8 +251,8 @@ def main() -> None:
     for runner in runners:
         saved = db.load_portfolio(runner.name)
         if saved:
-            available_cash, starting_cash = saved
-            runner.restore_cash(available_cash, starting_cash)
+            available_cash, starting_cash, total_reloads = saved
+            runner.restore_cash(available_cash, starting_cash, total_reloads)
         runner.restore_positions(db.load_open_positions(runner.name))
         runner.restore_closed_positions(db.load_closed_positions(runner.name))
 

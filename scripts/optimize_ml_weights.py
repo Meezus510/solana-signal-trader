@@ -311,7 +311,10 @@ def loo_evaluate(
             train_labels.append(records[j][label_key])
             recency_ws.append(math.exp(-age / halflife))
 
-        if len(train_feats) < 5:
+        # Need enough training data for KNN to be meaningful.
+        # min_train = max(k*3, 15% of dataset) so early records don't skew results.
+        min_train = max(k * 3, max(5, n // 7))
+        if len(train_feats) < min_train:
             if is_winner:
                 winners_through += 1
             continue
@@ -486,8 +489,22 @@ def ask_claude_for_configs(
             f"\nLOCKED ZERO FEATURES (must be 0.0 in weights): indices {locked_zero_indices}\n"
         )
 
+    # Cap history: send top 12 by through_pnl + last 4 (most recent) to keep prompt lean.
+    # Sending all configs leads to degraded Claude suggestions after many rounds.
+    sorted_by_pnl = sorted(results_history, key=lambda r: -r["through_pnl_boosted"])
+    recent = results_history[-4:] if len(results_history) > 4 else []
+    seen_labels = set()
+    capped_history = []
+    for r in sorted_by_pnl[:12]:
+        capped_history.append(r)
+        seen_labels.add(r["label"])
+    for r in recent:
+        if r["label"] not in seen_labels:
+            capped_history.append(r)
+            seen_labels.add(r["label"])
+
     history_lines = []
-    for i, r in enumerate(results_history):
+    for i, r in enumerate(capped_history):
         wt, lb, tw, tl = r["winners_through"], r["losers_blocked"], r["total_winners"], r["total_losers"]
         miss_pct = (tw - wt) / tw * 100 if tw else 0
         sp = r.get("score_pcts", {})
@@ -511,8 +528,9 @@ def ask_claude_for_configs(
         system_prompt = SYSTEM_PROMPT_WEIGHTS_ONLY
         suggest_line  = f"Suggest {n_suggestions} new weight vectors to try. Return only a JSON array."
 
-    user_msg = f"""Dataset: {results_history[0]['total_winners'] + results_history[0]['total_losers']} trades,
-{results_history[0]['total_winners']} winners, {results_history[0]['total_losers']} losers.
+    ref = capped_history[0] if capped_history else results_history[0]
+    user_msg = f"""Dataset: {ref['total_winners'] + ref['total_losers']} trades,
+{ref['total_winners']} winners, {ref['total_losers']} losers.
 min_score threshold: {min_score}
 KNN training label: {label_key}
 KNN: k={KNN_K}, halflife={KNN_HL}d, score_range=[{KNN_SL}, {KNN_SH}]
@@ -596,14 +614,41 @@ def main() -> None:
                         help="Strategy to optimize (default: quick_pop)")
     parser.add_argument("--rounds",      type=int,   default=4,   help="Optimization rounds")
     parser.add_argument("--suggestions", type=int,   default=8,   help="Suggestions per round")
-    parser.add_argument("--min-score",     type=float, default=1.5,  help="KNN min_score threshold")
-    parser.add_argument("--max-miss-rate",    type=float, default=0.25, help="Max winner miss rate (default 0.25 = 25%%)")
+    parser.add_argument("--min-score",     type=float, default=None,
+                        help="KNN min_score threshold (default: 1.5 normal, 8.0 strict)")
+    parser.add_argument("--max-miss-rate",    type=float, default=None,
+                        help="Max winner miss rate (default: 0.25 normal, 0.85 strict)")
     parser.add_argument("--random-per-round", type=int,   default=3,
                         help="Random configs injected each round for exploration (default 3)")
     parser.add_argument("--optimize-tiers", action="store_true",
                         help="Also let AI suggest tiered buy multipliers per score level (default: all trades 1×)")
+    parser.add_argument("--strict", action="store_true",
+                        help="Strict mode: target ≤5%% pass rate and >50%% win rate. "
+                             "Sets min-score=8.0, max-miss-rate=0.85, ranks by win_rate first.")
+    parser.add_argument("--lenient", action="store_true",
+                        help="Lenient mode: miss ZERO winners, block as many losers as possible. "
+                             "Sets min-score=3.5, max-miss-rate=0.02.")
     parser.add_argument("--db",            type=str,   default=DB_PATH)
     args = parser.parse_args()
+
+    if args.strict and args.lenient:
+        parser.error("--strict and --lenient are mutually exclusive")
+
+    # Apply mode defaults (can still be overridden by explicit flags)
+    if args.min_score is None:
+        if args.strict:
+            args.min_score = 8.0
+        elif args.lenient:
+            args.min_score = 3.5
+        else:
+            args.min_score = 1.5
+    if args.max_miss_rate is None:
+        if args.strict:
+            args.max_miss_rate = 0.85
+        elif args.lenient:
+            args.max_miss_rate = 0.02
+        else:
+            args.max_miss_rate = 0.25
 
     cfg = STRATEGY_CONFIGS[args.strategy]
     global KNN_K, KNN_HL, KNN_SL, KNN_SH
@@ -639,6 +684,11 @@ def main() -> None:
         seed_weights[idx] = 0.0
 
     results_history: list[dict] = []
+    _seen_weight_hashes: set[tuple] = set()
+
+    def _weight_hash(w: list[float]) -> tuple:
+        """Round to 1dp so near-identical configs are deduplicated."""
+        return tuple(round(x, 1) for x in w)
 
     def generate_random_config() -> dict:
         """Random weight vector + optional random tiers for broad space exploration."""
@@ -671,7 +721,12 @@ def main() -> None:
         lo, hi = int(idx), min(int(idx) + 1, len(s) - 1)
         return s[lo] + (s[hi] - s[lo]) * (idx - lo)
 
-    def evaluate_and_record(weights: list[float], tiers: list[list[float]], label: str) -> dict:
+    def evaluate_and_record(weights: list[float], tiers: list[list[float]], label: str) -> dict | None:
+        h = _weight_hash(weights)
+        if h in _seen_weight_hashes:
+            print(f"  [{label:<18}] (duplicate — skipped)")
+            return None
+        _seen_weight_hashes.add(h)
         (wt, lb, tw, tl, pnl_saved, pnl_missed,
          through_base, through_boosted,
          passing_scores) = loo_evaluate(
@@ -708,11 +763,19 @@ def main() -> None:
             "combined_pnl_usd":   combined_pnl,
             "score_pcts":         score_pcts,
         }
-        miss_rate = (tw - wt) / tw * 100 if tw else 0
+        miss_rate    = (tw - wt) / tw * 100 if tw else 0
+        trades_through = wt + (tl - lb)   # winners + losers that passed
+        win_rate_pct   = wt / trades_through * 100 if trades_through else 0
+        pass_rate_pct  = trades_through / (tw + tl) * 100 if (tw + tl) else 0
+        result["win_rate_pct"]   = win_rate_pct
+        result["pass_rate_pct"]  = pass_rate_pct
+        result["trades_through"] = trades_through
         tiers_str = json.dumps(tiers) if tiers else "[]"
+        win_flag = " >50%!" if win_rate_pct > 50 else ""
         print(
             f"  [{label:<18}] through=${through_base:>+7.2f}  net=${net_pnl:>+7.2f}  "
             f"winners={wt}/{tw} (miss={miss_rate:.0f}%)  blocked={lb}/{tl}  "
+            f"win_rate={win_rate_pct:.0f}%{win_flag}  pass_rate={pass_rate_pct:.1f}%  "
             f"saved=${pnl_saved:>+6.2f}  missed=${pnl_missed:>+6.2f}  "
             f"boost=${boost_gain:>+6.2f}  "
             f"scores(p50={score_pcts['p50']:.1f} p75={score_pcts['p75']:.1f} p90={score_pcts['p90']:.1f} max={score_pcts['max']:.1f})  "
@@ -724,7 +787,8 @@ def main() -> None:
     print(f"Optimization mode: {mode_label}")
     print("Round 0: Evaluating seed (production weights)...")
     r0 = evaluate_and_record(seed_weights, seed_tiers, "production")
-    results_history.append(r0)
+    if r0:
+        results_history.append(r0)
 
     client = anthropic.Anthropic()
 
@@ -748,7 +812,8 @@ def main() -> None:
             result = evaluate_and_record(
                 cfg_suggestion["weights"], cfg_suggestion["multiplier_tiers"], label
             )
-            results_history.append(result)
+            if result:
+                results_history.append(result)
 
         if args.random_per_round > 0:
             print(f"  Injecting {args.random_per_round} random configs for exploration...")
@@ -756,27 +821,57 @@ def main() -> None:
                 rand_cfg = generate_random_config()
                 label = f"r{round_num}_rand{idx+1}"
                 result = evaluate_and_record(rand_cfg["weights"], rand_cfg["multiplier_tiers"], label)
-                results_history.append(result)
+                if result:
+                    results_history.append(result)
 
-    # Sort by through_pnl_base (actual trading PnL) primary — the only metric that maps to
-    # real profit. net_pnl_usd (saved - missed) secondary, boost_gain tertiary when tiers active.
-    results_history.sort(
-        key=lambda r: (r["through_pnl_boosted"], r["net_pnl_usd"], r["combined"]),
-        reverse=True,
-    )
+    if args.strict:
+        # Strict mode: rank by win_rate > 50% first, then through_pnl.
+        # A config with 60% win rate and $+5 beats one with 40% win rate and $+20.
+        results_history.sort(
+            key=lambda r: (1 if r["win_rate_pct"] > 50 else 0,
+                           r["through_pnl_boosted"], r["net_pnl_usd"]),
+            reverse=True,
+        )
+        sort_note = "win_rate>50% first, then through_pnl"
+    elif args.lenient:
+        # Lenient mode: fewest winner misses first, then highest through_pnl.
+        # Goal: let ALL winners through while blocking as many losers as possible.
+        results_history.sort(
+            key=lambda r: (-(r["total_winners"] - r["winners_through"]),
+                           r["through_pnl_boosted"], r["losers_blocked"]),
+            reverse=False,
+        )
+        # Reverse=False because we want the smallest miss count first, but
+        # through_pnl and losers_blocked should be maximized — negate them inline.
+        results_history.sort(
+            key=lambda r: (r["total_winners"] - r["winners_through"],
+                           -r["through_pnl_boosted"], -r["losers_blocked"]),
+        )
+        sort_note = "fewest winner misses first, then through_pnl"
+    else:
+        # Normal mode: sort by through_pnl (actual trading PnL) — the only metric that
+        # maps to real profit. net_pnl_usd secondary, boost_gain tertiary when tiers active.
+        results_history.sort(
+            key=lambda r: (r["through_pnl_boosted"], r["net_pnl_usd"], r["combined"]),
+            reverse=True,
+        )
+        sort_note = "through_pnl = actual trading PnL"
 
     print("\n" + "=" * 80)
-    print("  OPTIMIZATION RESULTS — TOP 10  (sorted by through_pnl = actual trading PnL)")
+    print(f"  OPTIMIZATION RESULTS — TOP 10  (sorted by {sort_note})")
     print("=" * 80)
-    print(f"  {'Label':<20} {'ThroughPnL':>11} {'NetPnL':>8} {'Saved':>7} {'Missed':>7} {'Boost':>7} {'ScoreP50':>8} {'Miss%':>6}  Tiers")
-    print("  " + "-" * 90)
+    print(f"  {'Label':<20} {'ThroughPnL':>11} {'NetPnL':>8} {'WinRate':>8} {'PassRate':>9} {'Saved':>7} {'Missed':>7} {'Boost':>7} {'ScoreP50':>8} {'Miss%':>6}  Tiers")
+    print("  " + "-" * 110)
     for r in results_history[:10]:
         miss_pct = (r["total_winners"] - r["winners_through"]) / r["total_winners"] * 100
         flag = " !" if miss_pct / 100 > max_miss_rate else ""
         sp = r.get("score_pcts", {})
+        win_flag = "*" if r.get("win_rate_pct", 0) > 50 else " "
         print(
             f"  {r['label']:<20} ${r['through_pnl_boosted']:>+9.2f}  "
             f"${r['net_pnl_usd']:>+6.2f}  "
+            f"{r.get('win_rate_pct', 0):>7.0f}%{win_flag}  "
+            f"{r.get('pass_rate_pct', 0):>8.1f}%  "
             f"${r['pnl_saved_usd']:>5.2f}  ${r['pnl_missed_usd']:>5.2f}  "
             f"${r['boost_gain_usd']:>+5.2f}  "
             f"{sp.get('p50', 0):>8.2f}  "
@@ -800,11 +895,17 @@ def main() -> None:
     print("=" * 80)
     miss_pct = (best["total_winners"] - best["winners_through"]) / best["total_winners"] * 100
     print(f"  Label:             {best['label']}")
+    _mode_label = "STRICT" if args.strict else ("LENIENT" if args.lenient else "normal")
+    print(f"  Mode:              {_mode_label}")
     print(f"  Net PnL:           ${best['net_pnl_usd']:+.2f}  "
           f"(saved ${best['pnl_saved_usd']:.2f} — missed ${best['pnl_missed_usd']:.2f})")
     print(f"  Boost gain:        ${best['boost_gain_usd']:+.2f}  "
           f"(through base ${best['through_pnl_base']:+.2f} → boosted ${best['through_pnl_boosted']:+.2f})")
     print(f"  Combined score:    {best['combined']}")
+    print(f"  Win rate:          {best.get('win_rate_pct', 0):.0f}%  "
+          f"({best['winners_through']} winners / {best.get('trades_through', '?')} passed)")
+    print(f"  Pass rate:         {best.get('pass_rate_pct', 0):.1f}%  "
+          f"({best.get('trades_through', '?')} / {best['total_winners'] + best['total_losers']} trades)")
     print(f"  Winners through:   {best['winners_through']}/{best['total_winners']} ({miss_pct:.0f}% miss)")
     print(f"  Losers blocked:    {best['losers_blocked']}/{best['total_losers']}")
     print(f"  Passing score pcts: p25={sp.get('p25',0):.2f}  p50={sp.get('p50',0):.2f}  "

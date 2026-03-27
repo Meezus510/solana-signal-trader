@@ -222,6 +222,73 @@ def save_config(config: dict, path: Path = CONFIG_PATH) -> None:
         raise
 
 
+def _meta_value_changed(before: dict, after: dict, key: str) -> bool:
+    return before.get(key) != after.get(key)
+
+
+def assert_owned_config_changes(
+    before: dict,
+    after: dict,
+    *,
+    owned_strategy: str,
+    allowed_meta_keys: set[str] | None = None,
+    allowed_meta_prefixes: tuple[str, ...] = (),
+) -> None:
+    """
+    Ensure an agent only changed its own strategy block plus approved _meta keys.
+
+    This is the hard isolation boundary for multi-agent config mutation.
+    If any other strategy section changes, or if _meta keys outside the allowed
+    set/prefixes are modified, raise ValueError before the config is written.
+    """
+    allowed_meta_keys = allowed_meta_keys or set()
+
+    before_keys = set(before)
+    after_keys = set(after)
+    disallowed_top_level = (before_keys | after_keys) - {owned_strategy, "_meta"}
+    for key in sorted(disallowed_top_level):
+        if before.get(key) != after.get(key):
+            raise ValueError(
+                f"agent attempted to modify non-owned config section {key!r}; "
+                f"owned strategy is {owned_strategy!r}"
+            )
+
+    before_meta = before.get("_meta", {})
+    after_meta = after.get("_meta", {})
+    meta_keys = set(before_meta) | set(after_meta)
+    for key in sorted(meta_keys):
+        allowed = key in allowed_meta_keys or any(key.startswith(prefix) for prefix in allowed_meta_prefixes)
+        if allowed:
+            continue
+        if _meta_value_changed(before_meta, after_meta, key):
+            raise ValueError(
+                f"agent attempted to modify non-owned _meta key {key!r}; "
+                f"owned strategy is {owned_strategy!r}"
+            )
+
+
+def save_owned_config(
+    before: dict,
+    after: dict,
+    *,
+    owned_strategy: str,
+    allowed_meta_keys: set[str] | None = None,
+    allowed_meta_prefixes: tuple[str, ...] = (),
+    path: Path = CONFIG_PATH,
+) -> None:
+    """
+    Save config only if all mutations are confined to one owned strategy.
+    """
+    assert_owned_config_changes(
+        before,
+        after,
+        owned_strategy=owned_strategy,
+        allowed_meta_keys=allowed_meta_keys,
+        allowed_meta_prefixes=allowed_meta_prefixes,
+    )
+    save_config(after, path=path)
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------

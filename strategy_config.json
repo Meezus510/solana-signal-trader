@@ -20,7 +20,17 @@
     "live_trading": false,
     "stop_loss_pct": 0.05,
     "timeout_minutes": 60.0,
-    "timeout_min_gain_pct": 0.10
+    "timeout_min_gain_pct": 0.10,
+    "peak_drop_exit_pct": 0.08,
+    "early_timeout_minutes": 20.0,
+    "early_timeout_max_gain_pct": 0.02,
+    "early_timeout_min_range_pct": 0.05
+  },
+  "quick_pop": {
+    "peak_drop_exit_pct": 0.12,
+    "early_timeout_minutes": 12.0,
+    "early_timeout_max_gain_pct": 0.02,
+    "early_timeout_min_range_pct": 0.06
   },
   "trend_rider": {
     "live_trading": false,
@@ -34,9 +44,14 @@
     ],
     "timeout_minutes": 90.0,
     "timeout_min_gain_pct": 0.15,
-    "max_hold_minutes": 240.0
+    "max_hold_minutes": 240.0,
+    "peak_drop_exit_pct": 0.18,
+    "early_timeout_minutes": 25.0,
+    "early_timeout_max_gain_pct": 0.03,
+    "early_timeout_min_range_pct": 0.08
   },
   "trend_rider_managed": {
+    "ml_filter_mode": "balanced",
     "live_trading": false,
     "stop_loss_pct": 0.35,
     "trailing_stop_pct": 0.25,
@@ -49,6 +64,10 @@
     "timeout_minutes": 90.0,
     "timeout_min_gain_pct": 0.15,
     "max_hold_minutes": 240.0,
+    "peak_drop_exit_pct": 0.18,
+    "early_timeout_minutes": 25.0,
+    "early_timeout_max_gain_pct": 0.03,
+    "early_timeout_min_range_pct": 0.08,
     "use_chart_filter": false,
     "pump_ratio_max": 3.5,
     "use_reanalyze": false,
@@ -93,6 +112,10 @@
   },
   "quick_pop_managed": {
     "live_trading": true,
+    "peak_drop_exit_pct": 0.12,
+    "early_timeout_minutes": 12.0,
+    "early_timeout_max_gain_pct": 0.02,
+    "early_timeout_min_range_pct": 0.06,
     "use_policy_agent": false,
     "use_ai_override": false,
     "use_ai_override_shadow": false,
@@ -103,6 +126,19 @@
     "ml_max_score_threshold": 8.0,
     "ml_size_multiplier": 1.2,
     "ml_max_size_multiplier": 2.0,
+    "ml_k": 3,
+    "ml_halflife_days": 7.0,
+    "ml_score_low_pct": -45.0,
+    "ml_score_high_pct": 300.0
+  },
+  "open_ai_managed": {
+    "base_strategy": "quick_pop",
+    "mode": "balanced",
+    "live_trading": false,
+    "peak_drop_exit_pct": 0.12,
+    "early_timeout_minutes": 12.0,
+    "early_timeout_max_gain_pct": 0.02,
+    "early_timeout_min_range_pct": 0.06,
     "ml_k": 3,
     "ml_halflife_days": 7.0,
     "ml_score_low_pct": -45.0,

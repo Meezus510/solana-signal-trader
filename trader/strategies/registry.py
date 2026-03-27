@@ -37,10 +37,420 @@ from trader.trading.strategy import (
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# trend_rider_managed ML filter modes
+# ---------------------------------------------------------------------------
+# Each mode overrides ml_min_score and the three hard entry filters.
+# Config values in strategy_config.json still take final precedence over modes
+# (explicit config key beats the mode default), but if the key is absent the
+# mode value is used instead of the hardcoded default.
+#
+#  lenient  — mild filtering, keeps ~30-40 % of signals. Useful for data
+#             collection while reducing obvious duds.
+#  balanced — moderate filtering (~15-20 % pass). Good risk/reward trade-off
+#             once enough training data exists.
+#  strict   — aggressive filtering (≤5 % pass). Precision-first: only enter
+#             when the KNN is very confident AND hard filters all clear.
+#             Use this when win rate matters more than opportunity volume.
+_TREND_RIDER_ML_MODES: dict[str, dict] = {
+    "lenient": {
+        # Goal: miss ZERO winners, block as many losers as possible.
+        # Backtest (83 closed trades, 17W / 66L):
+        #   - hc_max=900  misses 4/17 winners (max winner hc = 2119) → raised to 3000
+        #   - ml_min=3.5  misses 0/17 winners (all winners scored ≥5.0)
+        #   - late_entry filters very loose so no moonshot is excluded
+        "use_ml_filter":                 True,
+        "ml_min_score":                  3.5,
+        "holder_count_max":              3000,
+        "late_entry_price_chg_30m_max":  350.0,
+        "late_entry_pump_ratio_min":     10.0,
+    },
+    "balanced": {
+        # Mirrors current production defaults — use this as the baseline.
+        "use_ml_filter":                 True,
+        "ml_min_score":                  5.0,
+        "holder_count_max":              1000,
+        "late_entry_price_chg_30m_max":  250.0,
+        "late_entry_pump_ratio_min":     20.0,
+    },
+    "strict": {
+        # Precision-first: only enter when ALL filters are very confident.
+        # Targets ≤5% pass rate with >50% win rate based on 687-trade backtest.
+        "use_ml_filter":                 True,
+        "ml_min_score":                  8.0,
+        "holder_count_max":              350,
+        "late_entry_price_chg_30m_max":  100.0,
+        "late_entry_pump_ratio_min":     8.0,
+        # buy_vol_ratio_1h < 0.016 → 60% win rate at 95% block (backtest)
+        "buy_vol_ratio_1h_max":          0.016,
+        # market_cap_usd > $300k → 60% win rate at 95% block (backtest)
+        "market_cap_usd_min":            300_000.0,
+        # Tighter stop loss: fewer false-stop-outs, limits damage when wrong
+        "stop_loss_pct":                 0.18,
+        "trailing_stop_pct":             0.20,
+    },
+}
+
+# ---------------------------------------------------------------------------
+# open_ai_managed profiles
+# ---------------------------------------------------------------------------
+# One OpenAI-managed strategy with:
+#   - its own isolated paper portfolio
+#   - switchable base strategy family
+#   - switchable aggressiveness mode
+#   - local backtests driving config updates
+#
+# Supported base families:
+#   quick_pop, trend_rider, safe_bet, infinite_moonbag
+#
+# Mode semantics:
+#   allow_all — disable gating; take every signal
+#   lenient   — loose filters, maximize opportunity volume
+#   balanced  — default live research mode
+#   strict    — precision-first
+#   block_all — reject every new entry but keep managing open positions
+_OPEN_AI_QP_WEIGHTS: tuple[float, ...] = (
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    10.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 8.0, 4.0, 3.0, 0.0, 0.0,
+    0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0,
+    0.0, 1.0,
+    0.0, 0.0, 0.0, 4.0, 0.0, 0.0,
+    0.0, 1.0, 2.0, 0.0, 2.5, 0.5, 1.5, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 2.5, 0.0, 0.0,
+)
+
+_OPEN_AI_TR_WEIGHTS: tuple[float, ...] = (
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    3.2, 0.0, 3.2, 0.0, 2.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 3.2, 2.2,
+    0.0, 2.2, 0.0,
+    0.0, 0.1, 0.0, 0.0,
+    2.0, 1.5,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+)
+
+_OPEN_AI_MB_WEIGHTS: tuple[float, ...] = (
+    3.0, 1.0, 3.0, 1.0, 3.0, 1.0,
+    7.6, 1.78, 6.9, 5.1, 0.38, 0.28,
+    0.0, 0.0, 0.0, 0.0, 0.01, 0.22,
+    0.04, 0.02, 0.0,
+    0.0, 0.12, 0.0, 0.0,
+    1.5, 4.0,
+)
+
+_OPEN_AI_MANAGED_BASES: dict[str, dict] = {
+    "quick_pop": {
+        "runner": "standard",
+        "buy_size_usd": 30.0,
+        "timeout_minutes": 45.0,
+        "timeout_min_gain_pct": 0.49,
+        "max_hold_minutes": None,
+        "peak_drop_exit_pct": 0.12,
+        "early_timeout_minutes": 12.0,
+        "early_timeout_max_gain_pct": 0.02,
+        "early_timeout_min_range_pct": 0.06,
+        "ml_training_strategy": "quick_pop",
+        "ml_training_label": "position_peak_pnl_pct",
+        "ml_use_subminute": True,
+        "ml_k": 3,
+        "ml_halflife_days": 7.0,
+        "ml_score_low_pct": -45.0,
+        "ml_score_high_pct": 300.0,
+        "ml_feature_weights": _OPEN_AI_QP_WEIGHTS,
+        "tp_levels": [[1.26, 0.78], [1.98, 0.22]],
+        "stop_loss_pct": 0.06,
+        "trailing_stop_pct": 0.07,
+    },
+    "trend_rider": {
+        "runner": "standard",
+        "buy_size_usd": 10.0,
+        "timeout_minutes": 90.0,
+        "timeout_min_gain_pct": 0.15,
+        "max_hold_minutes": 240.0,
+        "peak_drop_exit_pct": 0.18,
+        "early_timeout_minutes": 25.0,
+        "early_timeout_max_gain_pct": 0.03,
+        "early_timeout_min_range_pct": 0.08,
+        "ml_training_strategy": "trend_rider",
+        "ml_training_label": "outcome_pnl_pct",
+        "ml_use_subminute": False,
+        "ml_k": 5,
+        "ml_halflife_days": 14.0,
+        "ml_score_low_pct": -35.0,
+        "ml_score_high_pct": 85.0,
+        "ml_feature_weights": _OPEN_AI_TR_WEIGHTS,
+        "tp_levels": [[2.5, 0.50]],
+        "stop_loss_pct": 0.35,
+        "trailing_stop_pct": 0.28,
+    },
+    "safe_bet": {
+        "runner": "standard",
+        "buy_size_usd": 30.0,
+        "timeout_minutes": 60.0,
+        "timeout_min_gain_pct": 0.10,
+        "max_hold_minutes": None,
+        "peak_drop_exit_pct": 0.08,
+        "early_timeout_minutes": 20.0,
+        "early_timeout_max_gain_pct": 0.02,
+        "early_timeout_min_range_pct": 0.05,
+        "ml_training_strategy": "safe_bet",
+        "ml_training_label": "outcome_pnl_pct",
+        "ml_use_subminute": False,
+        "ml_k": 5,
+        "ml_halflife_days": 14.0,
+        "ml_score_low_pct": -20.0,
+        "ml_score_high_pct": 25.0,
+        "ml_feature_weights": None,
+        "tp_levels": [[1.20, 1.0]],
+        "stop_loss_pct": 0.05,
+        "trailing_stop_pct": 0.05,
+        "use_real_exit_price": True,
+    },
+    "infinite_moonbag": {
+        "runner": "moonbag",
+        "buy_size_usd": 5.0,
+        "timeout_minutes": None,
+        "timeout_min_gain_pct": None,
+        "max_hold_minutes": None,
+        "peak_drop_exit_pct": None,
+        "early_timeout_minutes": None,
+        "early_timeout_max_gain_pct": None,
+        "early_timeout_min_range_pct": None,
+        "ml_training_strategy": "infinite_moonbag",
+        "ml_training_label": "position_peak_pnl_pct",
+        "ml_use_subminute": True,
+        "ml_k": 3,
+        "ml_halflife_days": 14.0,
+        "ml_score_low_pct": 0.0,
+        "ml_score_high_pct": 200.0,
+        "ml_feature_weights": _OPEN_AI_MB_WEIGHTS,
+        "tp_levels": [[1.5, 0.15], [2.5, 0.12], [4.0, 0.12], [6.0, 0.08]],
+        "stop_loss_pct": 0.35,
+        "trailing_stop_pct": 0.35,
+    },
+}
+
+_OPEN_AI_MANAGED_MODES: dict[str, dict[str, dict]] = {
+    "quick_pop": {
+        "allow_all": {
+            "use_ml_filter": False,
+            "block_new_entries": False,
+            "holder_count_max": None,
+            "late_entry_price_chg_30m_max": None,
+            "late_entry_pump_ratio_min": None,
+            "buy_vol_ratio_1h_max": None,
+            "market_cap_usd_min": None,
+            "ml_wallet_momentum_max": None,
+        },
+        "lenient": {
+            "use_ml_filter": True,
+            "block_new_entries": False,
+            "tp_levels": [[1.16, 0.60], [1.85, 0.40]],
+            "stop_loss_pct": 0.06,
+            "trailing_stop_pct": 0.07,
+            "ml_min_score": 2.0,
+            "ml_high_score_threshold": 6.0,
+            "ml_max_score_threshold": 6.0,
+            "ml_size_multiplier": 1.10,
+            "ml_max_size_multiplier": 1.75,
+            "holder_count_max": 1500,
+            "late_entry_price_chg_30m_max": 180.0,
+            "late_entry_pump_ratio_min": 15.0,
+            "buy_vol_ratio_1h_max": 0.55,
+            "market_cap_usd_min": None,
+            "ml_wallet_momentum_max": None,
+        },
+        "balanced": {
+            "use_ml_filter": True,
+            "block_new_entries": False,
+            "tp_levels": [[1.16, 0.60], [2.30, 0.40]],
+            "stop_loss_pct": 0.08,
+            "trailing_stop_pct": 0.12,
+            "ml_min_score": 2.25,
+            "ml_high_score_threshold": 5.0,
+            "ml_max_score_threshold": 6.0,
+            "ml_size_multiplier": 1.35,
+            "ml_max_size_multiplier": 1.75,
+            "holder_count_max": 1000,
+            "late_entry_price_chg_30m_max": 250.0,
+            "late_entry_pump_ratio_min": 10.0,
+            "buy_vol_ratio_1h_max": 0.65,
+            "market_cap_usd_min": None,
+            "ml_wallet_momentum_max": 2.5,
+        },
+        "strict": {
+            "use_ml_filter": True,
+            "block_new_entries": False,
+            "tp_levels": [[1.16, 0.70], [1.85, 0.30]],
+            "stop_loss_pct": 0.12,
+            "trailing_stop_pct": 0.07,
+            "ml_min_score": 2.25,
+            "ml_high_score_threshold": 4.5,
+            "ml_max_score_threshold": 7.0,
+            "ml_size_multiplier": 1.10,
+            "ml_max_size_multiplier": 1.20,
+            "holder_count_max": 1500,
+            "late_entry_price_chg_30m_max": 180.0,
+            "late_entry_pump_ratio_min": 20.0,
+            "buy_vol_ratio_1h_max": 0.65,
+            "market_cap_usd_min": 100_000.0,
+            "ml_wallet_momentum_max": 2.102,
+        },
+        "block_all": {
+            "use_ml_filter": False,
+            "block_new_entries": True,
+        },
+    },
+    "trend_rider": {
+        "allow_all": {
+            "use_ml_filter": False,
+            "block_new_entries": False,
+            "holder_count_max": None,
+            "late_entry_price_chg_30m_max": None,
+            "late_entry_pump_ratio_min": None,
+            "buy_vol_ratio_1h_max": None,
+            "market_cap_usd_min": None,
+        },
+        "lenient": {
+            "use_ml_filter": True,
+            "block_new_entries": False,
+            "ml_min_score": 3.5,
+            "ml_high_score_threshold": 6.5,
+            "ml_max_score_threshold": 8.0,
+            "ml_size_multiplier": 1.25,
+            "ml_max_size_multiplier": 1.75,
+            "holder_count_max": 3000,
+            "late_entry_price_chg_30m_max": 350.0,
+            "late_entry_pump_ratio_min": 10.0,
+            "buy_vol_ratio_1h_max": None,
+            "market_cap_usd_min": None,
+        },
+        "balanced": {
+            "use_ml_filter": True,
+            "block_new_entries": False,
+            "ml_min_score": 5.0,
+            "ml_high_score_threshold": 8.0,
+            "ml_max_score_threshold": 9.5,
+            "ml_size_multiplier": 1.50,
+            "ml_max_size_multiplier": 2.50,
+            "holder_count_max": 1000,
+            "late_entry_price_chg_30m_max": 250.0,
+            "late_entry_pump_ratio_min": 20.0,
+            "buy_vol_ratio_1h_max": None,
+            "market_cap_usd_min": None,
+        },
+        "strict": {
+            "use_ml_filter": True,
+            "block_new_entries": False,
+            "ml_min_score": 8.0,
+            "ml_high_score_threshold": 8.5,
+            "ml_max_score_threshold": 9.5,
+            "ml_size_multiplier": 1.50,
+            "ml_max_size_multiplier": 2.50,
+            "holder_count_max": 350,
+            "late_entry_price_chg_30m_max": 100.0,
+            "late_entry_pump_ratio_min": 8.0,
+            "buy_vol_ratio_1h_max": 0.016,
+            "market_cap_usd_min": 300_000.0,
+            "stop_loss_pct": 0.18,
+            "trailing_stop_pct": 0.20,
+        },
+        "block_all": {
+            "use_ml_filter": False,
+            "block_new_entries": True,
+        },
+    },
+    "safe_bet": {
+        "allow_all": {
+            "use_ml_filter": False,
+            "block_new_entries": False,
+        },
+        "lenient": {
+            "use_ml_filter": False,
+            "block_new_entries": False,
+            "holder_count_max": 3000,
+        },
+        "balanced": {
+            "use_ml_filter": False,
+            "block_new_entries": False,
+            "holder_count_max": 1500,
+            "buy_vol_ratio_1h_max": 0.75,
+        },
+        "strict": {
+            "use_ml_filter": False,
+            "block_new_entries": False,
+            "holder_count_max": 700,
+            "buy_vol_ratio_1h_max": 0.65,
+            "market_cap_usd_min": 100_000.0,
+        },
+        "block_all": {
+            "use_ml_filter": False,
+            "block_new_entries": True,
+        },
+    },
+    "infinite_moonbag": {
+        "allow_all": {
+            "use_ml_filter": False,
+            "block_new_entries": False,
+            "holder_count_max": None,
+            "late_entry_price_chg_30m_max": None,
+            "late_entry_pump_ratio_min": None,
+        },
+        "lenient": {
+            "use_ml_filter": True,
+            "block_new_entries": False,
+            "ml_min_score": 2.0,
+            "ml_high_score_threshold": 6.0,
+            "ml_max_score_threshold": 8.0,
+            "ml_size_multiplier": 1.25,
+            "ml_max_size_multiplier": 1.75,
+            "holder_count_max": 2000,
+            "late_entry_price_chg_30m_max": 350.0,
+            "late_entry_pump_ratio_min": 10.0,
+        },
+        "balanced": {
+            "use_ml_filter": True,
+            "block_new_entries": False,
+            "ml_min_score": 2.0,
+            "ml_high_score_threshold": 6.0,
+            "ml_max_score_threshold": 8.0,
+            "ml_size_multiplier": 2.0,
+            "ml_max_size_multiplier": 3.0,
+            "holder_count_max": 1000,
+            "late_entry_price_chg_30m_max": 250.0,
+            "late_entry_pump_ratio_min": 20.0,
+        },
+        "strict": {
+            "use_ml_filter": True,
+            "block_new_entries": False,
+            "ml_min_score": 3.0,
+            "ml_high_score_threshold": 6.5,
+            "ml_max_score_threshold": 8.5,
+            "ml_size_multiplier": 1.5,
+            "ml_max_size_multiplier": 2.0,
+            "holder_count_max": 700,
+            "late_entry_price_chg_30m_max": 180.0,
+            "late_entry_pump_ratio_min": 10.0,
+            "buy_vol_ratio_1h_max": 0.65,
+        },
+        "block_all": {
+            "use_ml_filter": False,
+            "block_new_entries": True,
+        },
+    },
+}
+
 _CONTROLLED = frozenset([
     "trend_rider", "trend_rider_managed",
     "infinite_moonbag", "moonbag_managed",
     "quick_pop_managed",
+    "open_ai_managed",
     "safe_bet",
 ])
 
@@ -117,7 +527,12 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         starting_cash_usd=cfg.starting_cash_usd,
         timeout_minutes=45.0,
         timeout_min_gain_pct=0.49,
+        peak_drop_exit_pct=_o("quick_pop").get("peak_drop_exit_pct", None),
+        early_timeout_minutes=_o("quick_pop").get("early_timeout_minutes", None),
+        early_timeout_max_gain_pct=_o("quick_pop").get("early_timeout_max_gain_pct", None),
+        early_timeout_min_range_pct=_o("quick_pop").get("early_timeout_min_range_pct", None),
         save_chart_data=True,
+        recently_closed_cooldown_minutes=_o("quick_pop").get("recently_closed_cooldown_minutes", 30.0),
     )
 
     trend_rider_cfg = StrategyConfig(
@@ -132,8 +547,13 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         timeout_minutes=_o("trend_rider").get("timeout_minutes", 90.0),
         timeout_min_gain_pct=_o("trend_rider").get("timeout_min_gain_pct", 0.15),
         max_hold_minutes=_o("trend_rider").get("max_hold_minutes", 240.0),
+        peak_drop_exit_pct=_o("trend_rider").get("peak_drop_exit_pct", None),
+        early_timeout_minutes=_o("trend_rider").get("early_timeout_minutes", None),
+        early_timeout_max_gain_pct=_o("trend_rider").get("early_timeout_max_gain_pct", None),
+        early_timeout_min_range_pct=_o("trend_rider").get("early_timeout_min_range_pct", None),
         live_trading=_o("trend_rider").get("live_trading", False),
         save_chart_data=True,
+        recently_closed_cooldown_minutes=_o("trend_rider").get("recently_closed_cooldown_minutes", 30.0),
     )
 
     moonbag_cfg = StrategyConfig(
@@ -150,6 +570,7 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         starting_cash_usd=cfg.starting_cash_usd,
         save_chart_data=True,
         live_trading=_o("infinite_moonbag").get("live_trading", False),
+        recently_closed_cooldown_minutes=_o("infinite_moonbag").get("recently_closed_cooldown_minutes", 30.0),
     )
 
     safe_bet_cfg = StrategyConfig(
@@ -163,9 +584,14 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         starting_cash_usd=cfg.starting_cash_usd,
         timeout_minutes=_o("safe_bet").get("timeout_minutes", 60.0),
         timeout_min_gain_pct=_o("safe_bet").get("timeout_min_gain_pct", 0.10),
+        peak_drop_exit_pct=_o("safe_bet").get("peak_drop_exit_pct", None),
+        early_timeout_minutes=_o("safe_bet").get("early_timeout_minutes", None),
+        early_timeout_max_gain_pct=_o("safe_bet").get("early_timeout_max_gain_pct", None),
+        early_timeout_min_range_pct=_o("safe_bet").get("early_timeout_min_range_pct", None),
         save_chart_data=True,
         live_trading=_o("safe_bet").get("live_trading", False),
         use_real_exit_price=True,
+        recently_closed_cooldown_minutes=_o("safe_bet").get("recently_closed_cooldown_minutes", 30.0),
     )
 
     # ------------------------------------------------------------------
@@ -211,7 +637,7 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
             10.0, 0.0, 0.0, 0.0, 0.0, 0.0,           # idx  6-11: 1m OHLCV
             0.0, 8.0, 4.0, 3.0, 0.0, 0.0,            # idx 12-17: pair stats + source_channel
             0.0, 0.0, 0.0,                            # idx 18-20: token metadata
-            0.0, 0.0, 0.0, 3.0,                      # idx 21-24: wallet (5m)
+            0.0, 0.0, 0.0, 0.0,                      # idx 21-24: wallet (5m) — idx 24 buy_vol_ratio_5m zeroed (hard filter)
             0.0, 1.0,                                 # idx 25-26: wallet_momentum_30m, top10_holder_pct
             0.0, 0.0, 0.0, 4.0, 0.0, 0.0,            # idx 27-32: 1s OHLCV
             0.0, 1.0, 2.0, 0.0, 2.5, 0.5, 1.5, 0.0, 0.0, 0.0,  # idx 33-42: 15s shape
@@ -221,40 +647,68 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         # Hard pre-filter: block signals with wallet_momentum_5m >= 2.102.
         # LOO backtest on 197 trades: blocks 9/134 losers with 0 winner misses.
         ml_wallet_momentum_max=2.102,
+        # Hard entry filters (data-derived, independent of ML).
+        holder_count_max=_qp_chart.get("holder_count_max", 1000),
+        late_entry_price_chg_30m_max=_qp_chart.get("late_entry_price_chg_30m_max", 250.0),
+        late_entry_pump_ratio_min=_qp_chart.get("late_entry_pump_ratio_min", 20.0),
+        peak_drop_exit_pct=_qp_chart.get("peak_drop_exit_pct", None),
+        early_timeout_minutes=_qp_chart.get("early_timeout_minutes", None),
+        early_timeout_max_gain_pct=_qp_chart.get("early_timeout_max_gain_pct", None),
+        early_timeout_min_range_pct=_qp_chart.get("early_timeout_min_range_pct", None),
         live_trading=_qp_chart.get("live_trading", False),
+        recently_closed_cooldown_minutes=_qp_chart.get("recently_closed_cooldown_minutes", 30.0),
     )
 
     _tr_chart = _o("trend_rider_managed")
+    # Resolve mode defaults: explicit config keys override mode, mode overrides hardcoded defaults.
+    _tr_mode_name = _tr_chart.get("ml_filter_mode")
+    _tr_mode = _TREND_RIDER_ML_MODES.get(_tr_mode_name, {}) if _tr_mode_name else {}
+    if _tr_mode_name and _tr_mode_name not in _TREND_RIDER_ML_MODES:
+        logger.warning("[registry] Unknown trend_rider ml_filter_mode %r — ignoring", _tr_mode_name)
+
+    def _tr(key, default):
+        """Resolve: explicit config > mode default > hardcoded default."""
+        if key in _tr_chart:
+            return _tr_chart[key]
+        return _tr_mode.get(key, default)
+
+    if _tr_mode_name:
+        logger.info("[registry] trend_rider_managed ml_filter_mode=%r", _tr_mode_name)
+
     trend_rider_chart_cfg = StrategyConfig(
         name="trend_rider_managed",
         buy_size_usd=cfg.buy_size_usd,
-        stop_loss_pct=_tr_chart.get("stop_loss_pct", 0.30),
+        stop_loss_pct=_tr("stop_loss_pct", 0.30),
         take_profit_levels=_tp("trend_rider_managed", [
             TakeProfitLevel(multiple=1.8, sell_fraction_original=0.50),
         ]),
-        trailing_stop_pct=_tr_chart.get("trailing_stop_pct", 0.30),
+        trailing_stop_pct=_tr("trailing_stop_pct", 0.30),
         starting_cash_usd=cfg.starting_cash_usd,
-        timeout_minutes=_tr_chart.get("timeout_minutes", 90.0),
-        timeout_min_gain_pct=_tr_chart.get("timeout_min_gain_pct", 0.15),
-        max_hold_minutes=_tr_chart.get("max_hold_minutes", 240.0),
+        timeout_minutes=_tr("timeout_minutes", 90.0),
+        timeout_min_gain_pct=_tr("timeout_min_gain_pct", 0.15),
+        max_hold_minutes=_tr("max_hold_minutes", 240.0),
         save_chart_data=True,
-        use_chart_filter=_tr_chart.get("use_chart_filter", True),
-        pump_ratio_max=_tr_chart.get("pump_ratio_max", 3.5),
-        use_reanalyze=_tr_chart.get("use_reanalyze", True),
-        reanalyze_pump_delay=_tr_chart.get("reanalyze_pump_delay", 480.0),
-        reanalyze_vol_delay=_tr_chart.get("reanalyze_vol_delay", 240.0),
-        reanalyze_both_delay=_tr_chart.get("reanalyze_both_delay", 600.0),
+        use_chart_filter=_tr("use_chart_filter", True),
+        pump_ratio_max=_tr("pump_ratio_max", 3.5),
+        use_reanalyze=_tr("use_reanalyze", True),
+        reanalyze_pump_delay=_tr("reanalyze_pump_delay", 480.0),
+        reanalyze_vol_delay=_tr("reanalyze_vol_delay", 240.0),
+        reanalyze_both_delay=_tr("reanalyze_both_delay", 600.0),
         ml_training_strategy="trend_rider",
-        use_ml_filter=_tr_chart.get("use_ml_filter", False),
-        ml_min_score=_tr_chart.get("ml_min_score", 5.0),
-        ml_high_score_threshold=_tr_chart.get("ml_high_score_threshold", 8.0),
-        ml_max_score_threshold=_tr_chart.get("ml_max_score_threshold", 9.5),
-        ml_size_multiplier=_tr_chart.get("ml_size_multiplier", 2.0),
-        ml_max_size_multiplier=_tr_chart.get("ml_max_size_multiplier", 3.0),
-        ml_k=int(_tr_chart.get("ml_k", 5)),
-        ml_halflife_days=_tr_chart.get("ml_halflife_days", 14.0),
-        ml_score_low_pct=_tr_chart.get("ml_score_low_pct", -35.0),
-        ml_score_high_pct=_tr_chart.get("ml_score_high_pct", 85.0),
+        peak_drop_exit_pct=_tr("peak_drop_exit_pct", None),
+        early_timeout_minutes=_tr("early_timeout_minutes", None),
+        early_timeout_max_gain_pct=_tr("early_timeout_max_gain_pct", None),
+        early_timeout_min_range_pct=_tr("early_timeout_min_range_pct", None),
+        use_ml_filter=_tr("use_ml_filter", False),
+        ml_min_score=_tr("ml_min_score", 5.0),
+        ml_high_score_threshold=_tr("ml_high_score_threshold", 8.0),
+        ml_max_score_threshold=_tr("ml_max_score_threshold", 9.5),
+        ml_size_multiplier=_tr("ml_size_multiplier", 2.0),
+        ml_max_size_multiplier=_tr("ml_max_size_multiplier", 3.0),
+        ml_k=int(_tr("ml_k", 5)),
+        ml_halflife_days=_tr("ml_halflife_days", 14.0),
+        ml_score_low_pct=_tr("ml_score_low_pct", -35.0),
+        ml_score_high_pct=_tr("ml_score_high_pct", 85.0),
         # Feature weights for trend_rider KNN (63 features total).
         # trend_rider is ml_use_subminute=False → candles_15s=[] and candles_1s=None at inference.
         # Locked to 0: idx 0-5 (15s OHLCV), 27-42 (1s OHLCV + 15s shape), 53-62 (1s shape).
@@ -264,14 +718,21 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
             3.2, 0.0, 3.2, 0.0, 2.0, 0.0,            # idx  6-11: 1m OHLCV
             0.0, 0.0, 0.0, 0.0, 3.2, 2.2,            # idx 12-17: pair stats + source_channel
             0.0, 2.2, 0.0,                            # idx 18-20: token metadata
-            0.0, 0.1, 0.0, 1.8,                      # idx 21-24: wallet (5m)
+            0.0, 0.1, 0.0, 0.0,                      # idx 21-24: wallet (5m) — idx 24 buy_vol_ratio_5m zeroed (hard filter)
             2.0, 1.5,                                 # idx 25-26: wallet_momentum_30m, top10_holder_pct
             0.0, 0.0, 0.0, 0.0, 0.0, 0.0,            # idx 27-32: 1s OHLCV — locked
             0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # idx 33-42: 15s shape — locked
             1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,  # idx 43-52: 1m shape
             0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,  # idx 53-62: 1s shape — locked
         ),
-        live_trading=_tr_chart.get("live_trading", False),
+        # Hard entry filters (data-derived, independent of ML).
+        holder_count_max=_tr("holder_count_max", 1000),
+        late_entry_price_chg_30m_max=_tr("late_entry_price_chg_30m_max", 250.0),
+        late_entry_pump_ratio_min=_tr("late_entry_pump_ratio_min", 20.0),
+        buy_vol_ratio_1h_max=_tr("buy_vol_ratio_1h_max", None),
+        market_cap_usd_min=_tr("market_cap_usd_min", None),
+        live_trading=_tr("live_trading", False),
+        recently_closed_cooldown_minutes=_tr("recently_closed_cooldown_minutes", 30.0),
     )
 
     _mb_chart = _o("moonbag_managed")
@@ -342,18 +803,97 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
             7.6, 1.78, 6.9, 5.1, 0.38, 0.28,   # idx  6-11: 1m OHLCV
             0.0, 0.0, 0.0, 0.0, 0.01, 0.22,    # idx 12-17: pair stats + source_channel
             0.04, 0.02, 0.0,                    # idx 18-20: token metadata
-            0.0, 0.12, 0.0, 6.9,               # idx 21-24: wallet (5m)
+            0.0, 0.12, 0.0, 0.0,               # idx 21-24: wallet (5m) — idx 24 buy_vol_ratio_5m zeroed (hard filter)
             1.5, 4.0,                           # idx 25-26: wallet_momentum_30m, top10_holder_pct
         ),
+        # Hard entry filters (data-derived, independent of ML).
+        holder_count_max=_mb_chart.get("holder_count_max", 1000),
+        late_entry_price_chg_30m_max=_mb_chart.get("late_entry_price_chg_30m_max", 250.0),
+        late_entry_pump_ratio_min=_mb_chart.get("late_entry_pump_ratio_min", 20.0),
         live_trading=_mb_chart.get("live_trading", False),
+        recently_closed_cooldown_minutes=_mb_chart.get("recently_closed_cooldown_minutes", 30.0),
     )
+
+    _oa = _o("open_ai_managed")
+    _oa_base_name = _oa.get("base_strategy", "quick_pop")
+    _oa_base = _OPEN_AI_MANAGED_BASES.get(_oa_base_name, _OPEN_AI_MANAGED_BASES["quick_pop"])
+    if _oa_base_name not in _OPEN_AI_MANAGED_BASES:
+        logger.warning("[registry] Unknown open_ai_managed base_strategy %r — using 'quick_pop'", _oa_base_name)
+        _oa_base_name = "quick_pop"
+    _oa_mode_name = _oa.get("mode", "balanced")
+    _oa_mode_table = _OPEN_AI_MANAGED_MODES.get(_oa_base_name, _OPEN_AI_MANAGED_MODES["quick_pop"])
+    _oa_mode = _oa_mode_table.get(_oa_mode_name, _oa_mode_table["balanced"])
+    if _oa_mode_name not in _oa_mode_table:
+        logger.warning("[registry] Unknown open_ai_managed mode %r for %s — using 'balanced'", _oa_mode_name, _oa_base_name)
+        _oa_mode_name = "balanced"
+    logger.info("[registry] open_ai_managed base=%r mode=%r", _oa_base_name, _oa_mode_name)
+
+    def _oa_v(key: str, default):
+        if key in _oa:
+            return _oa[key]
+        if key in _oa_mode:
+            return _oa_mode[key]
+        if key in _oa_base:
+            return _oa_base[key]
+        return _oa_mode.get(key, default)
+
+    open_ai_managed_cfg = StrategyConfig(
+        name="open_ai_managed",
+        buy_size_usd=_oa_v("buy_size_usd", 30.0),
+        stop_loss_pct=_oa_v("stop_loss_pct", 0.08),
+        take_profit_levels=_tp("open_ai_managed", [
+            TakeProfitLevel(multiple=1.16, sell_fraction_original=0.60),
+            TakeProfitLevel(multiple=2.30, sell_fraction_original=0.40),
+        ]),
+        trailing_stop_pct=_oa_v("trailing_stop_pct", 0.12),
+        starting_cash_usd=cfg.starting_cash_usd,
+        timeout_minutes=_oa_v("timeout_minutes", 45.0),
+        timeout_min_gain_pct=_oa_v("timeout_min_gain_pct", 0.49),
+        max_hold_minutes=_oa_v("max_hold_minutes", None),
+        save_chart_data=True,
+        use_chart_filter=False,
+        use_ml_filter=_oa_v("use_ml_filter", True),
+        ml_training_strategy=_oa_v("ml_training_strategy", "quick_pop"),
+        ml_training_label=_oa_v("ml_training_label", "position_peak_pnl_pct"),
+        ml_use_subminute=_oa_v("ml_use_subminute", True),
+        ml_min_score=_oa_v("ml_min_score", 2.25),
+        ml_high_score_threshold=_oa_v("ml_high_score_threshold", 5.0),
+        ml_max_score_threshold=_oa_v("ml_max_score_threshold", 6.0),
+        ml_size_multiplier=_oa_v("ml_size_multiplier", 1.35),
+        ml_max_size_multiplier=_oa_v("ml_max_size_multiplier", 1.75),
+        ml_k=int(_oa_v("ml_k", 3)),
+        ml_halflife_days=_oa_v("ml_halflife_days", 7.0),
+        ml_score_low_pct=_oa_v("ml_score_low_pct", -45.0),
+        ml_score_high_pct=_oa_v("ml_score_high_pct", 300.0),
+        ml_feature_weights=(
+            tuple(_oa_v("ml_feature_weights", ()))
+            if _oa_v("ml_feature_weights", None) is not None else None
+        ),
+        ml_wallet_momentum_max=_oa_v("ml_wallet_momentum_max", 2.5),
+        holder_count_max=_oa_v("holder_count_max", 1000),
+        late_entry_price_chg_30m_max=_oa_v("late_entry_price_chg_30m_max", 250.0),
+        late_entry_pump_ratio_min=_oa_v("late_entry_pump_ratio_min", 10.0),
+        buy_vol_ratio_1h_max=_oa_v("buy_vol_ratio_1h_max", 0.65),
+        market_cap_usd_min=_oa_v("market_cap_usd_min", None),
+        peak_drop_exit_pct=_oa_v("peak_drop_exit_pct", 0.12),
+        early_timeout_minutes=_oa_v("early_timeout_minutes", 12.0),
+        early_timeout_max_gain_pct=_oa_v("early_timeout_max_gain_pct", 0.02),
+        early_timeout_min_range_pct=_oa_v("early_timeout_min_range_pct", 0.06),
+        live_trading=_oa.get("live_trading", False),
+        recently_closed_cooldown_minutes=_oa.get("recently_closed_cooldown_minutes", 30.0),
+        use_real_exit_price=_oa_v("use_real_exit_price", False),
+        block_new_entries=_oa_v("block_new_entries", False),
+    )
+
+    open_ai_runner_cls = InfiniteMoonbagRunner if _oa_base.get("runner") == "moonbag" else StrategyRunner
 
     return [
         StrategyRunner(cfg=quick_pop_cfg, db=db),
         StrategyRunner(cfg=trend_rider_cfg, db=db),
-        InfiniteMoonbagRunner(cfg=moonbag_cfg, db=db),
+        # InfiniteMoonbagRunner(cfg=moonbag_cfg, db=db),      # disabled: trend_rider outperforms
         StrategyRunner(cfg=safe_bet_cfg, db=db),
         StrategyRunner(cfg=quick_pop_chart_cfg, db=db),
+        open_ai_runner_cls(cfg=open_ai_managed_cfg, db=db),
         StrategyRunner(cfg=trend_rider_chart_cfg, db=db),
-        InfiniteMoonbagRunner(cfg=moonbag_chart_cfg, db=db),
+        # InfiniteMoonbagRunner(cfg=moonbag_chart_cfg, db=db),  # disabled: trend_rider_managed outperforms
     ]

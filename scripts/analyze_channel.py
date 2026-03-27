@@ -67,7 +67,7 @@ async def fetch_messages(channel: str, limit: int) -> list[dict]:
     tg_api_hash  = _require("TG_API_HASH")
     tg_phone     = os.getenv("TG_PHONE", "").strip() or None
     session_str  = os.getenv("TG_SESSION_STRING", "").strip()
-    session_file = "trader/listener/tg_session"
+    session_file = "scripts/analyze_session"
 
     session = StringSession(session_str) if session_str else session_file
     client  = TelegramClient(session, tg_api_id, tg_api_hash)
