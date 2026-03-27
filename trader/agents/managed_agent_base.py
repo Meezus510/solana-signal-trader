@@ -10,7 +10,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from trader.agents.base import log_agent_action, query_exit_stats, query_recent_trades, query_score_buckets
+from trader.agents.base import (
+    log_agent_action,
+    query_exit_stats,
+    query_recent_trades,
+    query_regime_context,
+    query_score_buckets,
+)
 from trader.agents.strategy_tuner import load_config, save_owned_config
 from trader.analysis.managed_backtest import (
     backtest_managed_config,
@@ -125,6 +131,7 @@ def build_managed_prompt(
     exit_stats: list[dict],
     recent: list[dict],
     score_buckets: list[dict],
+    regime_context: dict[str, Any],
 ) -> str:
     managed_spec = get_managed_strategy_spec(spec.strategy_name)
     base_list = " | ".join(sorted(managed_spec.bases))
@@ -159,9 +166,15 @@ Recent {spec.strategy_name} trades:
 ML score buckets for {spec.strategy_name}:
 {json.dumps(score_buckets, indent=2)}
 
+Recent regime/context snapshot:
+{json.dumps(regime_context, indent=2)}
+
 Rules:
 - Prefer simple changes over wide churn.
 - If the current setup is clearly worse than a leaderboard option, switch to that base/mode.
+- Use regime/context data to decide when the current mode is too strict or too loose.
+- If managed_strategy_recent block_rate is extremely high while base_strategy_recent looks healthy,
+  consider loosening filters or switching base_strategy.
 - Use block_all only as an emergency brake, not as a default.
 - If you change tp_levels, return the full list.
 - If you change ml_feature_weights, return the full list.
@@ -198,8 +211,22 @@ def run_managed_agent(
     exit_stats = query_exit_stats(db_path, spec.strategy_name)
     recent = query_recent_trades(db_path, spec.strategy_name, limit=20)
     score_buckets = query_score_buckets(db_path, spec.strategy_name)
+    regime_context = query_regime_context(
+        db_path,
+        spec.strategy_name,
+        base_strategy=current.get("base_strategy"),
+    )
 
-    prompt = build_managed_prompt(spec, current, current_metrics, leaderboard, exit_stats, recent, score_buckets)
+    prompt = build_managed_prompt(
+        spec,
+        current,
+        current_metrics,
+        leaderboard,
+        exit_stats,
+        recent,
+        score_buckets,
+        regime_context,
+    )
     raw = provider.generate_json(prompt, model=model or spec.default_model).strip()
     logger.debug("[%s] Raw response: %s", spec.agent_name, raw)
 

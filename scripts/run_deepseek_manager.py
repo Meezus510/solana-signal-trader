@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Trigger loop for the Anthropic-managed strategy controller.
+Trigger loop for the DeepSeek-managed strategy controller.
 """
 
 from __future__ import annotations
@@ -15,11 +15,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from trader.agents.anthropic_manager import run as manager_run
+from trader.agents.deepseek_manager import run as manager_run
 from trader.agents.strategy_tuner import load_config, save_owned_config
 
-STRATEGY = "anthropic_managed"
-META_PREFIX = "anthropic_manager_"
+STRATEGY = "deepseek_managed"
+META_PREFIX = "deepseek_manager_"
 
 
 def _closed_count(db_path: str) -> tuple[int, int]:
@@ -29,9 +29,15 @@ def _closed_count(db_path: str) -> tuple[int, int]:
         "SELECT COUNT(*) FROM strategy_outcomes WHERE strategy=? AND entered=1 AND closed=1",
         (STRATEGY,),
     ).fetchone()[0]
+    
+    # Get base strategy from config
+    from trader.agents.strategy_tuner import load_config
+    cfg = load_config()
+    base_strategy = cfg.get(STRATEGY, {}).get("base_strategy", "quick_pop")
+    
     base = conn.execute(
         "SELECT COUNT(*) FROM strategy_outcomes WHERE strategy=? AND entered=1 AND closed=1",
-        ("quick_pop",),
+        (base_strategy,),
     ).fetchone()[0]
     conn.close()
     return managed, base
@@ -82,6 +88,9 @@ def should_trigger(db_path: str, every_closed: int, min_hours: float, min_closed
     # OR: base strategy is moving fast but managed strategy is mostly blocked
     if not trigger and base_delta >= every_closed * 5 and managed_delta >= 1:
         trigger = True
+    # OR: first run (no previous run recorded)
+    if not trigger and last_run is None:
+        trigger = True
 
     return trigger, {
         "current_closed": current_managed,
@@ -107,7 +116,7 @@ def run_once(db_path: str, every_closed: int, min_hours: float, min_closed_hours
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the Anthropic strategy manager.")
+    parser = argparse.ArgumentParser(description="Run the DeepSeek strategy manager.")
     parser.add_argument("--db", default="trader.db")
     parser.add_argument("--every-closed", type=int, default=10)
     parser.add_argument("--min-hours", type=float, default=3.0)

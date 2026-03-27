@@ -472,6 +472,13 @@ MANAGED_STRATEGY_SPECS: dict[str, ManagedStrategySpec] = {
         default_base="quick_pop",
         default_mode="balanced",
     ),
+    "deepseek_managed": ManagedStrategySpec(
+        name="deepseek_managed",
+        bases=_OPEN_AI_MANAGED_BASES,
+        modes=_OPEN_AI_MANAGED_MODES,
+        default_base="quick_pop",
+        default_mode="balanced",
+    ),
 }
 
 
@@ -589,6 +596,7 @@ _CONTROLLED = frozenset([
     "quick_pop_managed",
     "open_ai_managed",
     "anthropic_managed",
+    "deepseek_managed",
     "safe_bet",
 ])
 
@@ -954,6 +962,7 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
 
     open_ai_runner = build_managed_runner("open_ai_managed", cfg, db, overrides)
     anthropic_runner = build_managed_runner("anthropic_managed", cfg, db, overrides)
+    deepseek_runner = build_managed_runner("deepseek_managed", cfg, db, overrides)
 
     return [
         StrategyRunner(cfg=quick_pop_cfg, db=db),
@@ -963,6 +972,7 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         StrategyRunner(cfg=quick_pop_chart_cfg, db=db),
         open_ai_runner,
         anthropic_runner,
+        deepseek_runner,
         StrategyRunner(cfg=trend_rider_chart_cfg, db=db),
         # InfiniteMoonbagRunner(cfg=moonbag_chart_cfg, db=db),  # disabled: trend_rider_managed outperforms
     ]
