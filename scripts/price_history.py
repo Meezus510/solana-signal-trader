@@ -67,7 +67,8 @@ IS_DRY_RUN            = os.getenv("DRY_RUN", "").strip().lower() in ("1", "true"
 POLL_INTERVAL_SECONDS = 600    # 10 minutes between loop runs
 MAX_BATCH             = 20     # Birdeye calls per run
 INTER_REQUEST_SLEEP   = 0.5    # seconds between Birdeye calls
-MAX_WINDOW_MIN        = 1440   # hard cap: stop tracking after 24 hours
+MAX_WINDOW_MIN        = 1440   # base window: 24 hours
+DAILY_EXTENSION_PCT   = 100.0  # if price is >100% above entry at each 24h checkpoint, extend another 24h
 STALE_THRESHOLD       = 3      # consecutive no-movement intervals → mark done
 MAX_ATTEMPTS          = 3      # dead-coin threshold (no candles returned N times)
 
@@ -129,7 +130,7 @@ def _get_pending_rows(db_path: str, max_attempts: int) -> list[tuple]:
         return conn.execute(
             """
             SELECT id, mint, entry_price, ts, price_window_min,
-                   peak_price, trough_price, price_stale_count
+                   peak_price, trough_price, price_stale_count, price_checkpoint_price
               FROM signal_charts
              WHERE price_tracking_done = 0
                AND fetch_attempts < ?
@@ -186,17 +187,30 @@ def _close_position_in_db(
     strategy: str,
     sell_reason: str,
     closed_at: str,
+    exit_price: float,
 ) -> None:
-    """Mark the positions table row as CLOSED so it isn't restored on restart."""
+    """Mark the positions table row as CLOSED so it isn't restored on restart.
+
+    Also zeroes remaining_quantity and records the simulated exit price and PnL
+    so the row is financially consistent (not left with a phantom open quantity).
+    """
     conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
     try:
         conn.execute(
             """
             UPDATE positions
-               SET status='CLOSED', sell_reason=?, closed_at=?
+               SET status              = 'CLOSED',
+                   sell_reason         = ?,
+                   closed_at           = ?,
+                   last_price          = ?,
+                   realized_pnl_usd    = realized_pnl_usd
+                                         + (? - entry_price) * remaining_quantity,
+                   total_proceeds_usd  = total_proceeds_usd
+                                         + ? * remaining_quantity,
+                   remaining_quantity  = 0
              WHERE mint=? AND strategy=? AND status='OPEN'
             """,
-            (sell_reason, closed_at, mint, strategy),
+            (sell_reason, closed_at, exit_price, exit_price, exit_price, mint, strategy),
         )
         conn.commit()
     finally:
@@ -212,10 +226,14 @@ def _simulate_outcome(
     entry_price: float,
     stop_loss_pct: float,
     tp_multiple: float,
-) -> tuple[str, float, int | None]:
+) -> tuple[str, float, int | None, float, int | None, float, int | None]:
     """
     Walk 1m candles in chronological order and return
-    (sell_reason, exit_price, exit_candle_unix).
+    (sell_reason, exit_price, exit_candle_unix,
+     peak_price, peak_unix, trough_price, trough_unix).
+
+    peak_price / trough_price are the highest high and lowest low seen
+    across all candles up to and including the exit candle.
 
     Logic:
       - If a candle's low  <= stop_loss_price → STOP_LOSS
@@ -226,18 +244,30 @@ def _simulate_outcome(
     stop_price = entry_price * (1.0 - stop_loss_pct)
     tp_price   = entry_price * tp_multiple
 
+    peak_price   = entry_price
+    peak_unix    = candles[0].unix_time if candles else None
+    trough_price = entry_price
+    trough_unix  = candles[0].unix_time if candles else None
+
     for candle in candles:
+        if candle.high > peak_price:
+            peak_price = candle.high
+            peak_unix  = candle.unix_time
+        if candle.low < trough_price:
+            trough_price = candle.low
+            trough_unix  = candle.unix_time
+
         hit_stop = candle.low  <= stop_price
         hit_tp   = candle.high >= tp_price
 
         if hit_stop:
-            return "STOP_LOSS", stop_price, candle.unix_time
+            return "STOP_LOSS", stop_price, candle.unix_time, peak_price, peak_unix, trough_price, trough_unix
         if hit_tp:
-            return "TP1", tp_price, candle.unix_time
+            return "TP1", tp_price, candle.unix_time, peak_price, peak_unix, trough_price, trough_unix
 
     exit_price = candles[-1].close if candles else entry_price
     exit_unix  = candles[-1].unix_time if candles else None
-    return "TIMEOUT", exit_price, exit_unix
+    return "TIMEOUT", exit_price, exit_unix, peak_price, peak_unix, trough_price, trough_unix
 
 
 def _simulate_and_write(
@@ -267,23 +297,23 @@ def _simulate_and_write(
     if ts_dt.tzinfo is None:
         ts_dt = ts_dt.replace(tzinfo=timezone.utc)
 
-    max_gain_pct = (
-        (max(c.high for c in candles) / entry_price - 1.0) * 100.0
-        if candles else 0.0
-    )
-
     for outcome_id, strategy_name, usd_size in rows:
         cfg           = strategy_cfg.get(strategy_name, {})
         stop_loss_pct = cfg.get("stop_loss_pct", 0.30)
         tp_levels     = cfg.get("tp_levels", [[2.0, 0.5]])
         tp_multiple   = tp_levels[0][0] if tp_levels else 2.0
 
-        sell_reason, exit_price, exit_unix = _simulate_outcome(
+        sell_reason, exit_price, exit_unix, peak_price, peak_unix, trough_price, trough_unix = _simulate_outcome(
             candles, entry_price, stop_loss_pct, tp_multiple
         )
 
-        pnl_pct = (exit_price / entry_price - 1.0) * 100.0
-        pnl_usd = (pnl_pct / 100.0) * usd_size if usd_size is not None else None
+        pnl_pct      = (exit_price   / entry_price - 1.0) * 100.0
+        pnl_usd      = (pnl_pct / 100.0) * usd_size if usd_size is not None else None
+        max_gain_pct = (peak_price   / entry_price - 1.0) * 100.0 if entry_price else 0.0
+        peak_pnl_pct   = max_gain_pct
+        trough_pnl_pct = (trough_price / entry_price - 1.0) * 100.0 if entry_price else 0.0
+        peak_ts_str    = _iso(peak_unix)   if peak_unix   else None
+        trough_ts_str  = _iso(trough_unix) if trough_unix else None
 
         if exit_unix:
             exit_dt   = datetime.fromtimestamp(exit_unix, tz=timezone.utc)
@@ -294,16 +324,22 @@ def _simulate_and_write(
         hold_secs = (exit_dt - ts_dt).total_seconds()
 
         logger.info(
-            "[sim] signal_chart=%d strategy=%-20s | %-10s pnl=%+.1f%% hold=%.0fs",
-            signal_chart_id, strategy_name, sell_reason, pnl_pct, hold_secs,
+            "[sim] signal_chart=%d strategy=%-20s | %-10s pnl=%+.1f%% peak=%+.1f%% trough=%+.1f%% hold=%.0fs",
+            signal_chart_id, strategy_name, sell_reason, pnl_pct, peak_pnl_pct, trough_pnl_pct, hold_secs,
         )
 
         if not dry_run_only:
             db.update_strategy_outcome(
                 outcome_id, pnl_pct, sell_reason, hold_secs, max_gain_pct,
                 pnl_usd=pnl_usd,
+                position_peak_price=peak_price,
+                position_peak_ts=peak_ts_str,
+                position_peak_pnl_pct=peak_pnl_pct,
+                position_trough_price=trough_price,
+                position_trough_ts=trough_ts_str,
+                position_trough_pnl_pct=trough_pnl_pct,
             )
-            _close_position_in_db(db_path, mint, strategy_name, sell_reason, closed_at)
+            _close_position_in_db(db_path, mint, strategy_name, sell_reason, closed_at, exit_price)
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +369,7 @@ async def _process_batch(
         cfg    = Config.load()
         client = BirdeyePriceClient(cfg, session)
 
-        for row_id, mint, entry_price, ts_str, current_window_min, stored_peak, stored_trough, stale_count in rows:
+        for row_id, mint, entry_price, ts_str, current_window_min, stored_peak, stored_trough, stale_count, checkpoint_price in rows:
             try:
                 ts_dt = datetime.fromisoformat(ts_str)
             except Exception:
@@ -455,7 +491,33 @@ async def _process_batch(
                 else:
                     new_stale = stale_count + 1
 
-                done = new_stale >= STALE_THRESHOLD or new_window_min >= max_window_min
+                # At each 24h boundary, compare current price to the price at
+                # the previous checkpoint (rolling 24h window):
+                #   - first checkpoint (24h): compare vs entry_price
+                #   - subsequent checkpoints (48h, 72h, ...): compare vs price saved at prior checkpoint
+                # If >100% gain over that 24h window, extend another 24h and
+                # save current snapshot as the new checkpoint baseline.
+                at_daily_checkpoint = (new_window_min % MAX_WINDOW_MIN == 0
+                                       and new_window_min >= MAX_WINDOW_MIN)
+                new_checkpoint_price = None  # only set when we save a new baseline
+                if at_daily_checkpoint:
+                    baseline = checkpoint_price if checkpoint_price is not None else entry_price
+                    gain_pct = (snapshot_price / baseline - 1.0) * 100.0 if baseline else 0.0
+                    if gain_pct > DAILY_EXTENSION_PCT:
+                        logger.info(
+                            "[price_history] row %d %s — %dh checkpoint: +%.1f%% vs prior 24h → extending",
+                            row_id, mint[:8], new_window_min // 60, gain_pct,
+                        )
+                        new_checkpoint_price = snapshot_price  # save as next baseline
+                        done = new_stale >= STALE_THRESHOLD
+                    else:
+                        logger.info(
+                            "[price_history] row %d %s — %dh checkpoint: +%.1f%% ≤ %.0f%% → stopping",
+                            row_id, mint[:8], new_window_min // 60, gain_pct, DAILY_EXTENSION_PCT,
+                        )
+                        done = True
+                else:
+                    done = new_stale >= STALE_THRESHOLD
 
                 peak_price     = batch_peak   if has_new_peak   else stored_peak
                 trough_price   = batch_trough if has_new_trough else stored_trough
@@ -487,6 +549,7 @@ async def _process_batch(
                         new_window_min=new_window_min,
                         stale_count=new_stale,
                         done=done,
+                        checkpoint_price=new_checkpoint_price,
                     )
                     updated += 1
 

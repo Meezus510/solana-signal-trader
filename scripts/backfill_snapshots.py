@@ -7,7 +7,7 @@ signal_charts + strategy_outcomes so ChartMLScorer has training data
 immediately instead of waiting for live chart-filtered trades to accumulate.
 
 Outcomes are saved under the base strategy name (e.g. "quick_pop") because
-chart variants (e.g. "quick_pop_chart_ml") are configured to train on their
+chart variants (e.g. "quick_pop_managed") are configured to train on their
 base strategy's unfiltered outcomes — avoiding selection bias.
 
 How it works

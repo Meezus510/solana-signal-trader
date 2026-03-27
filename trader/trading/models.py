@@ -58,8 +58,10 @@ class Position:
     closed_at: Optional[datetime]
 
     # Strategy state
-    highest_price: float          # running max — drives trailing stop
-    lowest_price: float           # running min — tracked for post-signal training data
+    highest_price: float                  # running max — drives trailing stop
+    highest_price_ts: Optional[datetime]  # when highest_price was first reached
+    lowest_price: float                   # running min — tracked for training data
+    lowest_price_ts: Optional[datetime]   # when lowest_price was first reached
     take_profit_price: float      # entry_price × take_profit_multiple
     stop_loss_price: float        # entry_price × (1 − stop_loss_pct)
     trailing_active: bool         # True after partial TP sell fires
@@ -72,6 +74,9 @@ class Position:
     last_price: Optional[float]   # most recent observed price
     total_proceeds_usd: float     # gross USD received from all sells
     total_fees_usd: float         # reserved for fee modelling (0.0 for now)
+
+    # Token metadata
+    token_decimals: int = 6   # SPL token decimals — used for Jupiter quote amount calculation
 
     # Flags
     partial_take_profit_hit: bool = False   # True after TP1 sell fires
@@ -91,3 +96,4 @@ class PortfolioState:
     """Tracks the aggregate mock cash balance across all trades."""
     starting_cash_usd: float
     available_cash_usd: float
+    total_reloads_usd: float = 0.0  # cumulative paper cash injected via reloads

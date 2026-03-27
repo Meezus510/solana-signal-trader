@@ -4,10 +4,10 @@ scripts/skips.py — Show skipped signals and why they were rejected.
 
 Usage:
     python scripts/skips.py                              # all strategies, last 30
-    python scripts/skips.py quick_pop_chart_ml           # one strategy
-    python scripts/skips.py quick_pop_chart_ml --limit 50
-    python scripts/skips.py quick_pop_chart_ml --today
-    python scripts/skips.py quick_pop_chart_ml --reason ML_SKIP
+    python scripts/skips.py quick_pop_managed           # one strategy
+    python scripts/skips.py quick_pop_managed --limit 50
+    python scripts/skips.py quick_pop_managed --today
+    python scripts/skips.py quick_pop_managed --reason ML_SKIP
 """
 
 from __future__ import annotations
@@ -26,10 +26,10 @@ SEP = "=" * 90
 
 VALID_STRATEGIES = [
     "quick_pop",
-    "quick_pop_chart_ml",
+    "quick_pop_managed",
     "trend_rider",
-    "trend_rider_chart_reanalyze",
-    "infinite_moonbag_chart",
+    "trend_rider_managed",
+    "moonbag_managed",
 ]
 
 VALID_REASONS = ["ML_SKIP", "CHART_SKIP", "POLICY_BLK"]

@@ -27,7 +27,7 @@ VALID_STRATEGIES = [
     "trend_rider",
     "trend_rider_chart",
     "infinite_moonbag",
-    "infinite_moonbag_chart",
+    "moonbag_managed",
 ]
 
 

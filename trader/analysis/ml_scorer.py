@@ -12,7 +12,7 @@ Algorithm
 ---------
 Recency-weighted K-Nearest Neighbours (no external dependencies).
 
-1. Extract a 6-dimensional feature vector from the incoming candles.
+1. Extract an 18-dimensional feature vector from the incoming candles.
 2. Load all closed snapshots for the strategy from the database.
 3. Extract the same feature vector from each stored snapshot.
 4. Z-score normalise everything using training-set statistics.
@@ -30,31 +30,98 @@ Recency-weighted K-Nearest Neighbours (no external dependencies).
 
 Returns None when fewer than MIN_SAMPLES closed snapshots exist.
 
-Candle resolution
------------------
-Birdeye's OHLCV endpoint supports 1m as its finest granularity — sub-minute
-intervals (1s, 5s, 15s, 30s) are not available. ML_OHLCV_INTERVAL is "1m"
-and ML_OHLCV_BARS is 40, giving a 40-minute window that captures the full
-pre-pump setup and early momentum of a quick_pop signal.
+Candle resolution — triple (quick_pop) / dual (other strategies)
+-----------------------------------------------------------------
+Three candle sources are combined in the quick_pop feature vector:
+  • Birdeye v3 15s — 100 bars ≈ 25 min. Fine-grained pump shape.
+                     Used as features 1–6. Neutral fallback on failure.
+  • Birdeye 1m    — 40 bars = 40 min. Broader momentum context.
+                     Used as features 7–12.
+  • Birdeye v3 1s — 60 bars = 60 sec. Ultra-fine immediate spike shape.
+                     Used as features 28–33 (quick_pop only).
+                     Neutral fallback for snapshots without 1s data (old data).
 
 Features (one vector per chart window)
 ---------------------------------------
-OHLCV features (from Birdeye 1m candles):
-1. pump_ratio        — current_price / recent_low
-2. vol_momentum      — avg volume last 5 bars / avg volume earlier bars
-3. price_slope_pct   — (close[-1] / open[0] − 1) × 100
-4. recent_momentum   — (close[-1] / close[-6] − 1) × 100 (last 5 bars)
-5. price_volatility  — std-dev of bar-to-bar % returns
-6. candle_count_norm — candle_count / 20  (proxy for token age)
-7. pump_ratio_1m     — same pump_ratio from the separate 1m chart-filter fetch
-8. vol_trend_1m      — RISING=1.0 | FLAT=0.5 | DYING=0.0 from chart filter
+OHLCV features from Birdeye v3 15s candles (neutral fallback when unavailable):
+1. pump_ratio_15s     — close[-1] / min(low) over the sub-minute window
+2. vol_momentum_15s   — avg volume last 5 bars / avg volume earlier bars
+3. price_slope_15s    — (close[-1] / open[0] − 1) × 100
+4. recent_momentum_15s— (close[-1] / close[-6] − 1) × 100 (last 5 bars)
+5. volatility_15s     — std-dev of bar-to-bar % returns
+6. candle_count_15s   — candle_count / 20  (proxy for token age / data coverage)
 
-Pair stats features (from Moralis live pair stats — fallback to neutral when unavailable):
-9.  buy_ratio_5m          — buys / (buys + sells) in last 5 min  [0–1, fallback 0.5]
-10. activity_5m_norm      — (buys + sells) / 20, capped at 3.0   [0–3, fallback 0.0]
-11. price_change_5m_norm  — price % change last 5 min / 50, clamped [-1, 1]  [fallback 0.0]
-12. buy_vol_ratio_1h      — buy USD vol / total USD vol last hour  [0–1, fallback 0.5]
-13. liquidity_change_1h   — liquidity % change last hour / 20, clamped [-1, 1]  [fallback 0.0]
+OHLCV features from Birdeye 1m candles (same 6 computations, different timescale):
+7. pump_ratio_1m
+8. vol_momentum_1m
+9. price_slope_1m
+10. recent_momentum_1m
+11. volatility_1m
+12. candle_count_1m
+
+Pair stats features (from token overview — fallback to neutral when unavailable):
+13. buy_ratio_5m          — buys / (buys + sells) in last 5 min  [0–1, fallback 0.5]
+14. activity_5m_norm      — (buys + sells) / 20, capped at 3.0   [0–3, fallback 0.0]
+15. price_change_5m_norm  — price % change last 5 min / 50, clamped [-1, 1]  [fallback 0.0]
+16. buy_vol_ratio_1h      — buy USD vol / total USD vol last hour  [0–1, fallback 0.5]
+17. liquidity_change_1h   — liquidity % change last hour / 20, clamped [-1, 1]  [fallback 0.0]
+
+Source:
+18. source_channel        — WizzyTrades=1.0, WizzyCasino=2.0, other=0.0
+
+Token metadata features (from Birdeye token overview — fallback 0.5 when unavailable):
+Log-scale normalisation used because market cap and liquidity span multiple orders of magnitude.
+19. market_cap_norm       — log10(market_cap_usd) / 8, clamped [0, 1]  [fallback 0.5]
+                            $10K→0.50, $100K→0.63, $1M→0.75, $10M→0.88, $100M→1.0
+20. liquidity_usd_norm    — log10(liquidity_usd) / 7, clamped [0, 1]   [fallback 0.5]
+                            $1K→0.43, $10K→0.57, $100K→0.71, $1M→0.86, $10M→1.0
+21. holder_count_norm     — log10(holder_count) / 5, clamped [0, 1]    [fallback 0.5]
+                            10→0.20, 100→0.40, 1K→0.60, 10K→0.80, 100K→1.0
+
+Wallet activity features (from Birdeye token overview — fallback 0.0/1.0/0.5 when unavailable):
+22. unique_wallet_5m_norm — min(unique_wallet_5m / 50, 3.0)            [fallback 0.0]
+                            Distinct wallets trading in last 5m, normalised.
+                            50 wallets→1.0, 150→3.0. Organic vs wash-trading signal.
+23. wallet_momentum_5m    — min(unique_wallet_5m / max(unique_wallet_hist_5m, 1), 5.0) [fallback 1.0]
+                            Ratio of current to previous-window unique wallets.
+                            >1 = wallet count growing (momentum building), <1 = shrinking.
+24. price_change_30m_norm — price_change_30m_pct / 200, clamped [-1, 1] [fallback 0.0]
+                            How much the token already pumped over the last 30 min.
+                            +200% in 30m → 1.0 (likely exhausted), flat → 0.0.
+25. buy_vol_ratio_5m      — buy_volume_usd_5m / (buy + sell volume usd 5m) [fallback 0.5]
+                            5-minute buy pressure in USD. Complements buy_vol_ratio_1h
+                            (idx 16) with a shorter, more immediate timeframe.
+26. wallet_momentum_30m   — min(unique_wallet_30m / max(unique_wallet_hist_30m, 1), 5.0) [fallback 1.0]
+                            30-minute wallet momentum ratio. Distinguishes sustained interest
+                            from a brief spike — more relevant for moonbag/trend_rider holds.
+                            >1 = wallet count grew over the last 30m window.
+27. top10_holder_pct      — fraction of supply held by top 10 wallets, clamped [0, 1] [fallback 0.5]
+                            High concentration (→1.0) = insider/team dump risk.
+                            Low concentration (→0.0) = organically distributed supply.
+                            Most predictive for moonbag (multi-hour hold, needs exit liquidity).
+
+OHLCV features from Birdeye v3 1s candles (quick_pop only — neutral fallback when unavailable):
+These features are appended last so old snapshots without 1s data fall back to the same neutral
+values uniformly, preserving relative neighbour ordering during the transition period.
+28. pump_ratio_1s
+29. vol_momentum_1s
+30. price_slope_1s
+31. recent_momentum_1s
+32. volatility_1s
+33. candle_count_1s       — candle_count / 20 (60 bars → 3.0)
+
+Chart shape features — 10-point normalised price series per resolution:
+Each point is close[i] / close[0] - 1 (cumulative return from bar 0), clamped to [-1.0, 3.0].
+Sampled at evenly-spaced percentile positions across however many bars are available, so it
+handles variable bar counts (17–40 bars for 15s, up to 40 for 1m, up to 60 for 1s) gracefully.
+All 10 points are 0.0 when fewer than 3 candles are available (neutral fallback).
+Features 34–43: shape series from 15s candles (candles_15s). Usable now (236 training examples
+                have candles_json — actually Moralis 10s data rebranded, slightly noisy but same
+                shape statistics).
+Features 44–53: shape series from 1m candles (candles_1m). Most reliable — all 236 training
+                examples have 1m candles.
+Features 54–63: shape series from 1s candles (candles_1s, quick_pop only). Neutral for old
+                snapshots; will populate as 1s-tagged trades close (collection started March 22).
 """
 
 from __future__ import annotations
@@ -80,11 +147,17 @@ HALFLIFE_DAYS: float = 14.0 # recency weight half-life (older data counts less)
 ML_OHLCV_BARS: int = 40
 ML_OHLCV_INTERVAL: str = "1m"
 
-# Higher-resolution ML candles via Moralis (supports sub-minute intervals).
-# 100 bars × 10s ≈ 17-minute window at 6× the detail of 1m bars.
-# Used when MORALIS_API_KEY is set — captures pump shape with much finer granularity.
-MORALIS_OHLCV_BARS: int = 100
-MORALIS_OHLCV_INTERVAL: str = "10s"
+# Higher-resolution ML candles via Birdeye v3 (sub-minute intervals).
+# 100 bars × 15s ≈ 25-minute window at 4× the detail of 1m bars.
+# Captures pump shape with much finer granularity than 1m candles.
+SUBMINUTE_OHLCV_BARS: int = 100
+SUBMINUTE_OHLCV_INTERVAL: str = "15s"
+
+# Ultra high-resolution ML candles via Birdeye v3 1s (quick_pop only).
+# 60 bars × 1s = 60-second window. Captures the immediate pump spike shape.
+# 2-week data retention — used alongside 15s candles for quick_pop scoring.
+ULTRA_OHLCV_BARS: int = 60
+ULTRA_OHLCV_INTERVAL: str = "1s"
 
 # Score mapping: PnL% range covered by [0, 10].
 # Uses price-based return (weighted avg exit price / entry price - 1) × 100,
@@ -93,135 +166,237 @@ MORALIS_OHLCV_INTERVAL: str = "10s"
 _SCORE_LOW_PCT:  float = -35.0   # maps to score 0
 _SCORE_HIGH_PCT: float =  85.0   # maps to score 10
 
-# Encoding for the 1-minute vol_trend label → numeric feature
-_VOL_TREND_ENC: dict[str, float] = {"RISING": 1.0, "FLAT": 0.5, "DYING": 0.0}
-
 # Encoding for source channel → numeric feature (0.0 = unknown/other)
 _CHANNEL_ENC: dict[str, float] = {
     "WizzyTrades": 1.0,
     "WizzyCasino": 2.0,
+    "wedegentheyaped": 3.0,
 }
+
+# Human-readable names for all 63 features (indexed 0–62).
+# Used by the daily report to label non-zero ML weights.
+FEATURE_NAMES: list[str] = [
+    # idx 0-5: 15s OHLCV
+    "pump_ratio_15s", "vol_momentum_15s", "price_slope_15s",
+    "recent_momentum_15s", "volatility_15s", "candle_count_15s",
+    # idx 6-11: 1m OHLCV
+    "pump_ratio_1m", "vol_momentum_1m", "price_slope_1m",
+    "recent_momentum_1m", "volatility_1m", "candle_count_1m",
+    # idx 12-17: pair stats + source channel
+    "buy_ratio_5m", "activity_5m_norm", "price_change_5m_norm",
+    "buy_vol_ratio_1h", "liquidity_change_1h", "source_channel",
+    # idx 18-20: token metadata
+    "market_cap_norm", "liquidity_usd_norm", "holder_count_norm",
+    # idx 21-26: wallet / on-chain activity
+    "unique_wallet_5m_norm", "wallet_momentum_5m", "price_change_30m_norm",
+    "buy_vol_ratio_5m", "wallet_momentum_30m", "top10_holder_pct",
+    # idx 27-32: 1s OHLCV (quick_pop only)
+    "pump_ratio_1s", "vol_momentum_1s", "price_slope_1s",
+    "recent_momentum_1s", "volatility_1s", "candle_count_1s",
+    # idx 33-42: 15s chart shape
+    *[f"shape_15s_{i}" for i in range(10)],
+    # idx 43-52: 1m chart shape
+    *[f"shape_1m_{i}" for i in range(10)],
+    # idx 53-62: 1s chart shape (quick_pop only)
+    *[f"shape_1s_{i}" for i in range(10)],
+]
 
 
 # ---------------------------------------------------------------------------
 # Feature extraction
 # ---------------------------------------------------------------------------
 
-def extract_features(
-    candles_data: list[dict],
-    pump_ratio_1m: Optional[float] = None,
-    vol_trend_1m: Optional[str] = None,
-    pair_stats: Optional[dict] = None,
-    source_channel: Optional[str] = None,
-) -> Optional[list[float]]:
+def _compute_shape_series(candles: list[dict], n_points: int = 10) -> list[float]:
     """
-    Extract a 14-element feature vector from candle data + optional pair stats.
+    Sample n_points evenly-spaced closing prices across the candle series
+    and return them as cumulative returns from bar 0.
 
-    Features 1-6: OHLCV-derived (resolution-agnostic).
-    Features 7-8: 1-minute chart filter context (fall back to neutral).
-    Features 9-13: Moralis live pair stats (fall back to neutral when unavailable
-                   — old snapshots without pair stats still produce valid vectors).
-    Feature 14: source channel encoded as float (0.0 = unknown/other).
-                Gracefully neutral until multi-channel data accumulates.
-
-    pair_stats dict keys (all optional, each falls back independently):
-        buys_5m, sells_5m, buy_volume_1h, total_volume_1h,
-        price_change_5m_pct, liquidity_change_1h_pct
-
-    Accepts candle dicts with keys {t, o, h, l, c, v}.
-    Returns None if there are fewer than 3 candles.
+    Each point: close[i] / close[0] - 1, clamped to [-1.0, 3.0].
+    Indices are chosen by percentile so variable bar counts are handled
+    uniformly (e.g. 17 bars for a new token vs 40 bars for an older one).
+    Returns all zeros if fewer than 3 candles (neutral fallback).
     """
-    if len(candles_data) < 3:
-        return None
+    if not candles or len(candles) < 3:
+        return [0.0] * n_points
 
-    opens   = [c["o"] for c in candles_data]
-    closes  = [c["c"] for c in candles_data]
-    lows    = [c["l"] for c in candles_data]
-    volumes = [c["v"] for c in candles_data]
+    closes = [c["c"] for c in candles]
+    base = closes[0]
+    if base <= 0:
+        return [0.0] * n_points
 
-    # 1. Pump ratio (15s)
+    n = len(closes)
+    result = []
+    for i in range(n_points):
+        idx = round(i * (n - 1) / (n_points - 1)) if n_points > 1 else 0
+        ret = closes[idx] / base - 1.0
+        result.append(max(-1.0, min(3.0, ret)))
+    return result
+
+
+def _compute_ohlcv_features(candles: list[dict]) -> list[float]:
+    """
+    Compute 6 OHLCV-derived features from a candle list.
+
+    Returns neutral values [1.0, 1.0, 0.0, 0.0, 0.0, 0.0] when fewer than
+    3 candles are available, so the caller can still produce a valid vector.
+    """
+    if not candles or len(candles) < 3:
+        return [1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+
+    opens   = [c["o"] for c in candles]
+    closes  = [c["c"] for c in candles]
+    lows    = [c["l"] for c in candles]
+    volumes = [c["v"] for c in candles]
+
     recent_low = min(lows)
     pump_ratio = closes[-1] / recent_low if recent_low > 0 else 1.0
 
-    # 2. Volume momentum (recent 5 bars vs earlier, 15s)
-    vol_window = min(5, len(volumes) - 1)
+    vol_window   = min(5, len(volumes) - 1)
     recent_vols  = volumes[-vol_window:]
     earlier_vols = volumes[:-vol_window] if len(volumes) > vol_window else volumes
-    avg_recent  = sum(recent_vols)  / len(recent_vols)
-    avg_earlier = sum(earlier_vols) / len(earlier_vols)
+    avg_recent   = sum(recent_vols)  / len(recent_vols)
+    avg_earlier  = sum(earlier_vols) / len(earlier_vols)
     vol_momentum = avg_recent / avg_earlier if avg_earlier > 0 else 1.0
 
-    # 3. Price slope over the full window (15s)
     price_slope = (closes[-1] / opens[0] - 1.0) * 100.0 if opens[0] > 0 else 0.0
 
-    # 4. Recent momentum — last 5 bars (15s)
-    lookback = min(5, len(closes) - 1)
-    base = closes[-1 - lookback]
+    lookback        = min(5, len(closes) - 1)
+    base            = closes[-1 - lookback]
     recent_momentum = (closes[-1] / base - 1.0) * 100.0 if base > 0 else 0.0
 
-    # 5. Price volatility — std-dev of bar returns (15s)
     returns = []
     for i in range(1, len(closes)):
         if closes[i - 1] > 0:
             returns.append((closes[i] / closes[i - 1] - 1.0) * 100.0)
     if len(returns) >= 2:
-        mean_ret = sum(returns) / len(returns)
-        volatility = math.sqrt(
-            sum((r - mean_ret) ** 2 for r in returns) / len(returns)
-        )
+        mean_ret   = sum(returns) / len(returns)
+        volatility = math.sqrt(sum((r - mean_ret) ** 2 for r in returns) / len(returns))
     else:
         volatility = 0.0
 
-    # 6. Candle count normalised to [0, 1] (15s)
-    candle_count_norm = len(candles_data) / 20.0
+    candle_count_norm = len(candles) / 20.0
 
-    # 7. Pump ratio from 1-minute chart filter (broader 20-min window)
-    #    Falls back to the 15s pump_ratio — no new info but keeps vector length stable.
-    f_pump_1m = pump_ratio_1m if pump_ratio_1m is not None else pump_ratio
+    return [pump_ratio, vol_momentum, price_slope, recent_momentum, volatility, candle_count_norm]
 
-    # 8. Vol trend from 1-minute chart filter, encoded as float
-    #    Falls back to 0.5 (FLAT / neutral) when unavailable.
-    f_vol_trend_1m = _VOL_TREND_ENC.get(vol_trend_1m, 0.5) if vol_trend_1m else 0.5
+
+def extract_features(
+    candles_15s: list[dict],
+    candles_1m: Optional[list[dict]] = None,
+    candles_1s: Optional[list[dict]] = None,
+    pair_stats: Optional[dict] = None,
+    source_channel: Optional[str] = None,
+) -> Optional[list[float]]:
+    """
+    Extract a feature vector from dual- or triple-resolution candle data.
+
+    Features 1-6:   OHLCV from Birdeye v3 15s candles (neutral when unavailable).
+    Features 7-12:  OHLCV from 1m Birdeye candles  (neutral when unavailable).
+    Features 13-17: pair stats / token overview (neutral when unavailable).
+    Feature 18:     source channel encoded as float.
+    Features 19-27: token metadata + wallet activity.
+    Features 28-33: OHLCV from Birdeye v3 1s candles (quick_pop only; neutral
+                    fallback for old snapshots — preserves relative neighbour
+                    ordering during the Moralis→Birdeye transition).
+    Features 34-43: chart shape series from 15s candles (10 points; zeros when unavailable).
+    Features 44-53: chart shape series from 1m candles  (10 points; zeros when unavailable).
+    Features 54-63: chart shape series from 1s candles  (10 points; zeros when unavailable).
+
+    Returns None only when both candles_15s and candles_1m have fewer than 3
+    candles (nothing meaningful to score against).
+
+    pair_stats dict keys (all optional, each falls back independently):
+        buys_5m, sells_5m, buy_volume_1h, total_volume_1h,
+        price_change_5m_pct, liquidity_change_1h_pct
+    """
+    has_15s = bool(candles_15s) and len(candles_15s) >= 3
+    has_1m  = bool(candles_1m)  and len(candles_1m)  >= 3
+    if not has_15s and not has_1m:
+        return None
+
+    feats_15s = _compute_ohlcv_features(candles_15s or [])
+    feats_1m  = _compute_ohlcv_features(candles_1m  or [])
+    feats_1s  = _compute_ohlcv_features(candles_1s  or [])
 
     # ------------------------------------------------------------------
-    # Features 9-13: Moralis live pair stats
-    # All fall back to neutral values when pair_stats is None (old snapshots,
-    # tokens without Moralis coverage, or API failures).
+    # Features 13-17: pair stats / token overview
+    # All fall back to neutral values when pair_stats is None.
     # ------------------------------------------------------------------
     ps = pair_stats or {}
 
-    # 9. Buy ratio in last 5 min: 0 = all sells, 0.5 = balanced, 1 = all buys
     buys_5m  = ps.get("buys_5m",  0) or 0
     sells_5m = ps.get("sells_5m", 0) or 0
-    f_buy_ratio_5m = buys_5m / (buys_5m + sells_5m + 1e-9) if (buys_5m + sells_5m) > 0 else 0.5
+    f_buy_ratio_5m     = buys_5m / (buys_5m + sells_5m + 1e-9) if (buys_5m + sells_5m) > 0 else 0.5
+    f_activity_5m      = min((buys_5m + sells_5m) / 20.0, 3.0)
 
-    # 10. Activity level: normalised trade count in last 5 min (capped at 3)
-    f_activity_5m = min((buys_5m + sells_5m) / 20.0, 3.0)
+    price_5m           = ps.get("price_change_5m_pct", 0.0) or 0.0
+    f_price_change_5m  = max(-1.0, min(1.0, price_5m / 50.0))
 
-    # 11. Price momentum: % change in last 5 min, normalised to [-1, 1]
-    price_5m = ps.get("price_change_5m_pct", 0.0) or 0.0
-    f_price_change_5m = max(-1.0, min(1.0, price_5m / 50.0))
-
-    # 12. Buy volume dominance over the last hour [0-1]
-    buy_vol_1h   = ps.get("buy_volume_1h",   0.0) or 0.0
-    total_vol_1h = ps.get("total_volume_1h", 0.0) or 0.0
+    buy_vol_1h         = ps.get("buy_volume_1h",   0.0) or 0.0
+    total_vol_1h       = ps.get("total_volume_1h", 0.0) or 0.0
     f_buy_vol_ratio_1h = buy_vol_1h / (total_vol_1h + 1e-9) if total_vol_1h > 0 else 0.5
 
-    # 13. Liquidity trend last hour: normalised to [-1, 1]
-    liq_1h = ps.get("liquidity_change_1h_pct", 0.0) or 0.0
-    f_liquidity_change_1h = max(-1.0, min(1.0, liq_1h / 20.0))
+    liq_1h                 = ps.get("liquidity_change_1h_pct", 0.0) or 0.0
+    f_liquidity_change_1h  = max(-1.0, min(1.0, liq_1h / 20.0))
 
-    # 14. Source channel: encoded as float; 0.0 = unknown/other
+    # Feature 18: source channel
     f_channel = _CHANNEL_ENC.get(source_channel or "", 0.0)
 
-    return [
-        pump_ratio, vol_momentum, price_slope, recent_momentum,
-        volatility, candle_count_norm,
-        f_pump_1m, f_vol_trend_1m,
-        f_buy_ratio_5m, f_activity_5m, f_price_change_5m,
-        f_buy_vol_ratio_1h, f_liquidity_change_1h,
-        f_channel,
-    ]
+    # ------------------------------------------------------------------
+    # Features 19-21: Birdeye token metadata (log-scale normalised).
+    # Falls back to 0.5 (neutral midpoint) when not available so all
+    # historical rows without metadata still produce a valid vector.
+    # ------------------------------------------------------------------
+    mc  = ps.get("market_cap_usd")
+    liq = ps.get("liquidity_usd")
+    hld = ps.get("holder_count")
+
+    f_market_cap_norm  = max(0.0, min(1.0, math.log10(max(mc,  1.0)) / 8.0)) if mc  else 0.5
+    f_liquidity_norm   = max(0.0, min(1.0, math.log10(max(liq, 1.0)) / 7.0)) if liq else 0.5
+    f_holder_norm      = max(0.0, min(1.0, math.log10(max(hld, 1.0)) / 5.0)) if hld else 0.5
+
+    # ------------------------------------------------------------------
+    # Features 22-25: Wallet activity (from Birdeye token overview)
+    # All fall back to neutral when unavailable.
+    # ------------------------------------------------------------------
+    uw5   = ps.get("unique_wallet_5m")
+    uwh5  = ps.get("unique_wallet_hist_5m")
+    uw30  = ps.get("unique_wallet_30m")
+    uwh30 = ps.get("unique_wallet_hist_30m")
+    pc30  = ps.get("price_change_30m_pct")
+    vb5   = ps.get("buy_volume_usd_5m")
+    vs5   = ps.get("sell_volume_usd_5m")
+    top10 = ps.get("top10_concentration")
+
+    f_unique_wallet_5m   = min((uw5 or 0) / 50.0, 3.0) if uw5 is not None else 0.0
+    f_wallet_momentum    = min((uw5 or 0) / max(uwh5 or 0, 1), 5.0) if uw5 is not None else 1.0
+    f_price_change_30m   = max(-1.0, min(1.0, (pc30 or 0.0) / 200.0)) if pc30 is not None else 0.0
+    f_buy_vol_ratio_5m   = (vb5 / ((vb5 or 0.0) + (vs5 or 0.0) + 1e-9)
+                            if (vb5 is not None and vs5 is not None and (vb5 + vs5) > 0)
+                            else 0.5)
+    f_wallet_momentum_30m = (min((uw30 or 0) / max(uwh30 or 0, 1), 5.0)
+                             if uw30 is not None else 1.0)
+    f_top10_holder_pct    = max(0.0, min(1.0, top10)) if top10 is not None else 0.5
+
+    shape_15s = _compute_shape_series(candles_15s or [])
+    shape_1m  = _compute_shape_series(candles_1m  or [])
+    shape_1s  = _compute_shape_series(candles_1s  or [])
+
+    return (
+        feats_15s
+        + feats_1m
+        + [
+            f_buy_ratio_5m, f_activity_5m, f_price_change_5m,
+            f_buy_vol_ratio_1h, f_liquidity_change_1h,
+            f_channel,
+            f_market_cap_norm, f_liquidity_norm, f_holder_norm,
+            f_unique_wallet_5m, f_wallet_momentum, f_price_change_30m, f_buy_vol_ratio_5m,
+            f_wallet_momentum_30m, f_top10_holder_pct,
+        ]
+        + feats_1s
+        + shape_15s
+        + shape_1m
+        + shape_1s
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +454,8 @@ class ChartMLScorer:
         recency_halflife_days: float = HALFLIFE_DAYS,
         score_low_pct: float = _SCORE_LOW_PCT,
         score_high_pct: float = _SCORE_HIGH_PCT,
+        training_label: str = "outcome_pnl_pct",
+        feature_weights: Optional[list[float]] = None,
     ) -> None:
         self._db = db
         self._strategy = strategy
@@ -286,24 +463,38 @@ class ChartMLScorer:
         self._halflife = recency_halflife_days
         self._score_low_pct = score_low_pct
         self._score_high_pct = score_high_pct
+        self._training_label = training_label
+        # Per-feature weights (18-element). Applied before z-normalisation so
+        # high-separability features have proportionally more distance influence.
+        self._feature_weights: list[float] = list(feature_weights) if feature_weights else []
 
-    def score(self, candles: list, chart_ctx=None, pair_stats=None, source_channel: str = "") -> Optional[float]:
+    def score(
+        self,
+        candles_15s: list,
+        candles_1m: Optional[list] = None,
+        candles_1s: Optional[list] = None,
+        chart_ctx=None,       # retained for call-site compatibility; no longer used
+        pair_stats=None,
+        source_channel: str = "",
+    ) -> Optional[float]:
         """
         Score incoming candles against historical closed snapshots.
 
-        candles    — list of OHLCVCandle objects (trader.analysis.chart) or
-                     dicts {t, o, h, l, c, v}.
-        chart_ctx  — ChartContext from the 1-minute chart filter (optional).
-                     When provided, features 7 and 8 (pump_ratio_1m, vol_trend_1m)
-                     are included, giving the model a broader time-scale view.
-        pair_stats — dict from MoralisOHLCVClient.get_pair_stats() (optional).
-                     When provided, features 9-13 (buy pressure, activity, price
-                     momentum, buy volume dominance, liquidity trend) are included.
+        candles_15s — Birdeye v3 15s candles (list of OHLCVCandle or dicts {t,o,h,l,c,v}).
+                      Features 1-6. Pass [] / None when unavailable;
+                      those features fall back to neutral.
+        candles_1m  — Birdeye 1m candles (same format). Features 7-12.
+                      Pass [] / None when unavailable.
+        candles_1s  — Birdeye v3 1s candles (quick_pop only). Features 28-33.
+                      Pass [] / None when unavailable; falls back to neutral so
+                      old snapshots without 1s data remain comparable.
+        pair_stats  — dict with token overview / pair stats fields (optional).
+        chart_ctx   — no longer used; kept so existing call sites don't break.
 
-        Returns a float in [0.0, 10.0] or None if there are fewer than
-        MIN_SAMPLES closed snapshots to learn from.
+        Returns a float in [0.0, 10.0] or None if fewer than MIN_SAMPLES
+        closed snapshots exist or if all candle inputs are too short.
         """
-        snapshots = self._db.load_chart_snapshots(self._strategy)
+        snapshots = self._db.load_chart_snapshots(self._strategy, label_column=self._training_label)
         if len(snapshots) < MIN_SAMPLES:
             logger.debug(
                 "[ML] Not enough training data (%d/%d closed snapshots) — skipping score",
@@ -311,20 +502,19 @@ class ChartMLScorer:
             )
             return None
 
-        # Normalise incoming candles to dicts
-        if candles and hasattr(candles[0], "unix_time"):
-            candle_dicts = [
-                {"t": c.unix_time, "o": c.open, "h": c.high,
-                 "l": c.low,       "c": c.close, "v": c.volume}
-                for c in candles
-            ]
-        else:
-            candle_dicts = candles
+        def _to_dicts(candles: list) -> list[dict]:
+            if candles and hasattr(candles[0], "unix_time"):
+                return [
+                    {"t": c.unix_time, "o": c.open, "h": c.high,
+                     "l": c.low,       "c": c.close, "v": c.volume}
+                    for c in candles
+                ]
+            return candles or []
 
         query_feat = extract_features(
-            candle_dicts,
-            pump_ratio_1m=chart_ctx.pump_ratio if chart_ctx else None,
-            vol_trend_1m=chart_ctx.vol_trend if chart_ctx else None,
+            _to_dicts(candles_15s),
+            candles_1m=_to_dicts(candles_1m) if candles_1m else None,
+            candles_1s=_to_dicts(candles_1s) if candles_1s else None,
             pair_stats=pair_stats,
             source_channel=source_channel,
         )
@@ -335,13 +525,17 @@ class ChartMLScorer:
         training_feats, training_pnl, recency_weights = [], [], []
 
         for snap in snapshots:
-            snap_candles = json.loads(snap["candles_json"])
+            snap_candles_15s = json.loads(snap["candles_json"])
+            snap_candles_1m_raw = snap.get("candles_1m_json")
+            snap_candles_1m = json.loads(snap_candles_1m_raw) if snap_candles_1m_raw else None
+            snap_candles_1s_raw = snap.get("candles_1s_json")
+            snap_candles_1s = json.loads(snap_candles_1s_raw) if snap_candles_1s_raw else None
             snap_pair_stats = json.loads(snap["pair_stats_json"]) \
                 if snap.get("pair_stats_json") else None
             feat = extract_features(
-                snap_candles,
-                pump_ratio_1m=snap.get("pump_ratio"),
-                vol_trend_1m=snap.get("vol_trend"),
+                snap_candles_15s,
+                candles_1m=snap_candles_1m,
+                candles_1s=snap_candles_1s,
                 pair_stats=snap_pair_stats,
                 source_channel=snap.get("source_channel", ""),
             )
@@ -359,6 +553,16 @@ class ChartMLScorer:
 
         if len(training_feats) < MIN_SAMPLES:
             return None
+
+        # Apply per-feature weights before normalisation (boosts high-separability
+        # features' influence on euclidean distance without changing the scale).
+        if self._feature_weights:
+            n_w = len(self._feature_weights)
+            query_feat    = [query_feat[i] * (self._feature_weights[i] if i < n_w else 1.0)
+                             for i in range(len(query_feat))]
+            training_feats = [[f[i] * (self._feature_weights[i] if i < n_w else 1.0)
+                               for i in range(len(f))]
+                              for f in training_feats]
 
         # Normalise all feature vectors
         norm_query, norm_training = zscore_normalize(query_feat, training_feats)

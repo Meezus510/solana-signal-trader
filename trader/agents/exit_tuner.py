@@ -12,7 +12,7 @@ Key insight this agent exploits:
 
 Usage:
     from trader.agents.exit_tuner import run
-    delta = run(db_path="trader.db", strategy="quick_pop_chart_ml", current_config={...})
+    delta = run(db_path="trader.db", strategy="quick_pop_managed", current_config={...})
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ _MODEL = "claude-haiku-4-5-20251001"
 
 def run(
     db_path: str = "trader.db",
-    strategy: str = "quick_pop_chart_ml",
+    strategy: str = "quick_pop_managed",
     current_config: dict | None = None,
 ) -> dict:
     """

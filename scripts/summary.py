@@ -12,17 +12,20 @@ Usage (on the server):
 No Birdeye call is made — open positions show last known price from the DB.
 """
 
+import asyncio
 import os
 import sqlite3
 import sys
 import logging
 
+import aiohttp
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from trader.config import Config
 from trader.persistence.database import TradeDatabase
+from trader.pricing.birdeye import BirdeyePriceClient
 from trader.trading.engine import MultiStrategyEngine
 from trader.utils.logging import configure_logging
 
@@ -196,6 +199,30 @@ def print_ai_balance(db_path: str) -> None:
     print()
 
 
+async def _fetch_and_update_prices(
+    cfg: "Config",
+    runners: list,
+) -> None:
+    """Fetch live prices for all open positions and update last_price."""
+    mint_to_positions: dict[str, list] = {}
+    for runner in runners:
+        for pos in runner.get_open_positions():
+            if pos.mint_address:
+                mint_to_positions.setdefault(pos.mint_address, []).append(pos)
+
+    if not mint_to_positions:
+        return
+
+    async with aiohttp.ClientSession() as session:
+        birdeye = BirdeyePriceClient(cfg=cfg, session=session)
+        prices = await birdeye.get_prices_batch(list(mint_to_positions.keys()))
+
+    for mint, price in prices.items():
+        if price is not None:
+            for pos in mint_to_positions[mint]:
+                pos.last_price = price
+
+
 def main() -> None:
     try:
         cfg = Config.load()
@@ -224,16 +251,18 @@ def main() -> None:
     for runner in runners:
         saved = db.load_portfolio(runner.name)
         if saved:
-            available_cash, starting_cash = saved
-            runner.restore_cash(available_cash, starting_cash)
+            available_cash, starting_cash, total_reloads = saved
+            runner.restore_cash(available_cash, starting_cash, total_reloads)
         runner.restore_positions(db.load_open_positions(runner.name))
+        runner.restore_closed_positions(db.load_closed_positions(runner.name))
 
     db.close()
 
-    # BirdeyePriceClient is not available here — open positions show entry price,
-    # not current market price. Unrealized PnL will read $0 for all open positions.
+    # Fetch live prices for open positions (one batch call)
+    asyncio.run(_fetch_and_update_prices(cfg, runners))
+
     print(SEP)
-    print("  OPEN POSITIONS  (prices shown are entry prices — not live)")
+    print("  OPEN POSITIONS  (live prices)")
     print(SEP)
     engine = MultiStrategyEngine(cfg=cfg, runners=runners, birdeye_client=None)
     engine.print_summary()

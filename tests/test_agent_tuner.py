@@ -27,8 +27,10 @@ from trader.agents.strategy_tuner import (
     _apply_delta,
     _parse_response,
     _validate_strategy_delta,
+    assert_owned_config_changes,
     load_config,
     save_config,
+    save_owned_config,
 )
 
 
@@ -46,16 +48,16 @@ class TestPermissionTiers:
     def test_quick_pop_base_not_controlled(self):
         assert "quick_pop" not in CONTROLLED_STRATEGIES
 
-    def test_quick_pop_chart_ml_is_ml_only(self):
-        assert "quick_pop_chart_ml" in ML_ONLY_STRATEGIES
+    def test_quick_pop_managed_is_ml_only(self):
+        assert "quick_pop_managed" in ML_ONLY_STRATEGIES
 
     def test_trend_rider_chart_is_full_control(self):
-        assert "trend_rider_chart_reanalyze" in FULL_CONTROL_STRATEGIES
-        assert "trend_rider_chart_reanalyze" not in ML_ONLY_STRATEGIES
+        assert "trend_rider_managed" in FULL_CONTROL_STRATEGIES
+        assert "trend_rider_managed" not in ML_ONLY_STRATEGIES
 
-    def test_infinite_moonbag_chart_is_full_control(self):
-        assert "infinite_moonbag_chart" in FULL_CONTROL_STRATEGIES
-        assert "infinite_moonbag_chart" not in ML_ONLY_STRATEGIES
+    def test_moonbag_managed_is_full_control(self):
+        assert "moonbag_managed" in FULL_CONTROL_STRATEGIES
+        assert "moonbag_managed" not in ML_ONLY_STRATEGIES
 
     def test_base_strategies_not_controlled(self):
         # Base strategies are NOT autonomously tuned — agent cannot write to them.
@@ -82,63 +84,63 @@ class TestPermissionTiers:
 # ---------------------------------------------------------------------------
 
 class TestValidateDeltaMLOnly:
-    """quick_pop_chart_ml can only change ML params."""
+    """quick_pop_managed can only change ML params."""
 
     def test_strips_stop_loss(self):
-        result = _validate_strategy_delta("quick_pop_chart_ml", {"stop_loss_pct": 0.15, "reason": "x"})
+        result = _validate_strategy_delta("quick_pop_managed", {"stop_loss_pct": 0.15, "reason": "x"})
         assert "stop_loss_pct" not in result
 
     def test_strips_trailing_stop(self):
-        result = _validate_strategy_delta("quick_pop_chart_ml", {"trailing_stop_pct": 0.20, "reason": "x"})
+        result = _validate_strategy_delta("quick_pop_managed", {"trailing_stop_pct": 0.20, "reason": "x"})
         assert "trailing_stop_pct" not in result
 
     def test_strips_tp_levels(self):
-        result = _validate_strategy_delta("quick_pop_chart_ml", {"tp_levels": [[1.5, 0.6]], "reason": "x"})
+        result = _validate_strategy_delta("quick_pop_managed", {"tp_levels": [[1.5, 0.6]], "reason": "x"})
         assert "tp_levels" not in result
 
     def test_strips_use_chart_filter(self):
-        result = _validate_strategy_delta("quick_pop_chart_ml", {"use_chart_filter": False, "reason": "x"})
+        result = _validate_strategy_delta("quick_pop_managed", {"use_chart_filter": False, "reason": "x"})
         assert "use_chart_filter" not in result
 
     def test_strips_use_reanalyze(self):
-        result = _validate_strategy_delta("quick_pop_chart_ml", {"use_reanalyze": True, "reason": "x"})
+        result = _validate_strategy_delta("quick_pop_managed", {"use_reanalyze": True, "reason": "x"})
         assert "use_reanalyze" not in result
 
     def test_strips_pump_ratio_max(self):
-        result = _validate_strategy_delta("quick_pop_chart_ml", {"pump_ratio_max": 4.0, "reason": "x"})
+        result = _validate_strategy_delta("quick_pop_managed", {"pump_ratio_max": 4.0, "reason": "x"})
         assert "pump_ratio_max" not in result
 
     def test_strips_use_ml_filter(self):
-        # use_ml_filter is permanently ON for quick_pop_chart_ml — agent cannot toggle it
-        result = _validate_strategy_delta("quick_pop_chart_ml", {"use_ml_filter": False, "reason": "x"})
+        # use_ml_filter is permanently ON for quick_pop_managed — agent cannot toggle it
+        result = _validate_strategy_delta("quick_pop_managed", {"use_ml_filter": False, "reason": "x"})
         assert "use_ml_filter" not in result
 
     def test_strips_ml_min_score_locked(self):
-        # ml_min_score is locked at 2.5 for quick_pop_chart_ml — any proposed change is dropped
-        result = _validate_strategy_delta("quick_pop_chart_ml", {"ml_min_score": 6.0, "reason": "x"})
+        # ml_min_score is locked at 2.5 for quick_pop_managed — any proposed change is dropped
+        result = _validate_strategy_delta("quick_pop_managed", {"ml_min_score": 6.0, "reason": "x"})
         assert "ml_min_score" not in result
 
     def test_keeps_ml_k(self):
-        result = _validate_strategy_delta("quick_pop_chart_ml", {"ml_k": 7, "reason": "x"})
+        result = _validate_strategy_delta("quick_pop_managed", {"ml_k": 7, "reason": "x"})
         assert result.get("ml_k") == 7
 
     def test_keeps_ml_halflife(self):
-        result = _validate_strategy_delta("quick_pop_chart_ml", {"ml_halflife_days": 10.0, "reason": "x"})
+        result = _validate_strategy_delta("quick_pop_managed", {"ml_halflife_days": 10.0, "reason": "x"})
         assert result.get("ml_halflife_days") == 10.0
 
     def test_keeps_ml_score_low_high(self):
-        result = _validate_strategy_delta("quick_pop_chart_ml", {
+        result = _validate_strategy_delta("quick_pop_managed", {
             "ml_score_low_pct": -40.0, "ml_score_high_pct": 100.0, "reason": "x",
         })
         assert result.get("ml_score_low_pct") == -40.0
         assert result.get("ml_score_high_pct") == 100.0
 
     def test_passes_reason_through(self):
-        result = _validate_strategy_delta("quick_pop_chart_ml", {"use_ml_filter": True, "reason": "test reason"})
+        result = _validate_strategy_delta("quick_pop_managed", {"use_ml_filter": True, "reason": "test reason"})
         assert result.get("reason") == "test reason"
 
     def test_empty_delta_returns_empty(self):
-        result = _validate_strategy_delta("quick_pop_chart_ml", {})
+        result = _validate_strategy_delta("quick_pop_managed", {})
         assert result == {}
 
 
@@ -158,19 +160,19 @@ class TestValidateDeltaFullControl:
         assert "trailing_stop_pct" in result
 
     def test_allows_use_ml_filter(self):
-        result = _validate_strategy_delta("trend_rider_chart_reanalyze", {"use_ml_filter": True})
+        result = _validate_strategy_delta("trend_rider_managed", {"use_ml_filter": True})
         assert result.get("use_ml_filter") is True
 
     def test_allows_use_chart_filter(self):
-        result = _validate_strategy_delta("trend_rider_chart_reanalyze", {"use_chart_filter": False})
+        result = _validate_strategy_delta("trend_rider_managed", {"use_chart_filter": False})
         assert result.get("use_chart_filter") is False
 
     def test_allows_use_reanalyze(self):
-        result = _validate_strategy_delta("trend_rider_chart_reanalyze", {"use_reanalyze": True})
+        result = _validate_strategy_delta("trend_rider_managed", {"use_reanalyze": True})
         assert result.get("use_reanalyze") is True
 
     def test_allows_pump_ratio_max(self):
-        result = _validate_strategy_delta("trend_rider_chart_reanalyze", {"pump_ratio_max": 5.0})
+        result = _validate_strategy_delta("trend_rider_managed", {"pump_ratio_max": 5.0})
         assert result.get("pump_ratio_max") == 5.0
 
     def test_allows_tp_levels_trend_rider(self):
@@ -188,7 +190,7 @@ class TestValidateDeltaFullControl:
 
     def test_clamps_pump_ratio_to_extra_guardrail_max(self):
         # _EXTRA_GUARDRAILS pump_ratio_max max is 8.0
-        result = _validate_strategy_delta("trend_rider_chart_reanalyze", {"pump_ratio_max": 20.0})
+        result = _validate_strategy_delta("trend_rider_managed", {"pump_ratio_max": 20.0})
         assert result.get("pump_ratio_max") == pytest.approx(8.0)
 
     def test_moonbag_timeout_stripped(self):
@@ -197,13 +199,13 @@ class TestValidateDeltaFullControl:
         assert "timeout_minutes" not in result
 
     def test_ml_k_cast_to_int(self):
-        result = _validate_strategy_delta("trend_rider_chart_reanalyze", {"ml_k": 6.7})
+        result = _validate_strategy_delta("trend_rider_managed", {"ml_k": 6.7})
         assert result.get("ml_k") == 7
         assert isinstance(result.get("ml_k"), int)
 
     def test_bool_must_be_bool(self):
         # String "true" is not a valid bool
-        result = _validate_strategy_delta("trend_rider_chart_reanalyze", {"use_ml_filter": "true"})
+        result = _validate_strategy_delta("trend_rider_managed", {"use_ml_filter": "true"})
         assert "use_ml_filter" not in result
 
 
@@ -336,6 +338,71 @@ class TestConfigIO:
         tmp_files = list(tmp_path.glob("*.tmp"))
         assert tmp_files == []
 
+    def test_save_owned_config_allows_owned_strategy_and_namespaced_meta(self, tmp_path):
+        cfg_path = tmp_path / "strategy_config.json"
+        before = {
+            "_meta": {"version": 1, "deepseek_manager_last_run_at": "2026-03-27T00:00:00+00:00"},
+            "open_ai_managed": {"mode": "balanced"},
+            "deep_seek_managed": {"mode": "strict"},
+        }
+        after = {
+            "_meta": {
+                "version": 1,
+                "deepseek_manager_last_run_at": "2026-03-27T00:00:00+00:00",
+                "openai_manager_last_run_at": "2026-03-27T01:00:00+00:00",
+            },
+            "open_ai_managed": {"mode": "lenient"},
+            "deep_seek_managed": {"mode": "strict"},
+        }
+        save_owned_config(
+            before,
+            after,
+            owned_strategy="open_ai_managed",
+            allowed_meta_prefixes=("openai_manager_",),
+            path=cfg_path,
+        )
+        assert load_config(path=cfg_path) == after
+
+    def test_save_owned_config_rejects_other_strategy_changes(self, tmp_path):
+        cfg_path = tmp_path / "strategy_config.json"
+        before = {
+            "_meta": {"version": 1},
+            "open_ai_managed": {"mode": "balanced"},
+            "deep_seek_managed": {"mode": "strict"},
+        }
+        after = {
+            "_meta": {"version": 1, "openai_manager_last_run_at": "2026-03-27T01:00:00+00:00"},
+            "open_ai_managed": {"mode": "lenient"},
+            "deep_seek_managed": {"mode": "allow_all"},
+        }
+        with pytest.raises(ValueError, match="non-owned config section"):
+            save_owned_config(
+                before,
+                after,
+                owned_strategy="open_ai_managed",
+                allowed_meta_prefixes=("openai_manager_",),
+                path=cfg_path,
+            )
+
+    def test_save_owned_config_rejects_non_namespaced_meta_changes(self, tmp_path):
+        cfg_path = tmp_path / "strategy_config.json"
+        before = {
+            "_meta": {"version": 1, "last_tuned_at": "2026-03-20T19:43:20+00:00"},
+            "open_ai_managed": {"mode": "balanced"},
+        }
+        after = {
+            "_meta": {"version": 1, "last_tuned_at": "2026-03-27T01:00:00+00:00"},
+            "open_ai_managed": {"mode": "lenient"},
+        }
+        with pytest.raises(ValueError, match="non-owned _meta key"):
+            save_owned_config(
+                before,
+                after,
+                owned_strategy="open_ai_managed",
+                allowed_meta_prefixes=("openai_manager_",),
+                path=cfg_path,
+            )
+
 
 # ---------------------------------------------------------------------------
 # _apply_delta
@@ -369,9 +436,9 @@ class TestApplyDelta:
         assert config["trend_rider"]["trailing_stop_pct"] == 0.25
 
     def test_bool_written_correctly(self):
-        config = {"trend_rider_chart_reanalyze": {"use_ml_filter": False}}
-        _apply_delta("trend_rider_chart_reanalyze", {"use_ml_filter": True}, config)
-        assert config["trend_rider_chart_reanalyze"]["use_ml_filter"] is True
+        config = {"trend_rider_managed": {"use_ml_filter": False}}
+        _apply_delta("trend_rider_managed", {"use_ml_filter": True}, config)
+        assert config["trend_rider_managed"]["use_ml_filter"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +464,7 @@ class TestLoadStrategyOverrides:
         import trader.strategies.registry as reg
         cfg = tmp_path / "strategy_config.json"
         data = {
-            "trend_rider_chart_reanalyze": {"stop_loss_pct": 0.20},
+            "trend_rider_managed": {"stop_loss_pct": 0.20},
             "trend_rider": {"stop_loss_pct": 0.30},  # base — readable for manual overrides
             "quick_pop": {"stop_loss_pct": 0.15},    # not a registered strategy — excluded
             "_meta": {"version": 1},
@@ -405,20 +472,20 @@ class TestLoadStrategyOverrides:
         cfg.write_text(json.dumps(data))
         monkeypatch.setattr(reg, "_CONFIG_PATH", cfg)
         result = reg._load_strategy_overrides()
-        assert "trend_rider_chart_reanalyze" in result
+        assert "trend_rider_managed" in result
         assert "trend_rider" in result        # base strategies load for manual overrides
         assert "quick_pop" not in result      # not a registered config strategy
         assert "_meta" not in result
 
-    def test_quick_pop_chart_ml_included(self, tmp_path, monkeypatch):
+    def test_quick_pop_managed_included(self, tmp_path, monkeypatch):
         import trader.strategies.registry as reg
         cfg = tmp_path / "strategy_config.json"
-        data = {"quick_pop_chart_ml": {"use_ml_filter": True, "ml_k": 7}}
+        data = {"quick_pop_managed": {"use_ml_filter": True, "ml_k": 7}}
         cfg.write_text(json.dumps(data))
         monkeypatch.setattr(reg, "_CONFIG_PATH", cfg)
         result = reg._load_strategy_overrides()
-        assert "quick_pop_chart_ml" in result
-        assert result["quick_pop_chart_ml"]["ml_k"] == 7
+        assert "quick_pop_managed" in result
+        assert result["quick_pop_managed"]["ml_k"] == 7
 
 
 # ---------------------------------------------------------------------------
@@ -430,11 +497,11 @@ class TestLogAgentAction:
         from trader.agents import base
         monkeypatch.setattr(base, "_LOG_DIR", tmp_path)
         base.log_agent_action(
-            "strategy_tuner", "quick_pop_chart_ml",
+            "strategy_tuner", "quick_pop_managed",
             {"ml_min_score": 3.0, "ml_k": 7, "reason": "test"},
             {"ml_min_score": 5.0, "ml_k": 5},
         )
-        lines = (tmp_path / "agent_actions_quick_pop_chart_ml.log").read_text().splitlines()
+        lines = (tmp_path / "agent_actions_quick_pop_managed.log").read_text().splitlines()
         assert len(lines) == 2
         assert "ml_min_score: 5.0 → 3.0" in lines[0]
         assert "ml_k: 5 → 7" in lines[1]
@@ -443,59 +510,59 @@ class TestLogAgentAction:
         from trader.agents import base
         monkeypatch.setattr(base, "_LOG_DIR", tmp_path)
         base.log_agent_action(
-            "strategy_tuner", "quick_pop_chart_ml",
+            "strategy_tuner", "quick_pop_managed",
             {"ml_min_score": 3.0, "reason": "buckets negative"},
             {"ml_min_score": 5.0},
         )
-        line = (tmp_path / "agent_actions_quick_pop_chart_ml.log").read_text()
+        line = (tmp_path / "agent_actions_quick_pop_managed.log").read_text()
         assert "strategy_tuner" in line
-        assert "quick_pop_chart_ml" in line
+        assert "quick_pop_managed" in line
         assert "buckets negative" in line
 
     def test_appends_across_calls(self, tmp_path, monkeypatch):
         from trader.agents import base
         monkeypatch.setattr(base, "_LOG_DIR", tmp_path)
-        base.log_agent_action("strategy_tuner", "quick_pop_chart_ml",
+        base.log_agent_action("strategy_tuner", "quick_pop_managed",
                               {"ml_min_score": 3.0, "reason": "a"}, {"ml_min_score": 5.0})
-        base.log_agent_action("strategy_tuner", "quick_pop_chart_ml",
+        base.log_agent_action("strategy_tuner", "quick_pop_managed",
                               {"ml_min_score": 4.0, "reason": "b"}, {"ml_min_score": 3.0})
-        lines = (tmp_path / "agent_actions_quick_pop_chart_ml.log").read_text().splitlines()
+        lines = (tmp_path / "agent_actions_quick_pop_managed.log").read_text().splitlines()
         assert len(lines) == 2
 
     def test_no_changes_writes_nothing(self, tmp_path, monkeypatch):
         from trader.agents import base
         monkeypatch.setattr(base, "_LOG_DIR", tmp_path)
-        base.log_agent_action("strategy_tuner", "quick_pop_chart_ml",
+        base.log_agent_action("strategy_tuner", "quick_pop_managed",
                               {"reason": "only reason"}, {})
-        assert not (tmp_path / "agent_actions_quick_pop_chart_ml.log").exists()
+        assert not (tmp_path / "agent_actions_quick_pop_managed.log").exists()
 
     def test_creates_parent_directory(self, tmp_path, monkeypatch):
         from trader.agents import base
         nested_dir = tmp_path / "logs" / "subdir"
         monkeypatch.setattr(base, "_LOG_DIR", nested_dir)
-        base.log_agent_action("strategy_tuner", "quick_pop_chart_ml",
+        base.log_agent_action("strategy_tuner", "quick_pop_managed",
                               {"ml_min_score": 3.0, "reason": "x"}, {"ml_min_score": 5.0})
-        assert (nested_dir / "agent_actions_quick_pop_chart_ml.log").exists()
+        assert (nested_dir / "agent_actions_quick_pop_managed.log").exists()
 
     def test_reason_not_written_as_own_line(self, tmp_path, monkeypatch):
         from trader.agents import base
         monkeypatch.setattr(base, "_LOG_DIR", tmp_path)
-        base.log_agent_action("strategy_tuner", "quick_pop_chart_ml",
+        base.log_agent_action("strategy_tuner", "quick_pop_managed",
                               {"ml_min_score": 3.0, "reason": "x"}, {"ml_min_score": 5.0})
-        lines = (tmp_path / "agent_actions_quick_pop_chart_ml.log").read_text().splitlines()
+        lines = (tmp_path / "agent_actions_quick_pop_managed.log").read_text().splitlines()
         assert len(lines) == 1  # only ml_min_score, not reason
 
     def test_different_strategies_write_separate_files(self, tmp_path, monkeypatch):
         from trader.agents import base
         monkeypatch.setattr(base, "_LOG_DIR", tmp_path)
-        base.log_agent_action("strategy_tuner", "quick_pop_chart_ml",
+        base.log_agent_action("strategy_tuner", "quick_pop_managed",
                               {"ml_min_score": 3.0, "reason": "a"}, {"ml_min_score": 5.0})
-        base.log_agent_action("strategy_tuner", "trend_rider_chart_reanalyze",
+        base.log_agent_action("strategy_tuner", "trend_rider_managed",
                               {"stop_loss_pct": 0.25, "reason": "b"}, {"stop_loss_pct": 0.30})
-        assert (tmp_path / "agent_actions_quick_pop_chart_ml.log").exists()
-        assert (tmp_path / "agent_actions_trend_rider_chart_reanalyze.log").exists()
-        assert "ml_min_score" not in (tmp_path / "agent_actions_trend_rider_chart_reanalyze.log").read_text()
-        assert "stop_loss_pct" not in (tmp_path / "agent_actions_quick_pop_chart_ml.log").read_text()
+        assert (tmp_path / "agent_actions_quick_pop_managed.log").exists()
+        assert (tmp_path / "agent_actions_trend_rider_managed.log").exists()
+        assert "ml_min_score" not in (tmp_path / "agent_actions_trend_rider_managed.log").read_text()
+        assert "stop_loss_pct" not in (tmp_path / "agent_actions_quick_pop_managed.log").read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -506,68 +573,68 @@ class TestLoadAgentHistory:
     def test_returns_empty_when_no_log(self, tmp_path, monkeypatch):
         from trader.agents import base, strategy_tuner
         monkeypatch.setattr(base, "_LOG_DIR", tmp_path)
-        result = strategy_tuner._load_agent_history("quick_pop_chart_ml")
+        result = strategy_tuner._load_agent_history("quick_pop_managed")
         assert result == ""
 
     def test_returns_all_lines_from_strategy_file(self, tmp_path, monkeypatch):
         from trader.agents import base, strategy_tuner
         monkeypatch.setattr(base, "_LOG_DIR", tmp_path)
-        log = tmp_path / "agent_actions_quick_pop_chart_ml.log"
+        log = tmp_path / "agent_actions_quick_pop_managed.log"
         log.write_text(
-            "2026-03-17T10:00:00Z | strategy_tuner | quick_pop_chart_ml | ml_min_score: 5.0 → 3.0 | reason: a\n"
-            "2026-03-17T10:02:00Z | strategy_tuner | quick_pop_chart_ml | ml_k: 5 → 7 | reason: c\n"
+            "2026-03-17T10:00:00Z | strategy_tuner | quick_pop_managed | ml_min_score: 5.0 → 3.0 | reason: a\n"
+            "2026-03-17T10:02:00Z | strategy_tuner | quick_pop_managed | ml_k: 5 → 7 | reason: c\n"
         )
-        result = strategy_tuner._load_agent_history("quick_pop_chart_ml")
+        result = strategy_tuner._load_agent_history("quick_pop_managed")
         assert "ml_min_score" in result
         assert "ml_k" in result
 
     def test_other_strategy_file_not_included(self, tmp_path, monkeypatch):
         from trader.agents import base, strategy_tuner
         monkeypatch.setattr(base, "_LOG_DIR", tmp_path)
-        (tmp_path / "agent_actions_trend_rider_chart_reanalyze.log").write_text(
-            "2026-03-17T10:01:00Z | strategy_tuner | trend_rider_chart_reanalyze | stop_loss_pct: 0.30 → 0.25 | reason: b\n"
+        (tmp_path / "agent_actions_trend_rider_managed.log").write_text(
+            "2026-03-17T10:01:00Z | strategy_tuner | trend_rider_managed | stop_loss_pct: 0.30 → 0.25 | reason: b\n"
         )
-        result = strategy_tuner._load_agent_history("quick_pop_chart_ml")
+        result = strategy_tuner._load_agent_history("quick_pop_managed")
         assert result == ""
 
     def test_respects_max_lines(self, tmp_path, monkeypatch):
         from trader.agents import base, strategy_tuner
         monkeypatch.setattr(base, "_LOG_DIR", tmp_path)
-        log = tmp_path / "agent_actions_quick_pop_chart_ml.log"
+        log = tmp_path / "agent_actions_quick_pop_managed.log"
         lines = "\n".join(
-            f"2026-03-17T10:{i:02d}:00Z | strategy_tuner | quick_pop_chart_ml | ml_min_score: 5.0 → {i}.0 | reason: x"
+            f"2026-03-17T10:{i:02d}:00Z | strategy_tuner | quick_pop_managed | ml_min_score: 5.0 → {i}.0 | reason: x"
             for i in range(30)
         ) + "\n"
         log.write_text(lines)
-        result = strategy_tuner._load_agent_history("quick_pop_chart_ml", max_lines=5)
+        result = strategy_tuner._load_agent_history("quick_pop_managed", max_lines=5)
         assert len(result.splitlines()) == 5
 
 
 # ---------------------------------------------------------------------------
-# Locked params — ml_min_score is locked for quick_pop_chart_ml
+# Locked params — ml_min_score is locked for quick_pop_managed
 # ---------------------------------------------------------------------------
 
 class TestLockedParams:
-    def test_ml_min_score_stripped_for_quick_pop_chart_ml(self):
+    def test_ml_min_score_stripped_for_quick_pop_managed(self):
         # Locked — any proposed value (including the correct one) is dropped
-        result = _validate_strategy_delta("quick_pop_chart_ml", {"ml_min_score": 2.5, "reason": "x"})
+        result = _validate_strategy_delta("quick_pop_managed", {"ml_min_score": 2.5, "reason": "x"})
         assert "ml_min_score" not in result
 
     def test_ml_min_score_stripped_even_when_out_of_range(self):
         # Lock runs before guardrail clamping — still stripped even if value is invalid
-        result = _validate_strategy_delta("quick_pop_chart_ml", {"ml_min_score": 1.0, "reason": "x"})
+        result = _validate_strategy_delta("quick_pop_managed", {"ml_min_score": 1.0, "reason": "x"})
         assert "ml_min_score" not in result
 
     def test_ml_min_score_stripped_above_ceiling(self):
-        result = _validate_strategy_delta("quick_pop_chart_ml", {"ml_min_score": 9.0, "reason": "x"})
+        result = _validate_strategy_delta("quick_pop_managed", {"ml_min_score": 9.0, "reason": "x"})
         assert "ml_min_score" not in result
 
     def test_ml_min_score_allowed_for_full_control_strategy(self):
         # Not locked for other strategies — guardrail floor is 2.0
-        result = _validate_strategy_delta("trend_rider_chart_reanalyze", {"ml_min_score": 2.5})
+        result = _validate_strategy_delta("trend_rider_managed", {"ml_min_score": 2.5})
         assert result.get("ml_min_score") == pytest.approx(2.5)
 
     def test_ml_min_score_clamped_for_full_control_strategy(self):
         # Below guardrail floor (2.0) → clamped, not locked
-        result = _validate_strategy_delta("trend_rider_chart_reanalyze", {"ml_min_score": 1.0})
+        result = _validate_strategy_delta("trend_rider_managed", {"ml_min_score": 1.0})
         assert result.get("ml_min_score") == pytest.approx(2.0)

@@ -72,7 +72,8 @@ def extract_urls(text: str) -> list[str]:
 
 _UPDATE_PATTERNS = re.compile(
     r"""
-    \b\d+\.?\d*[xX]\b          # standalone multiplier:  2X · 5X · 2.5x
+    \b\d+\.?\d*[xX]\b          # digit-first multiplier:  2X · 5X · 2.5x
+    | \bX\d+\.?\d*\b            # X-first multiplier:  X3.8 · X14.0 (wedegentheyaped style)
     | \bhit\s+\d+[xX]\b        # "hit 5X"
     | \bmoon\s*mode\b           # "moon mode"
     | \bhover(?:ing)?\s+around\b  # "hovering around"
@@ -81,6 +82,8 @@ _UPDATE_PATTERNS = re.compile(
     | \bprofit\s+reached\b      # "X2 profit reached"
     | \bfrom\s+signal\s+entry\b # "Profit: +41% from signal entry"
     | \bTop\s+\d+\s+Gainers\b   # "Top 10 Gainers in Last 24h"
+    | BREAK\s+ATH               # "BREAK ATH" update header (wedegentheyaped style)
+    | \bJumped\s+from\b         # "Jumped from $25k to now $97k"
     """,
     re.IGNORECASE | re.VERBOSE,
 )

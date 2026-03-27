@@ -1,17 +1,36 @@
 {
   "_meta": {
-    "last_tuned_at": "2026-03-20T03:15:20.105879+00:00",
+    "last_tuned_at": "2026-03-20T19:43:20.522613+00:00",
     "trades_at_last_tune": {
       "trend_rider": 0,
-      "trend_rider_chart_reanalyze": 139,
+      "trend_rider_managed": 77,
       "infinite_moonbag": 0,
-      "infinite_moonbag_chart": 0,
-      "quick_pop_chart_ml": 139
+      "moonbag_managed": 75,
+      "quick_pop_managed": 83,
+      "infinite_moonbag_chart": 75,
+      "quick_pop_chart_ml": 83,
+      "trend_rider_chart_reanalyze": 77
     },
     "version": 1,
     "ai_balance_start_usd": 1000.0,
     "ai_profit_target_usd": 300.0,
     "ai_deadline": "2026-04-10"
+  },
+  "safe_bet": {
+    "live_trading": false,
+    "stop_loss_pct": 0.05,
+    "timeout_minutes": 60.0,
+    "timeout_min_gain_pct": 0.10,
+    "peak_drop_exit_pct": 0.08,
+    "early_timeout_minutes": 20.0,
+    "early_timeout_max_gain_pct": 0.02,
+    "early_timeout_min_range_pct": 0.05
+  },
+  "quick_pop": {
+    "peak_drop_exit_pct": 0.12,
+    "early_timeout_minutes": 12.0,
+    "early_timeout_max_gain_pct": 0.02,
+    "early_timeout_min_range_pct": 0.06
   },
   "trend_rider": {
     "live_trading": false,
@@ -25,9 +44,14 @@
     ],
     "timeout_minutes": 90.0,
     "timeout_min_gain_pct": 0.15,
-    "max_hold_minutes": 240.0
+    "max_hold_minutes": 240.0,
+    "peak_drop_exit_pct": 0.18,
+    "early_timeout_minutes": 25.0,
+    "early_timeout_max_gain_pct": 0.03,
+    "early_timeout_min_range_pct": 0.08
   },
-  "trend_rider_chart_reanalyze": {
+  "trend_rider_managed": {
+    "ml_filter_mode": "balanced",
     "live_trading": false,
     "stop_loss_pct": 0.35,
     "trailing_stop_pct": 0.25,
@@ -40,9 +64,13 @@
     "timeout_minutes": 90.0,
     "timeout_min_gain_pct": 0.15,
     "max_hold_minutes": 240.0,
+    "peak_drop_exit_pct": 0.18,
+    "early_timeout_minutes": 25.0,
+    "early_timeout_max_gain_pct": 0.03,
+    "early_timeout_min_range_pct": 0.08,
     "use_chart_filter": false,
     "pump_ratio_max": 3.5,
-    "use_reanalyze": true,
+    "use_reanalyze": false,
     "reanalyze_pump_delay": 480.0,
     "reanalyze_vol_delay": 240.0,
     "reanalyze_both_delay": 600.0,
@@ -82,22 +110,41 @@
       ]
     ]
   },
-  "quick_pop_chart_ml": {
+  "quick_pop_managed": {
     "live_trading": true,
+    "peak_drop_exit_pct": 0.12,
+    "early_timeout_minutes": 12.0,
+    "early_timeout_max_gain_pct": 0.02,
+    "early_timeout_min_range_pct": 0.06,
+    "use_policy_agent": false,
     "use_ai_override": false,
-    "use_ai_override_shadow": true,
+    "use_ai_override_shadow": false,
     "ml_training_strategy": "quick_pop",
-    "ml_min_score": 2.5,
-    "ml_high_score_threshold": 7.0,
-    "ml_max_score_threshold": 9.0,
-    "ml_size_multiplier": 1.3,
+    "ml_training_label": "position_peak_pnl_pct",
+    "ml_min_score": 1.5,
+    "ml_high_score_threshold": 6.0,
+    "ml_max_score_threshold": 8.0,
+    "ml_size_multiplier": 1.2,
     "ml_max_size_multiplier": 2.0,
-    "ml_k": 6,
-    "ml_halflife_days": 4.0,
-    "ml_score_low_pct": -35.0,
-    "ml_score_high_pct": 130.0
+    "ml_k": 3,
+    "ml_halflife_days": 7.0,
+    "ml_score_low_pct": -45.0,
+    "ml_score_high_pct": 300.0
   },
-  "infinite_moonbag_chart": {
+  "open_ai_managed": {
+    "base_strategy": "quick_pop",
+    "mode": "balanced",
+    "live_trading": false,
+    "peak_drop_exit_pct": 0.12,
+    "early_timeout_minutes": 12.0,
+    "early_timeout_max_gain_pct": 0.02,
+    "early_timeout_min_range_pct": 0.06,
+    "ml_k": 3,
+    "ml_halflife_days": 7.0,
+    "ml_score_low_pct": -45.0,
+    "ml_score_high_pct": 300.0
+  },
+  "moonbag_managed": {
     "live_trading": false,
     "stop_loss_pct": 0.35,
     "trailing_stop_pct": 0.35,
@@ -123,14 +170,14 @@
     "pump_ratio_max": 3.5,
     "use_ml_filter": true,
     "ml_training_strategy": "infinite_moonbag",
-    "ml_min_score": 5.0,
-    "ml_high_score_threshold": 8.0,
-    "ml_max_score_threshold": 9.5,
+    "ml_min_score": 2.0,
+    "ml_high_score_threshold": 6.0,
+    "ml_max_score_threshold": 8.0,
     "ml_size_multiplier": 2.0,
     "ml_max_size_multiplier": 3.0,
-    "ml_k": 5,
+    "ml_k": 3,
     "ml_halflife_days": 14.0,
     "ml_score_low_pct": -35.0,
-    "ml_score_high_pct": 85.0
+    "ml_score_high_pct": 150.0
   }
 }

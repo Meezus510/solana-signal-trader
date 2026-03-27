@@ -91,17 +91,17 @@ def _insert_outcome(conn, chart_id, strategy, entered, closed=0,
 # ---------------------------------------------------------------------------
 
 class TestBaseStrategyMapping:
-    def test_quick_pop_chart_ml_maps_to_quick_pop(self):
-        assert _BASE_STRATEGY["quick_pop_chart_ml"] == "quick_pop"
+    def test_quick_pop_managed_maps_to_quick_pop(self):
+        assert _BASE_STRATEGY["quick_pop_managed"] == "quick_pop"
 
-    def test_trend_rider_chart_reanalyze_maps_to_trend_rider(self):
-        assert _BASE_STRATEGY["trend_rider_chart_reanalyze"] == "trend_rider"
+    def test_trend_rider_managed_maps_to_trend_rider(self):
+        assert _BASE_STRATEGY["trend_rider_managed"] == "trend_rider"
 
-    def test_infinite_moonbag_chart_maps_to_infinite_moonbag(self):
-        assert _BASE_STRATEGY["infinite_moonbag_chart"] == "infinite_moonbag"
+    def test_moonbag_managed_maps_to_infinite_moonbag(self):
+        assert _BASE_STRATEGY["moonbag_managed"] == "infinite_moonbag"
 
     def test_all_chart_variants_have_mapping(self):
-        chart_variants = {"quick_pop_chart_ml", "trend_rider_chart_reanalyze", "infinite_moonbag_chart"}
+        chart_variants = {"quick_pop_managed", "trend_rider_managed", "moonbag_managed"}
         assert chart_variants.issubset(_BASE_STRATEGY.keys())
 
     def test_base_strategies_not_in_mapping(self):
@@ -120,7 +120,7 @@ class TestQuerySkippedStats:
         conn = _make_db(path)
         conn.close()
 
-        result = query_skipped_stats(path, "quick_pop_chart_ml", "quick_pop")
+        result = query_skipped_stats(path, "quick_pop_managed", "quick_pop")
         assert result["total_skipped"] == 0
         assert result["base_entered"] == 0
         assert result["profitable_pct"] is None
@@ -133,12 +133,12 @@ class TestQuerySkippedStats:
             path = f.name
         conn = _make_db(path)
         chart_id = _insert_chart(conn, symbol="WIF")
-        _insert_outcome(conn, chart_id, "quick_pop_chart_ml", entered=False)
+        _insert_outcome(conn, chart_id, "quick_pop_managed", entered=False)
         # base entered but NOT closed yet
         _insert_outcome(conn, chart_id, "quick_pop", entered=True, closed=False)
         conn.close()
 
-        result = query_skipped_stats(path, "quick_pop_chart_ml", "quick_pop")
+        result = query_skipped_stats(path, "quick_pop_managed", "quick_pop")
         assert result["total_skipped"] == 1
         assert result["base_entered"] == 0  # not closed yet, excluded
 
@@ -154,12 +154,12 @@ class TestQuerySkippedStats:
             (50.0, 80.0, "TP2"),
         ]:
             cid = _insert_chart(conn)
-            _insert_outcome(conn, cid, "quick_pop_chart_ml", entered=False)
+            _insert_outcome(conn, cid, "quick_pop_managed", entered=False)
             _insert_outcome(conn, cid, "quick_pop", entered=True, closed=True,
                             pnl_pct=pnl, max_gain_pct=gain, sell_reason=reason)
         conn.close()
 
-        result = query_skipped_stats(path, "quick_pop_chart_ml", "quick_pop")
+        result = query_skipped_stats(path, "quick_pop_managed", "quick_pop")
         assert result["total_skipped"] == 3
         assert result["base_entered"] == 3
         assert result["profitable_pct"] == 100.0
@@ -175,12 +175,12 @@ class TestQuerySkippedStats:
         # 2 profitable, 2 losing
         for pnl, gain in [(30.0, 50.0), (10.0, 20.0), (-15.0, 5.0), (-25.0, 3.0)]:
             cid = _insert_chart(conn)
-            _insert_outcome(conn, cid, "quick_pop_chart_ml", entered=False)
+            _insert_outcome(conn, cid, "quick_pop_managed", entered=False)
             _insert_outcome(conn, cid, "quick_pop", entered=True, closed=True,
                             pnl_pct=pnl, max_gain_pct=gain)
         conn.close()
 
-        result = query_skipped_stats(path, "quick_pop_chart_ml", "quick_pop")
+        result = query_skipped_stats(path, "quick_pop_managed", "quick_pop")
         assert result["total_skipped"] == 4
         assert result["base_entered"] == 4
         assert result["profitable_pct"] == 50.0
@@ -193,12 +193,12 @@ class TestQuerySkippedStats:
 
         for i in range(15):
             cid = _insert_chart(conn, symbol=f"TK{i}", ts=f"2026-01-01T{i:02d}:00:00")
-            _insert_outcome(conn, cid, "quick_pop_chart_ml", entered=False)
+            _insert_outcome(conn, cid, "quick_pop_managed", entered=False)
             _insert_outcome(conn, cid, "quick_pop", entered=True, closed=True,
                             pnl_pct=10.0, max_gain_pct=20.0)
         conn.close()
 
-        result = query_skipped_stats(path, "quick_pop_chart_ml", "quick_pop")
+        result = query_skipped_stats(path, "quick_pop_managed", "quick_pop")
         assert result["base_entered"] == 15
         assert len(result["sample_outcomes"]) == 10  # capped
 
@@ -210,11 +210,11 @@ class TestQuerySkippedStats:
 
         # This signal was entered by the chart variant (not skipped)
         cid = _insert_chart(conn)
-        _insert_outcome(conn, cid, "quick_pop_chart_ml", entered=True, closed=True, pnl_pct=20.0)
+        _insert_outcome(conn, cid, "quick_pop_managed", entered=True, closed=True, pnl_pct=20.0)
         _insert_outcome(conn, cid, "quick_pop", entered=True, closed=True, pnl_pct=20.0)
         conn.close()
 
-        result = query_skipped_stats(path, "quick_pop_chart_ml", "quick_pop")
+        result = query_skipped_stats(path, "quick_pop_managed", "quick_pop")
         assert result["total_skipped"] == 0
         assert result["base_entered"] == 0
 
@@ -224,12 +224,12 @@ class TestQuerySkippedStats:
         conn = _make_db(path)
 
         cid = _insert_chart(conn)
-        _insert_outcome(conn, cid, "trend_rider_chart_reanalyze", entered=False)
+        _insert_outcome(conn, cid, "trend_rider_managed", entered=False)
         _insert_outcome(conn, cid, "trend_rider", entered=True, closed=True,
                         pnl_pct=-10.0, max_gain_pct=5.0)
         conn.close()
 
-        result = query_skipped_stats(path, "trend_rider_chart_reanalyze", "trend_rider")
+        result = query_skipped_stats(path, "trend_rider_managed", "trend_rider")
         assert result["total_skipped"] == 1
         assert result["base_entered"] == 1
         assert result["profitable_pct"] == 0.0
@@ -241,12 +241,12 @@ class TestQuerySkippedStats:
         conn = _make_db(path)
 
         cid = _insert_chart(conn, symbol="PEPE")
-        _insert_outcome(conn, cid, "quick_pop_chart_ml", entered=False)
+        _insert_outcome(conn, cid, "quick_pop_managed", entered=False)
         _insert_outcome(conn, cid, "quick_pop", entered=True, closed=True,
                         pnl_pct=22.5, max_gain_pct=45.0, sell_reason="TP2", ml_score=7.5)
         conn.close()
 
-        result = query_skipped_stats(path, "quick_pop_chart_ml", "quick_pop")
+        result = query_skipped_stats(path, "quick_pop_managed", "quick_pop")
         outcome = result["sample_outcomes"][0]
         assert outcome["symbol"] == "PEPE"
         assert outcome["pnl_pct"] == 22.5
@@ -343,7 +343,7 @@ class TestGetSignalCount:
             path = f.name
         conn = _make_db(path)
         conn.close()
-        assert get_signal_count(path, "quick_pop_chart_ml") == 0
+        assert get_signal_count(path, "quick_pop_managed") == 0
 
     def test_counts_entered_signals(self):
         get_signal_count = self._import()
@@ -351,9 +351,9 @@ class TestGetSignalCount:
             path = f.name
         conn = _make_db(path)
         cid = _insert_chart(conn)
-        _insert_outcome(conn, cid, "quick_pop_chart_ml", entered=True, closed=True)
+        _insert_outcome(conn, cid, "quick_pop_managed", entered=True, closed=True)
         conn.close()
-        assert get_signal_count(path, "quick_pop_chart_ml") == 1
+        assert get_signal_count(path, "quick_pop_managed") == 1
 
     def test_counts_skipped_signals(self):
         get_signal_count = self._import()
@@ -362,9 +362,9 @@ class TestGetSignalCount:
         conn = _make_db(path)
         for _ in range(4):
             cid = _insert_chart(conn)
-            _insert_outcome(conn, cid, "quick_pop_chart_ml", entered=False)
+            _insert_outcome(conn, cid, "quick_pop_managed", entered=False)
         conn.close()
-        assert get_signal_count(path, "quick_pop_chart_ml") == 4
+        assert get_signal_count(path, "quick_pop_managed") == 4
 
     def test_counts_both_entered_and_skipped(self):
         get_signal_count = self._import()
@@ -374,12 +374,12 @@ class TestGetSignalCount:
         # 3 entered, 5 skipped = 8 total
         for _ in range(3):
             cid = _insert_chart(conn)
-            _insert_outcome(conn, cid, "quick_pop_chart_ml", entered=True, closed=True)
+            _insert_outcome(conn, cid, "quick_pop_managed", entered=True, closed=True)
         for _ in range(5):
             cid = _insert_chart(conn)
-            _insert_outcome(conn, cid, "quick_pop_chart_ml", entered=False)
+            _insert_outcome(conn, cid, "quick_pop_managed", entered=False)
         conn.close()
-        assert get_signal_count(path, "quick_pop_chart_ml") == 8
+        assert get_signal_count(path, "quick_pop_managed") == 8
 
     def test_does_not_count_other_strategies(self):
         get_signal_count = self._import()
@@ -388,10 +388,10 @@ class TestGetSignalCount:
         conn = _make_db(path)
         cid = _insert_chart(conn)
         _insert_outcome(conn, cid, "trend_rider", entered=True, closed=True)
-        _insert_outcome(conn, cid, "quick_pop_chart_ml", entered=False)
+        _insert_outcome(conn, cid, "quick_pop_managed", entered=False)
         conn.close()
-        # trend_rider has 1, quick_pop_chart_ml has 1
-        assert get_signal_count(path, "quick_pop_chart_ml") == 1
+        # trend_rider has 1, quick_pop_managed has 1
+        assert get_signal_count(path, "quick_pop_managed") == 1
         assert get_signal_count(path, "trend_rider") == 1
 
     def test_missing_table_returns_zero(self):
@@ -402,7 +402,7 @@ class TestGetSignalCount:
         # Don't create strategy_outcomes table
         conn = sqlite3.connect(path)
         conn.close()
-        assert get_signal_count(path, "quick_pop_chart_ml") == 0
+        assert get_signal_count(path, "quick_pop_managed") == 0
 
 
 # ---------------------------------------------------------------------------
@@ -433,8 +433,8 @@ class TestTuneTrigger:
             _insert_outcome(conn, cid, "quick_pop", entered=False)
         conn.close()
 
-        meta = {"trades_at_last_tune": {"quick_pop_chart_ml": 0}}
-        should, count, count_strategy = _should_tune("quick_pop_chart_ml", path, meta, every=10)
+        meta = {"trades_at_last_tune": {"quick_pop_managed": 0}}
+        should, count, count_strategy = _should_tune("quick_pop_managed", path, meta, every=10)
         assert should is True
         assert count == 10
         assert count_strategy == "quick_pop"
@@ -449,8 +449,8 @@ class TestTuneTrigger:
             _insert_outcome(conn, cid, "quick_pop", entered=False)
         conn.close()
 
-        meta = {"trades_at_last_tune": {"quick_pop_chart_ml": 0}}
-        should, count, count_strategy = _should_tune("quick_pop_chart_ml", path, meta, every=10)
+        meta = {"trades_at_last_tune": {"quick_pop_managed": 0}}
+        should, count, count_strategy = _should_tune("quick_pop_managed", path, meta, every=10)
         assert should is False
         assert count == 5
 
@@ -466,8 +466,8 @@ class TestTuneTrigger:
         conn.close()
 
         # Baseline at 8 — so 10 new signals have come in
-        meta = {"trades_at_last_tune": {"quick_pop_chart_ml": 8}}
-        should, count, _ = _should_tune("quick_pop_chart_ml", path, meta, every=10)
+        meta = {"trades_at_last_tune": {"quick_pop_managed": 8}}
+        should, count, _ = _should_tune("quick_pop_managed", path, meta, every=10)
         assert should is True
         assert count == 18
 
@@ -481,9 +481,9 @@ class TestTuneTrigger:
         for _ in range(10):
             cid = _insert_chart(conn)
             _insert_outcome(conn, cid, "quick_pop", entered=True, closed=True)
-            _insert_outcome(conn, cid, "quick_pop_chart_ml", entered=False)
+            _insert_outcome(conn, cid, "quick_pop_managed", entered=False)
         conn.close()
 
         meta = {"trades_at_last_tune": {}}
-        should, count, _ = _should_tune("quick_pop_chart_ml", path, meta, every=10)
+        should, count, _ = _should_tune("quick_pop_managed", path, meta, every=10)
         assert should is True

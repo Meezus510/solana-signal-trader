@@ -10,13 +10,13 @@ Usage:
     decision = propose_policy_decision(
         signal_context={
             "ml_score": 7.2,
-            "used_moralis_10s": True,
+            "used_subminute_v3": True,
             "used_birdeye_fallback": False,
             "pair_stats_available": True,
             "liquidity_usd": 45000,
             "slippage_bps": 120,
         },
-        strategy="quick_pop_chart_ml",
+        strategy="quick_pop_managed",
     )
     # decision = {
     #     "allow_trade": True,
@@ -67,7 +67,7 @@ _LOW_LIQUIDITY_USD   = 20_000   # below this → reduce size
 
 def propose_policy_decision(
     signal_context: dict,
-    strategy: str = "quick_pop_chart_ml",
+    strategy: str = "quick_pop_managed",
     db_path: str | None = None,          # reserved for future history look-ups
 ) -> dict:
     """
@@ -79,7 +79,7 @@ def propose_policy_decision(
     Parameters
     ----------
     signal_context : dict
-        Expected keys: ml_score, used_moralis_10s, used_birdeye_fallback,
+        Expected keys: ml_score, used_subminute_v3, used_birdeye_fallback,
         pair_stats_available, liquidity_usd, slippage_bps
     strategy : str
         Strategy name (informational — included in prompt).
@@ -147,7 +147,7 @@ def _hard_preflight(ctx: dict) -> dict | None:
 def _build_prompt(ctx: dict, strategy: str) -> str:
     ml_score              = ctx.get("ml_score")
     ml_min_score          = ctx.get("ml_min_score", 5.0)
-    used_moralis_10s      = ctx.get("used_moralis_10s", False)
+    used_subminute_v3     = ctx.get("used_subminute_v3", False)
     used_birdeye_fallback = ctx.get("used_birdeye_fallback", False)
     pair_stats_available  = ctx.get("pair_stats_available", False)
     liquidity_usd         = ctx.get("liquidity_usd", 0)
@@ -156,9 +156,9 @@ def _build_prompt(ctx: dict, strategy: str) -> str:
     # Summarise data quality in plain text for the model
     data_quality_lines = []
     if used_birdeye_fallback:
-        data_quality_lines.append("- Candle source: Birdeye 1m fallback (Moralis 10s unavailable) — lower resolution")
+        data_quality_lines.append("- Candle source: Birdeye 1m fallback (v3 sub-minute unavailable) — lower resolution")
     else:
-        data_quality_lines.append("- Candle source: Moralis 10s (full resolution)")
+        data_quality_lines.append("- Candle source: Birdeye v3 15s (full resolution)")
 
     if not pair_stats_available:
         data_quality_lines.append("- Pair stats: unavailable — features 9-13 used neutral values")
