@@ -7,6 +7,7 @@ Provides:
     query_score_buckets()   — score-bucket win/loss/avg-pnl breakdown from chart_snapshots.
     query_exit_stats()      — sell-reason breakdown (count, avg pnl, avg hold, avg max gain).
     query_recent_trades()   — last N closed positions for context.
+    query_regime_context()  — recent market/strategy/channel state for mode selection.
 
 The guardrail bands are the single source of truth for what the agents are
 allowed to change. Tighten or widen them here — never in a prompt.
@@ -268,6 +269,136 @@ def query_recent_trades(
         }
         for r in rows
     ]
+
+
+def query_regime_context(
+    db_path: str,
+    strategy: str,
+    *,
+    base_strategy: str | None = None,
+    lookback_signals: int = 50,
+) -> dict[str, Any]:
+    """
+    Summarise recent strategy/base/channel conditions for mode switching.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        def _recent_strategy_rows(target: str) -> list[tuple]:
+            return conn.execute(
+                """
+                SELECT
+                    so.entered,
+                    so.closed,
+                    so.outcome_pnl_pct,
+                    so.outcome_max_gain_pct,
+                    so.skip_reason,
+                    COALESCE(so.source_channel, sc.source_channel, 'UNKNOWN')
+                FROM strategy_outcomes so
+                JOIN signal_charts sc ON sc.id = so.signal_chart_id
+                WHERE so.strategy = ?
+                ORDER BY sc.ts DESC
+                LIMIT ?
+                """,
+                (target, lookback_signals),
+            ).fetchall()
+
+        def _summarise(rows: list[tuple]) -> dict[str, Any]:
+            total = len(rows)
+            entered_rows = [r for r in rows if r[0] == 1]
+            closed_rows = [r for r in entered_rows if r[1] == 1 and r[2] is not None]
+            skipped_rows = [r for r in rows if r[0] == 0]
+            wins = sum(1 for r in closed_rows if (r[2] or 0.0) > 0)
+            avg_pnl = sum((r[2] or 0.0) for r in closed_rows) / len(closed_rows) if closed_rows else 0.0
+            avg_peak = sum((r[3] or 0.0) for r in closed_rows) / len(closed_rows) if closed_rows else 0.0
+            skip_reasons: dict[str, int] = {}
+            channel_counts: dict[str, int] = {}
+            for _, _, _, _, skip_reason, source_channel in rows:
+                channel_counts[source_channel] = channel_counts.get(source_channel, 0) + 1
+                if skip_reason:
+                    skip_reasons[skip_reason] = skip_reasons.get(skip_reason, 0) + 1
+            top_channels = [
+                {"channel": channel, "count": count}
+                for channel, count in sorted(channel_counts.items(), key=lambda kv: kv[1], reverse=True)[:3]
+            ]
+            return {
+                "signals": total,
+                "entered": len(entered_rows),
+                "blocked": len(skipped_rows),
+                "block_rate": round(len(skipped_rows) / total, 4) if total else 0.0,
+                "closed": len(closed_rows),
+                "win_rate": round(wins / len(closed_rows), 4) if closed_rows else 0.0,
+                "avg_pnl_pct": round(avg_pnl, 2),
+                "avg_peak_gain_pct": round(avg_peak, 2),
+                "skip_reasons": skip_reasons,
+                "top_channels": top_channels,
+            }
+
+        strategy_rows = _recent_strategy_rows(strategy)
+        base_rows = _recent_strategy_rows(base_strategy) if base_strategy else []
+
+        market_row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS signals,
+                AVG(sc.pump_ratio) AS avg_pump_ratio,
+                AVG(sc.price_change_30m_pct) AS avg_price_change_30m_pct,
+                AVG(sc.unique_wallet_5m) AS avg_unique_wallet_5m,
+                AVG(sc.market_cap_usd) AS avg_market_cap_usd,
+                AVG(sc.liquidity_usd) AS avg_liquidity_usd
+            FROM (
+                SELECT id
+                FROM signal_charts
+                ORDER BY ts DESC
+                LIMIT ?
+            ) recent
+            JOIN signal_charts sc ON sc.id = recent.id
+            """,
+            (lookback_signals,),
+        ).fetchone()
+
+        channel_rows = conn.execute(
+            """
+            SELECT
+                COALESCE(so.source_channel, sc.source_channel, 'UNKNOWN') AS channel,
+                COUNT(*) AS signals,
+                SUM(CASE WHEN so.entered = 1 AND so.closed = 1 THEN 1 ELSE 0 END) AS closed,
+                SUM(CASE WHEN so.entered = 1 AND so.closed = 1 AND so.outcome_pnl_pct > 0 THEN 1 ELSE 0 END) AS wins,
+                AVG(CASE WHEN so.entered = 1 AND so.closed = 1 THEN so.outcome_pnl_pct END) AS avg_pnl_pct
+            FROM strategy_outcomes so
+            JOIN signal_charts sc ON sc.id = so.signal_chart_id
+            WHERE so.strategy = ?
+            GROUP BY 1
+            ORDER BY signals DESC
+            LIMIT 5
+            """,
+            (base_strategy or strategy,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    return {
+        "lookback_signals": lookback_signals,
+        "managed_strategy_recent": _summarise(strategy_rows),
+        "base_strategy_recent": _summarise(base_rows) if base_rows else None,
+        "market_recent": {
+            "signals": int(market_row[0] or 0) if market_row else 0,
+            "avg_pump_ratio": round(market_row[1] or 0.0, 3) if market_row else 0.0,
+            "avg_price_change_30m_pct": round(market_row[2] or 0.0, 2) if market_row else 0.0,
+            "avg_unique_wallet_5m": round(market_row[3] or 0.0, 2) if market_row else 0.0,
+            "avg_market_cap_usd": round(market_row[4] or 0.0, 2) if market_row else 0.0,
+            "avg_liquidity_usd": round(market_row[5] or 0.0, 2) if market_row else 0.0,
+        },
+        "base_channel_recent": [
+            {
+                "channel": channel,
+                "signals": signals,
+                "closed": closed,
+                "win_rate": round((wins / closed), 4) if closed else 0.0,
+                "avg_pnl_pct": round(avg_pnl_pct or 0.0, 2),
+            }
+            for channel, signals, closed, wins, avg_pnl_pct in channel_rows
+        ],
+    }
 
 
 def summarise_guardrails() -> str:

@@ -14,13 +14,23 @@
     "version": 1,
     "ai_balance_start_usd": 1000.0,
     "ai_profit_target_usd": 300.0,
-    "ai_deadline": "2026-04-10"
+    "ai_deadline": "2026-04-10",
+    "openai_manager_last_run_at": "2026-03-27T16:42:46.403797+00:00",
+    "openai_manager_last_closed_count": 3,
+    "openai_manager_last_signal_count": 53,
+    "openai_manager_last_blocked_count": 50,
+    "anthropic_manager_last_run_at": "2026-03-27T18:02:25.079341+00:00",
+    "anthropic_manager_last_closed_count": 5,
+    "anthropic_manager_last_base_closed_count": 788,
+    "deepseek_manager_last_run_at": "2026-03-27T19:38:28.405801+00:00",
+    "deepseek_manager_last_closed_count": 1,
+    "deepseek_manager_last_base_closed_count": 804
   },
   "safe_bet": {
     "live_trading": false,
     "stop_loss_pct": 0.05,
     "timeout_minutes": 60.0,
-    "timeout_min_gain_pct": 0.10,
+    "timeout_min_gain_pct": 0.1,
     "peak_drop_exit_pct": 0.08,
     "early_timeout_minutes": 20.0,
     "early_timeout_max_gain_pct": 0.02,
@@ -133,7 +143,7 @@
   },
   "open_ai_managed": {
     "base_strategy": "quick_pop",
-    "mode": "balanced",
+    "mode": "lenient",
     "live_trading": false,
     "peak_drop_exit_pct": 0.12,
     "early_timeout_minutes": 12.0,
@@ -141,8 +151,39 @@
     "early_timeout_min_range_pct": 0.06,
     "ml_k": 3,
     "ml_halflife_days": 7.0,
-    "ml_score_low_pct": -45.0,
-    "ml_score_high_pct": 300.0
+    "ml_score_low_pct": -25.0,
+    "ml_score_high_pct": 250.0
+  },
+  "anthropic_managed": {
+    "base_strategy": "quick_pop",
+    "mode": "lenient",
+    "live_trading": false,
+    "tp_levels": [
+      [
+        1.2,
+        0.5
+      ],
+      [
+        3.0,
+        0.3
+      ],
+      [
+        7.0,
+        0.2
+      ]
+    ],
+    "peak_drop_exit_pct": 0.08,
+    "early_timeout_minutes": 8.0,
+    "early_timeout_max_gain_pct": 0.015,
+    "early_timeout_min_range_pct": 0.05,
+    "ml_k": 5,
+    "ml_halflife_days": 5.0,
+    "ml_score_low_pct": -30.0,
+    "ml_score_high_pct": 200.0,
+    "ml_high_score_threshold": 3.5,
+    "ml_max_score_threshold": 5.0,
+    "ml_size_multiplier": 1.5,
+    "ml_max_size_multiplier": 2.0
   },
   "moonbag_managed": {
     "live_trading": false,
@@ -179,5 +220,40 @@
     "ml_halflife_days": 14.0,
     "ml_score_low_pct": -35.0,
     "ml_score_high_pct": 150.0
+  },
+  "deepseek_managed": {
+    "base_strategy": "quick_pop",
+    "mode": "lenient",
+    "live_trading": false,
+    "tp_levels": [
+      [
+        1.15,
+        1.0
+      ]
+    ],
+    "stop_loss_pct": 0.04,
+    "trailing_stop_pct": 0.12,
+    "peak_drop_exit_pct": 0.15,
+    "early_timeout_minutes": 20.0,
+    "early_timeout_max_gain_pct": 0.03,
+    "early_timeout_min_range_pct": 0.07,
+    "ml_k": 5,
+    "ml_halflife_days": 14.0,
+    "ml_score_low_pct": -25.0,
+    "ml_score_high_pct": 150.0,
+    "ml_high_score_threshold": 6.0,
+    "ml_max_score_threshold": 8.0,
+    "ml_size_multiplier": 1.2,
+    "ml_max_size_multiplier": 1.5,
+    "holder_count_max": 600,
+    "late_entry_price_chg_30m_max": 150.0,
+    "late_entry_pump_ratio_min": 15.0,
+    "buy_vol_ratio_1h_max": 0.65,
+    "market_cap_usd_min": 120000.0,
+    "ml_wallet_momentum_max": 2.0,
+    "ml_min_score": 3.0,
+    "timeout_minutes": 45.0,
+    "timeout_min_gain_pct": 0.08,
+    "use_ml_filter": false
   }
 }

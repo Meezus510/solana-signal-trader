@@ -1,5 +1,5 @@
 """
-OpenAI-backed managed-strategy adapter for `open_ai_managed`.
+DeepSeek-backed managed-strategy adapter for `deepseek_managed`.
 """
 
 from __future__ import annotations
@@ -8,13 +8,13 @@ import os
 from typing import Any
 
 from trader.agents.managed_agent_base import ManagedAgentSpec, run_managed_agent
-from trader.agents.provider_adapters import OpenAIJSONProvider
+from trader.agents.provider_adapters import DeepSeekJSONProvider
 
 _SPEC = ManagedAgentSpec(
-    strategy_name="open_ai_managed",
-    agent_name="openai_manager",
-    meta_prefix="openai_manager_",
-    default_model="gpt-5.4-mini",
+    strategy_name="deepseek_managed",
+    agent_name="deepseek_manager",
+    meta_prefix="deepseek_manager_",
+    default_model="deepseek-chat",
     allowed_scalars={
         "stop_loss_pct",
         "trailing_stop_pct",
@@ -74,8 +74,8 @@ _SPEC = ManagedAgentSpec(
 def run(db_path: str = "trader.db", dry_run: bool = False) -> dict[str, Any]:
     return run_managed_agent(
         _SPEC,
-        OpenAIJSONProvider(),
+        DeepSeekJSONProvider(),
         db_path=db_path,
         dry_run=dry_run,
-        model=os.getenv("OPENAI_MANAGER_MODEL", _SPEC.default_model),
+        model=os.getenv("DEEPSEEK_MANAGER_MODEL", _SPEC.default_model),
     )

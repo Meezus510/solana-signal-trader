@@ -23,6 +23,7 @@ Group B — chart filter enabled (skips late pumps and dying volume):
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
@@ -446,11 +447,156 @@ _OPEN_AI_MANAGED_MODES: dict[str, dict[str, dict]] = {
     },
 }
 
+
+@dataclass(frozen=True)
+class ManagedStrategySpec:
+    name: str
+    bases: dict[str, dict]
+    modes: dict[str, dict[str, dict]]
+    default_base: str = "quick_pop"
+    default_mode: str = "balanced"
+
+
+MANAGED_STRATEGY_SPECS: dict[str, ManagedStrategySpec] = {
+    "open_ai_managed": ManagedStrategySpec(
+        name="open_ai_managed",
+        bases=_OPEN_AI_MANAGED_BASES,
+        modes=_OPEN_AI_MANAGED_MODES,
+        default_base="quick_pop",
+        default_mode="balanced",
+    ),
+    "anthropic_managed": ManagedStrategySpec(
+        name="anthropic_managed",
+        bases=_OPEN_AI_MANAGED_BASES,
+        modes=_OPEN_AI_MANAGED_MODES,
+        default_base="quick_pop",
+        default_mode="balanced",
+    ),
+    "deepseek_managed": ManagedStrategySpec(
+        name="deepseek_managed",
+        bases=_OPEN_AI_MANAGED_BASES,
+        modes=_OPEN_AI_MANAGED_MODES,
+        default_base="quick_pop",
+        default_mode="balanced",
+    ),
+}
+
+
+def get_managed_strategy_spec(strategy_name: str) -> ManagedStrategySpec:
+    try:
+        return MANAGED_STRATEGY_SPECS[strategy_name]
+    except KeyError as exc:
+        raise KeyError(f"Unknown managed strategy {strategy_name!r}") from exc
+
+
+def resolve_managed_strategy_config(
+    strategy_name: str,
+    raw_cfg: dict,
+    *,
+    logger_: logging.Logger | None = None,
+) -> tuple[str, str, dict]:
+    spec = get_managed_strategy_spec(strategy_name)
+    logger_ = logger_ or logger
+
+    base_name = raw_cfg.get("base_strategy", spec.default_base)
+    if base_name not in spec.bases:
+        logger_.warning(
+            "[registry] Unknown %s base_strategy %r — using %r",
+            strategy_name,
+            base_name,
+            spec.default_base,
+        )
+        base_name = spec.default_base
+
+    mode_table = spec.modes.get(base_name, spec.modes[spec.default_base])
+    mode_name = raw_cfg.get("mode", spec.default_mode)
+    if mode_name not in mode_table:
+        logger_.warning(
+            "[registry] Unknown %s mode %r for %s — using %r",
+            strategy_name,
+            mode_name,
+            base_name,
+            spec.default_mode,
+        )
+        mode_name = spec.default_mode
+
+    merged = dict(spec.bases[base_name])
+    merged.update(mode_table.get(mode_name, {}))
+    merged.update(raw_cfg)
+    merged["base_strategy"] = base_name
+    merged["mode"] = mode_name
+    return base_name, mode_name, merged
+
+
+def build_managed_runner(
+    strategy_name: str,
+    cfg: Config,
+    db,
+    overrides: dict[str, dict],
+) -> StrategyRunner:
+    spec = get_managed_strategy_spec(strategy_name)
+    raw_cfg = overrides.get(strategy_name, {})
+    base_name, mode_name, resolved = resolve_managed_strategy_config(strategy_name, raw_cfg)
+    logger.info("[registry] %s base=%r mode=%r", strategy_name, base_name, mode_name)
+
+    tp_levels = resolved.get("tp_levels") or [[1.16, 0.60], [2.30, 0.40]]
+    managed_cfg = StrategyConfig(
+        name=strategy_name,
+        buy_size_usd=resolved.get("buy_size_usd", 30.0),
+        stop_loss_pct=resolved.get("stop_loss_pct", 0.08),
+        take_profit_levels=tuple(
+            TakeProfitLevel(multiple=m, sell_fraction_original=f)
+            for m, f in tp_levels
+        ),
+        trailing_stop_pct=resolved.get("trailing_stop_pct", 0.12),
+        starting_cash_usd=cfg.starting_cash_usd,
+        timeout_minutes=resolved.get("timeout_minutes", 45.0),
+        timeout_min_gain_pct=resolved.get("timeout_min_gain_pct", 0.49),
+        max_hold_minutes=resolved.get("max_hold_minutes", None),
+        save_chart_data=True,
+        use_chart_filter=False,
+        use_ml_filter=resolved.get("use_ml_filter", True),
+        ml_training_strategy=resolved.get("ml_training_strategy", "quick_pop"),
+        ml_training_label=resolved.get("ml_training_label", "position_peak_pnl_pct"),
+        ml_use_subminute=resolved.get("ml_use_subminute", True),
+        ml_min_score=resolved.get("ml_min_score", 2.25),
+        ml_high_score_threshold=resolved.get("ml_high_score_threshold", 5.0),
+        ml_max_score_threshold=resolved.get("ml_max_score_threshold", 6.0),
+        ml_size_multiplier=resolved.get("ml_size_multiplier", 1.35),
+        ml_max_size_multiplier=resolved.get("ml_max_size_multiplier", 1.75),
+        ml_k=int(resolved.get("ml_k", 3)),
+        ml_halflife_days=resolved.get("ml_halflife_days", 7.0),
+        ml_score_low_pct=resolved.get("ml_score_low_pct", -45.0),
+        ml_score_high_pct=resolved.get("ml_score_high_pct", 300.0),
+        ml_feature_weights=(
+            tuple(resolved.get("ml_feature_weights", ()))
+            if resolved.get("ml_feature_weights", None) is not None else None
+        ),
+        ml_wallet_momentum_max=resolved.get("ml_wallet_momentum_max", 2.5),
+        holder_count_max=resolved.get("holder_count_max", 1000),
+        late_entry_price_chg_30m_max=resolved.get("late_entry_price_chg_30m_max", 250.0),
+        late_entry_pump_ratio_min=resolved.get("late_entry_pump_ratio_min", 10.0),
+        buy_vol_ratio_1h_max=resolved.get("buy_vol_ratio_1h_max", 0.65),
+        market_cap_usd_min=resolved.get("market_cap_usd_min", None),
+        peak_drop_exit_pct=resolved.get("peak_drop_exit_pct", 0.12),
+        early_timeout_minutes=resolved.get("early_timeout_minutes", 12.0),
+        early_timeout_max_gain_pct=resolved.get("early_timeout_max_gain_pct", 0.02),
+        early_timeout_min_range_pct=resolved.get("early_timeout_min_range_pct", 0.06),
+        live_trading=raw_cfg.get("live_trading", False),
+        recently_closed_cooldown_minutes=raw_cfg.get("recently_closed_cooldown_minutes", 30.0),
+        use_real_exit_price=resolved.get("use_real_exit_price", False),
+        block_new_entries=resolved.get("block_new_entries", False),
+    )
+    runner_cls = InfiniteMoonbagRunner if spec.bases[base_name].get("runner") == "moonbag" else StrategyRunner
+    return runner_cls(cfg=managed_cfg, db=db)
+
 _CONTROLLED = frozenset([
     "trend_rider", "trend_rider_managed",
     "infinite_moonbag", "moonbag_managed",
     "quick_pop_managed",
     "open_ai_managed",
+    "anthropic_managed",
+    "deepseek_managed",
     "safe_bet",
 ])
 
@@ -814,78 +960,9 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         recently_closed_cooldown_minutes=_mb_chart.get("recently_closed_cooldown_minutes", 30.0),
     )
 
-    _oa = _o("open_ai_managed")
-    _oa_base_name = _oa.get("base_strategy", "quick_pop")
-    _oa_base = _OPEN_AI_MANAGED_BASES.get(_oa_base_name, _OPEN_AI_MANAGED_BASES["quick_pop"])
-    if _oa_base_name not in _OPEN_AI_MANAGED_BASES:
-        logger.warning("[registry] Unknown open_ai_managed base_strategy %r — using 'quick_pop'", _oa_base_name)
-        _oa_base_name = "quick_pop"
-    _oa_mode_name = _oa.get("mode", "balanced")
-    _oa_mode_table = _OPEN_AI_MANAGED_MODES.get(_oa_base_name, _OPEN_AI_MANAGED_MODES["quick_pop"])
-    _oa_mode = _oa_mode_table.get(_oa_mode_name, _oa_mode_table["balanced"])
-    if _oa_mode_name not in _oa_mode_table:
-        logger.warning("[registry] Unknown open_ai_managed mode %r for %s — using 'balanced'", _oa_mode_name, _oa_base_name)
-        _oa_mode_name = "balanced"
-    logger.info("[registry] open_ai_managed base=%r mode=%r", _oa_base_name, _oa_mode_name)
-
-    def _oa_v(key: str, default):
-        if key in _oa:
-            return _oa[key]
-        if key in _oa_mode:
-            return _oa_mode[key]
-        if key in _oa_base:
-            return _oa_base[key]
-        return _oa_mode.get(key, default)
-
-    open_ai_managed_cfg = StrategyConfig(
-        name="open_ai_managed",
-        buy_size_usd=_oa_v("buy_size_usd", 30.0),
-        stop_loss_pct=_oa_v("stop_loss_pct", 0.08),
-        take_profit_levels=_tp("open_ai_managed", [
-            TakeProfitLevel(multiple=1.16, sell_fraction_original=0.60),
-            TakeProfitLevel(multiple=2.30, sell_fraction_original=0.40),
-        ]),
-        trailing_stop_pct=_oa_v("trailing_stop_pct", 0.12),
-        starting_cash_usd=cfg.starting_cash_usd,
-        timeout_minutes=_oa_v("timeout_minutes", 45.0),
-        timeout_min_gain_pct=_oa_v("timeout_min_gain_pct", 0.49),
-        max_hold_minutes=_oa_v("max_hold_minutes", None),
-        save_chart_data=True,
-        use_chart_filter=False,
-        use_ml_filter=_oa_v("use_ml_filter", True),
-        ml_training_strategy=_oa_v("ml_training_strategy", "quick_pop"),
-        ml_training_label=_oa_v("ml_training_label", "position_peak_pnl_pct"),
-        ml_use_subminute=_oa_v("ml_use_subminute", True),
-        ml_min_score=_oa_v("ml_min_score", 2.25),
-        ml_high_score_threshold=_oa_v("ml_high_score_threshold", 5.0),
-        ml_max_score_threshold=_oa_v("ml_max_score_threshold", 6.0),
-        ml_size_multiplier=_oa_v("ml_size_multiplier", 1.35),
-        ml_max_size_multiplier=_oa_v("ml_max_size_multiplier", 1.75),
-        ml_k=int(_oa_v("ml_k", 3)),
-        ml_halflife_days=_oa_v("ml_halflife_days", 7.0),
-        ml_score_low_pct=_oa_v("ml_score_low_pct", -45.0),
-        ml_score_high_pct=_oa_v("ml_score_high_pct", 300.0),
-        ml_feature_weights=(
-            tuple(_oa_v("ml_feature_weights", ()))
-            if _oa_v("ml_feature_weights", None) is not None else None
-        ),
-        ml_wallet_momentum_max=_oa_v("ml_wallet_momentum_max", 2.5),
-        holder_count_max=_oa_v("holder_count_max", 1000),
-        late_entry_price_chg_30m_max=_oa_v("late_entry_price_chg_30m_max", 250.0),
-        late_entry_pump_ratio_min=_oa_v("late_entry_pump_ratio_min", 10.0),
-        buy_vol_ratio_1h_max=_oa_v("buy_vol_ratio_1h_max", 0.65),
-        market_cap_usd_min=_oa_v("market_cap_usd_min", None),
-        peak_drop_exit_pct=_oa_v("peak_drop_exit_pct", 0.12),
-        early_timeout_minutes=_oa_v("early_timeout_minutes", 12.0),
-        early_timeout_max_gain_pct=_oa_v("early_timeout_max_gain_pct", 0.02),
-        early_timeout_min_range_pct=_oa_v("early_timeout_min_range_pct", 0.06),
-        live_trading=_oa.get("live_trading", False),
-        recently_closed_cooldown_minutes=_oa.get("recently_closed_cooldown_minutes", 30.0),
-        use_real_exit_price=_oa_v("use_real_exit_price", False),
-        block_new_entries=_oa_v("block_new_entries", False),
-    )
-
-    open_ai_runner_cls = InfiniteMoonbagRunner if _oa_base.get("runner") == "moonbag" else StrategyRunner
+    open_ai_runner = build_managed_runner("open_ai_managed", cfg, db, overrides)
+    anthropic_runner = build_managed_runner("anthropic_managed", cfg, db, overrides)
+    deepseek_runner = build_managed_runner("deepseek_managed", cfg, db, overrides)
 
     return [
         StrategyRunner(cfg=quick_pop_cfg, db=db),
@@ -893,7 +970,9 @@ def build_runners(cfg: Config, db=None) -> list[StrategyRunner]:
         # InfiniteMoonbagRunner(cfg=moonbag_cfg, db=db),      # disabled: trend_rider outperforms
         StrategyRunner(cfg=safe_bet_cfg, db=db),
         StrategyRunner(cfg=quick_pop_chart_cfg, db=db),
-        open_ai_runner_cls(cfg=open_ai_managed_cfg, db=db),
+        open_ai_runner,
+        anthropic_runner,
+        deepseek_runner,
         StrategyRunner(cfg=trend_rider_chart_cfg, db=db),
         # InfiniteMoonbagRunner(cfg=moonbag_chart_cfg, db=db),  # disabled: trend_rider_managed outperforms
     ]
