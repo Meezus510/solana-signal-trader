@@ -31,12 +31,38 @@ def resolve_open_ai_config(raw_cfg: dict) -> tuple[str, dict]:
     return resolve_managed_config(STRATEGY, raw_cfg)
 
 
-def backtest_config(db_path: str, cfg: dict) -> dict:
-    return backtest_managed_config(db_path, STRATEGY, cfg)
+def backtest_config(
+    db_path: str,
+    cfg: dict,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict:
+    return backtest_managed_config(
+        db_path,
+        STRATEGY,
+        cfg,
+        date_from=date_from,
+        date_to=date_to,
+    )
 
 
-def backtest_named_mode(db_path: str, base_strategy: str, mode: str) -> dict:
-    return backtest_managed_mode(db_path, STRATEGY, base_strategy, mode)
+def backtest_named_mode(
+    db_path: str,
+    base_strategy: str,
+    mode: str,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict:
+    return backtest_managed_mode(
+        db_path,
+        STRATEGY,
+        base_strategy,
+        mode,
+        date_from=date_from,
+        date_to=date_to,
+    )
 
 
 def main() -> None:
@@ -44,17 +70,30 @@ def main() -> None:
     parser.add_argument("--db", default=DB_PATH)
     parser.add_argument("--base-strategy", choices=sorted(_OPEN_AI_MANAGED_BASES), default=None)
     parser.add_argument("--mode", default="current", choices=["current", *sorted(next(iter(_OPEN_AI_MANAGED_MODES.values())).keys())])
+    parser.add_argument("--date-from", dest="date_from", default=None)
+    parser.add_argument("--date-to", dest="date_to", default=None)
     args = parser.parse_args()
 
     if args.mode == "current":
         raw = load_open_ai_config()
         if args.base_strategy:
             raw["base_strategy"] = args.base_strategy
-        metrics = backtest_config(args.db, raw)
+        metrics = backtest_config(
+            args.db,
+            raw,
+            date_from=args.date_from,
+            date_to=args.date_to,
+        )
         print(f"Current open_ai_managed config on {metrics['base_strategy']}:")
     else:
         base = args.base_strategy or load_open_ai_config().get("base_strategy", "quick_pop")
-        metrics = backtest_named_mode(args.db, base, args.mode)
+        metrics = backtest_named_mode(
+            args.db,
+            base,
+            args.mode,
+            date_from=args.date_from,
+            date_to=args.date_to,
+        )
         print(f"{base} / {args.mode}")
 
     print(f"  entered    : {metrics['entered']}")

@@ -8,6 +8,7 @@ Provides:
     query_exit_stats()      — sell-reason breakdown (count, avg pnl, avg hold, avg max gain).
     query_recent_trades()   — last N closed positions for context.
     query_regime_context()  — recent market/strategy/channel state for mode selection.
+    query_strategy_pnl_snapshots() — compact total/daily pnl snapshots by strategy.
 
 The guardrail bands are the single source of truth for what the agents are
 allowed to change. Tighten or widen them here — never in a prompt.
@@ -50,11 +51,13 @@ def log_agent_action(
     """
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     reason = delta.get("reason", "")
-    changes = [
-        f"{k}: {before.get(k, '?')} → {v}"
-        for k, v in delta.items()
-        if k != "reason"
-    ]
+    changes = []
+    for k, v in delta.items():
+        if k == "reason":
+            continue
+        if before.get(k) == v:
+            continue
+        changes.append(f"{k}: {before.get(k, '?')} → {v}")
     if not changes:
         return
 
@@ -399,6 +402,71 @@ def query_regime_context(
             for channel, signals, closed, wins, avg_pnl_pct in channel_rows
         ],
     }
+
+
+def query_strategy_pnl_snapshots(
+    db_path: str,
+    strategies: list[str],
+) -> list[dict[str, Any]]:
+    """
+    Return compact pnl summaries for named strategies.
+
+    daily_pnl_usd is based on signal date (signal_charts.ts) for closed, entered rows
+    whose signal timestamp falls on the current local calendar day.
+    """
+    if not strategies:
+        return []
+
+    placeholders = ",".join("?" for _ in strategies)
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT
+                so.strategy,
+                SUM(CASE WHEN so.entered = 1 AND so.closed = 1 THEN COALESCE(so.outcome_pnl_usd, 0.0) ELSE 0.0 END) AS total_pnl_usd,
+                SUM(
+                    CASE
+                        WHEN so.entered = 1
+                         AND so.closed = 1
+                         AND date(sc.ts, 'localtime') = date('now', 'localtime')
+                        THEN COALESCE(so.outcome_pnl_usd, 0.0)
+                        ELSE 0.0
+                    END
+                ) AS daily_pnl_usd,
+                SUM(CASE WHEN so.entered = 1 AND so.closed = 1 THEN 1 ELSE 0 END) AS closed_trades
+            FROM strategy_outcomes so
+            JOIN signal_charts sc ON sc.id = so.signal_chart_id
+            WHERE so.strategy IN ({placeholders})
+            GROUP BY so.strategy
+            ORDER BY so.strategy
+            """,
+            strategies,
+        ).fetchall()
+    finally:
+        conn.close()
+
+    by_strategy = {
+        strategy: {
+            "strategy": strategy,
+            "total_pnl_usd": round(total_pnl or 0.0, 2),
+            "daily_pnl_usd": round(daily_pnl or 0.0, 2),
+            "closed_trades": int(closed or 0),
+        }
+        for strategy, total_pnl, daily_pnl, closed in rows
+    }
+    return [
+        by_strategy.get(
+            strategy,
+            {
+                "strategy": strategy,
+                "total_pnl_usd": 0.0,
+                "daily_pnl_usd": 0.0,
+                "closed_trades": 0,
+            },
+        )
+        for strategy in strategies
+    ]
 
 
 def summarise_guardrails() -> str:

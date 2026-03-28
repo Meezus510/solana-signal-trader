@@ -7,24 +7,48 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from trader.agents.base import (
+    agent_log_path,
     log_agent_action,
     query_exit_stats,
     query_recent_trades,
     query_regime_context,
     query_score_buckets,
+    query_strategy_pnl_snapshots,
 )
 from trader.agents.strategy_tuner import load_config, save_owned_config
 from trader.analysis.managed_backtest import (
     backtest_managed_config,
-    leaderboard_for_managed_strategy,
+    compare_modes_for_base,
 )
-from trader.strategies.registry import get_managed_strategy_spec
+from trader.strategies.registry import _TREND_RIDER_ML_MODES, get_managed_strategy_spec
 
 logger = logging.getLogger(__name__)
+
+_AI_MANAGED_STRATEGIES = ("open_ai_managed", "anthropic_managed", "deepseek_managed")
+_NON_AI_REFERENCE_STRATEGIES = (
+    "quick_pop",
+    "trend_rider",
+    "safe_bet",
+    "infinite_moonbag",
+    "quick_pop_managed",
+    "trend_rider_managed",
+    "moonbag_managed",
+)
+
+
+def _reference_strategy_context(config: dict) -> dict[str, Any]:
+    context: dict[str, Any] = {}
+    for strategy in _NON_AI_REFERENCE_STRATEGIES:
+        context[strategy] = {
+            "current_config": dict(config.get(strategy, {})),
+        }
+    if "trend_rider_managed" in context:
+        context["trend_rider_managed"]["available_modes"] = _TREND_RIDER_ML_MODES
+    return context
 
 
 @dataclass(frozen=True)
@@ -38,6 +62,14 @@ class ManagedAgentSpec:
     ranges: dict[str, tuple[float, float]]
     max_tp_levels: int = 4
     max_feature_weights: int = 63
+
+
+def _load_recent_agent_history(strategy_name: str, max_lines: int = 8) -> list[str]:
+    log_path = agent_log_path(strategy_name)
+    if not log_path.exists():
+        return []
+    lines = [line for line in log_path.read_text().splitlines() if line.strip()]
+    return lines[-max_lines:]
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -127,11 +159,15 @@ def build_managed_prompt(
     spec: ManagedAgentSpec,
     current_cfg: dict,
     current_metrics: dict,
-    leaderboard: list[dict],
+    recent_mode_comparison: list[dict],
     exit_stats: list[dict],
     recent: list[dict],
     score_buckets: list[dict],
     regime_context: dict[str, Any],
+    recent_history: list[str],
+    ai_peer_pnl: list[dict[str, Any]],
+    reference_strategy_pnl: list[dict[str, Any]],
+    reference_strategy_context: dict[str, Any],
 ) -> str:
     managed_spec = get_managed_strategy_spec(spec.strategy_name)
     base_list = " | ".join(sorted(managed_spec.bases))
@@ -154,8 +190,8 @@ Current config:
 Current local backtest:
 {json.dumps(current_metrics, indent=2)}
 
-Best built-in leaderboard from local backtests:
-{json.dumps(leaderboard, indent=2)}
+Recent-window comparison for current base only:
+{json.dumps(recent_mode_comparison, indent=2)}
 
 Actual {spec.strategy_name} exit stats:
 {json.dumps(exit_stats, indent=2)}
@@ -169,12 +205,28 @@ ML score buckets for {spec.strategy_name}:
 Recent regime/context snapshot:
 {json.dumps(regime_context, indent=2)}
 
+Your own most recent changes:
+{json.dumps(recent_history, indent=2)}
+
+Other AI agents: pnl only
+{json.dumps(ai_peer_pnl, indent=2)}
+
+Base and non-AI managed strategy performance:
+{json.dumps(reference_strategy_pnl, indent=2)}
+
+Base and non-AI managed strategy configs/modes:
+{json.dumps(reference_strategy_context, indent=2, default=list)}
+
 Rules:
 - Prefer simple changes over wide churn.
-- If the current setup is clearly worse than a leaderboard option, switch to that base/mode.
+- You may see other AI agents' pnl only. Do not infer or discuss their configs, modes, or hidden strategy settings.
+- Use the base and non-AI managed strategy performance for market context, not as permission to copy hidden settings.
 - Use regime/context data to decide when the current mode is too strict or too loose.
 - If managed_strategy_recent block_rate is extremely high while base_strategy_recent looks healthy,
   consider loosening filters or switching base_strategy.
+- Prefer one decision class per run:
+  either change base/mode, or tune risk/ML thresholds, but not both unless the evidence is overwhelming.
+- If current config has drifted far from a canonical preset and underperforms it, snap back toward the preset instead of incremental tweaks.
 - Use block_all only as an emergency brake, not as a default.
 - If you change tp_levels, return the full list.
 - If you change ml_feature_weights, return the full list.
@@ -206,8 +258,14 @@ def run_managed_agent(
     current.setdefault("base_strategy", managed_spec.default_base)
     current.setdefault("mode", managed_spec.default_mode)
 
-    leaderboard = leaderboard_for_managed_strategy(db_path, spec.strategy_name)
     current_metrics = backtest_managed_config(db_path, spec.strategy_name, current)
+    recent_date_from = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    recent_mode_comparison = compare_modes_for_base(
+        db_path,
+        spec.strategy_name,
+        current.get("base_strategy", managed_spec.default_base),
+        date_from=recent_date_from,
+    )[:5]
     exit_stats = query_exit_stats(db_path, spec.strategy_name)
     recent = query_recent_trades(db_path, spec.strategy_name, limit=20)
     score_buckets = query_score_buckets(db_path, spec.strategy_name)
@@ -216,16 +274,30 @@ def run_managed_agent(
         spec.strategy_name,
         base_strategy=current.get("base_strategy"),
     )
+    recent_history = _load_recent_agent_history(spec.strategy_name)
+    ai_peer_pnl = query_strategy_pnl_snapshots(
+        db_path,
+        [name for name in _AI_MANAGED_STRATEGIES if name != spec.strategy_name],
+    )
+    reference_strategy_pnl = query_strategy_pnl_snapshots(
+        db_path,
+        list(_NON_AI_REFERENCE_STRATEGIES),
+    )
+    reference_strategy_context = _reference_strategy_context(config)
 
     prompt = build_managed_prompt(
         spec,
         current,
         current_metrics,
-        leaderboard,
+        recent_mode_comparison,
         exit_stats,
         recent,
         score_buckets,
         regime_context,
+        recent_history,
+        ai_peer_pnl,
+        reference_strategy_pnl,
+        reference_strategy_context,
     )
     raw = provider.generate_json(prompt, model=model or spec.default_model).strip()
     logger.debug("[%s] Raw response: %s", spec.agent_name, raw)
@@ -237,6 +309,11 @@ def run_managed_agent(
         return {}
 
     validated = validate_managed_delta(spec, proposed)
+    validated = {
+        key: value
+        for key, value in validated.items()
+        if key == "reason" or current.get(key) != value
+    }
     if not validated:
         return {}
 

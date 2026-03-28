@@ -27,6 +27,8 @@ def main() -> None:
     parser.add_argument("--strategy", required=True, choices=sorted(MANAGED_STRATEGY_SPECS))
     parser.add_argument("--base-strategy", default=None)
     parser.add_argument("--mode", default="current")
+    parser.add_argument("--date-from", dest="date_from", default=None)
+    parser.add_argument("--date-to", dest="date_to", default=None)
     args = parser.parse_args()
 
     spec = get_managed_strategy_spec(args.strategy)
@@ -38,11 +40,24 @@ def main() -> None:
         raw = load_managed_config(args.strategy)
         if args.base_strategy:
             raw["base_strategy"] = args.base_strategy
-        metrics = backtest_managed_config(args.db, args.strategy, raw)
+        metrics = backtest_managed_config(
+            args.db,
+            args.strategy,
+            raw,
+            date_from=args.date_from,
+            date_to=args.date_to,
+        )
         print(f"Current {args.strategy} config on {metrics['base_strategy']}:")
     else:
         base = args.base_strategy or load_managed_config(args.strategy).get("base_strategy", spec.default_base)
-        metrics = backtest_managed_mode(args.db, args.strategy, base, args.mode)
+        metrics = backtest_managed_mode(
+            args.db,
+            args.strategy,
+            base,
+            args.mode,
+            date_from=args.date_from,
+            date_to=args.date_to,
+        )
         print(f"{args.strategy} :: {base} / {args.mode}")
 
     print(f"  entered    : {metrics['entered']}")

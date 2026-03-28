@@ -25,10 +25,33 @@ def resolve_managed_config(strategy_name: str, raw_cfg: dict) -> tuple[str, dict
     return base, resolved
 
 
-def _load_rows(db_path: str, base_strategy: str) -> list[dict]:
+def _normalize_ts(ts: str | None) -> str | None:
+    if not ts:
+        return None
+    value = ts.strip()
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.isoformat()
+
+
+def _load_rows(
+    db_path: str,
+    base_strategy: str,
+    max_rows: int | None = None,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> list[dict]:
     conn = sqlite3.connect(db_path)
-    rows = conn.execute(
-        """
+    date_from = _normalize_ts(date_from)
+    date_to = _normalize_ts(date_to)
+    query = """
         SELECT
             sc.ts,
             so.outcome_pnl_pct,
@@ -50,10 +73,19 @@ def _load_rows(db_path: str, base_strategy: str) -> list[dict]:
           AND so.position_peak_ts IS NOT NULL
           AND so.position_trough_pnl_pct IS NOT NULL
           AND so.position_trough_ts IS NOT NULL
-        ORDER BY sc.ts ASC
-        """,
-        (base_strategy,),
-    ).fetchall()
+        """
+    params: list = [base_strategy]
+    if date_from is not None:
+        query += " AND sc.ts >= ?"
+        params.append(date_from)
+    if date_to is not None:
+        query += " AND sc.ts <= ?"
+        params.append(date_to)
+    query += " ORDER BY sc.ts ASC"
+    if max_rows is not None and max_rows > 0:
+        query += " LIMIT ?"
+        params.append(max_rows)
+    rows = conn.execute(query, tuple(params)).fetchall()
     conn.close()
 
     out = []
@@ -232,9 +264,23 @@ def _simulate_one(row: dict, cfg: dict, base_strategy: str) -> float:
     return simulate_trade_qp(row, sim_cfg, buy_size=cfg["buy_size_usd"])
 
 
-def backtest_managed_config(db_path: str, strategy_name: str, cfg: dict) -> dict:
+def backtest_managed_config(
+    db_path: str,
+    strategy_name: str,
+    cfg: dict,
+    *,
+    max_rows: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict:
     base_strategy, resolved = resolve_managed_config(strategy_name, cfg)
-    rows = _load_rows(db_path, base_strategy)
+    rows = _load_rows(
+        db_path,
+        base_strategy,
+        max_rows=max_rows,
+        date_from=date_from,
+        date_to=date_to,
+    )
     _compute_scores(rows, resolved)
 
     total_pnl = 0.0
@@ -273,16 +319,47 @@ def backtest_managed_config(db_path: str, strategy_name: str, cfg: dict) -> dict
     }
 
 
-def backtest_managed_mode(db_path: str, strategy_name: str, base_strategy: str, mode: str) -> dict:
-    return backtest_managed_config(db_path, strategy_name, {"base_strategy": base_strategy, "mode": mode})
+def backtest_managed_mode(
+    db_path: str,
+    strategy_name: str,
+    base_strategy: str,
+    mode: str,
+    *,
+    max_rows: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict:
+    return backtest_managed_config(
+        db_path,
+        strategy_name,
+        {"base_strategy": base_strategy, "mode": mode},
+        max_rows=max_rows,
+        date_from=date_from,
+        date_to=date_to,
+    )
 
 
-def leaderboard_for_managed_strategy(db_path: str, strategy_name: str) -> list[dict]:
+def leaderboard_for_managed_strategy(
+    db_path: str,
+    strategy_name: str,
+    *,
+    max_rows: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> list[dict]:
     spec = get_managed_strategy_spec(strategy_name)
     rows = []
     for base in sorted(spec.bases):
         for mode in spec.modes.get(base, {}).keys():
-            metrics = backtest_managed_mode(db_path, strategy_name, base, mode)
+            metrics = backtest_managed_mode(
+                db_path,
+                strategy_name,
+                base,
+                mode,
+                max_rows=max_rows,
+                date_from=date_from,
+                date_to=date_to,
+            )
             rows.append({
                 "base_strategy": base,
                 "mode": mode,
@@ -294,3 +371,36 @@ def leaderboard_for_managed_strategy(db_path: str, strategy_name: str) -> list[d
             })
     rows.sort(key=lambda r: (r["total_pnl_usd"], r["win_rate"]), reverse=True)
     return rows[:12]
+
+
+def compare_modes_for_base(
+    db_path: str,
+    strategy_name: str,
+    base_strategy: str,
+    *,
+    max_rows: int | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> list[dict]:
+    spec = get_managed_strategy_spec(strategy_name)
+    rows = []
+    for mode in spec.modes.get(base_strategy, {}).keys():
+        metrics = backtest_managed_mode(
+            db_path,
+            strategy_name,
+            base_strategy,
+            mode,
+            max_rows=max_rows,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        rows.append({
+            "mode": mode,
+            "entered": metrics["entered"],
+            "block_rate": round(metrics["block_rate"], 4),
+            "win_rate": round(metrics["win_rate"], 4),
+            "total_pnl_usd": round(metrics["total_pnl_usd"], 2),
+            "avg_pnl_per_trade_usd": round(metrics["avg_pnl_per_trade_usd"], 4),
+        })
+    rows.sort(key=lambda r: (r["total_pnl_usd"], r["win_rate"]), reverse=True)
+    return rows

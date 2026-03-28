@@ -32,6 +32,7 @@ from trader.agents.strategy_tuner import (
     save_config,
     save_owned_config,
 )
+from trader.agents.base import log_agent_action
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +384,25 @@ class TestConfigIO:
                 allowed_meta_prefixes=("openai_manager_",),
                 path=cfg_path,
             )
+
+
+class TestAgentActionLog:
+    def test_log_agent_action_skips_noop_changes(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AGENT_LOG_DIR", str(tmp_path))
+        from importlib import reload
+        import trader.agents.base as base_mod
+        reload(base_mod)
+
+        base_mod.log_agent_action(
+            "openai_manager",
+            "open_ai_managed",
+            {"mode": "lenient", "ml_k": 3, "reason": "x"},
+            {"mode": "balanced", "ml_k": 3},
+        )
+        lines = (tmp_path / "agent_actions_open_ai_managed.log").read_text().splitlines()
+        assert len(lines) == 1
+        assert "mode: balanced → lenient" in lines[0]
+        assert "ml_k" not in lines[0]
 
     def test_save_owned_config_rejects_non_namespaced_meta_changes(self, tmp_path):
         cfg_path = tmp_path / "strategy_config.json"
